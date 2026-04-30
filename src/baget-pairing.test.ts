@@ -19,11 +19,11 @@ import { provisionBagetGroup, renderBagetClaudeMd } from './baget-pairing.js';
 
 const TEAM = {
   cos: 'Louis',
-  strategist: 'Tristan',
   developer: 'Valentin',
   marketing: 'Chloé',
   analyst: 'Théo',
   design: 'Nicolas',
+  ops: 'Marie',
 };
 
 let tmpRoot = '';
@@ -53,7 +53,7 @@ describe('renderBagetClaudeMd', () => {
     const out = renderBagetClaudeMd({ companyName: 'Acme', teamMembers: TEAM });
     expect(out).toContain('Acme');
     expect(out).toContain('Louis');
-    expect(out).toContain('Tristan');
+    expect(out).toContain('Marie'); // ops member name from TEAM fixture
     expect(out).not.toContain('{{cos_name}}');
     expect(out).not.toContain('{{company_name}}');
   });

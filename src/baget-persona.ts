@@ -33,16 +33,21 @@
 import type { BagetTeamMembers } from './baget-pairing.js';
 
 /**
- * Recognized role tags + their visual style. `ops` shares the design
- * member's name per the prompt (the team has six humans; ops is a
- * facet of design's voice, not a seventh role).
+ * Recognized role tags. Six personas, one name per persona — matches
+ * `@baget/shared::AgentRole` exactly (intern excluded). Ops is its own
+ * member with its own name (was previously folded under design). The
+ * earlier `strategist` tag is retired — long-range strategy / "should
+ * we pivot" questions are CoS territory (cos voice already covers
+ * strategic framing). Adding seven distinct personas to a Telegram-
+ * sized reply diluted attribution.
+ *
+ * `dev` is the model's short tag for the `developer` member field.
  */
-export type BagetRoleTag = 'cos' | 'strategist' | 'dev' | 'marketing' | 'analyst' | 'design' | 'ops';
+export type BagetRoleTag = 'cos' | 'dev' | 'marketing' | 'analyst' | 'design' | 'ops';
 
 /** Emoji per role — matches the prompt's roster bullets one-for-one. */
 const ROLE_EMOJI: Record<BagetRoleTag, string> = {
   cos: '🧭',
-  strategist: '🎯',
   dev: '💻',
   marketing: '📢',
   analyst: '📊',
@@ -50,15 +55,17 @@ const ROLE_EMOJI: Record<BagetRoleTag, string> = {
   ops: '⚙️',
 };
 
-/** Map role tag → BagetTeamMembers field. `dev` and `ops` are remapped. */
+/** Map role tag → BagetTeamMembers field. `dev` is remapped because
+ *  the model uses the short tag while the type uses the verbose role
+ *  name (`developer`). Ops is its own member, no longer aliased to
+ *  design. */
 const ROLE_TO_MEMBER: Record<BagetRoleTag, keyof BagetTeamMembers> = {
   cos: 'cos',
-  strategist: 'strategist',
   dev: 'developer',
   marketing: 'marketing',
   analyst: 'analyst',
   design: 'design',
-  ops: 'design', // shares design's name
+  ops: 'ops',
 };
 
 const KNOWN_ROLES = new Set<string>(Object.keys(ROLE_EMOJI));

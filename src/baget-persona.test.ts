@@ -5,16 +5,16 @@ import type { BagetTeamMembers } from './baget-pairing.js';
 
 const TEAM: BagetTeamMembers = {
   cos: 'Louis',
-  strategist: 'Tristan',
   developer: 'Valentin',
   marketing: 'Chloé',
   analyst: 'Théo',
   design: 'Nicolas',
+  ops: 'Tristan',
 };
 
 describe('parseRoleTag', () => {
   it('parses each known role tag', () => {
-    for (const tag of ['cos', 'strategist', 'dev', 'marketing', 'analyst', 'design', 'ops'] as const) {
+    for (const tag of ['cos', 'dev', 'marketing', 'analyst', 'design', 'ops'] as const) {
       const r = parseRoleTag(`${tag}: hello`);
       expect(r.tag).toBe(tag);
       expect(r.body).toBe('hello');
@@ -84,8 +84,8 @@ describe('applyPersonaPrefix', () => {
     expect(applyPersonaPrefix('dev: live', TEAM)).toBe('💻 Valentin: live');
   });
 
-  it('uses design name for ops tag (shared role)', () => {
-    expect(applyPersonaPrefix('ops: book the supplier', TEAM)).toBe('⚙️ Nicolas: book the supplier');
+  it('uses ops member name for ops tag (own member, no longer aliased to design)', () => {
+    expect(applyPersonaPrefix('ops: book the supplier', TEAM)).toBe('⚙️ Tristan: book the supplier');
   });
 
   it('falls through to cos when no tag is present', () => {

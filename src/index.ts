@@ -168,9 +168,11 @@ async function main(): Promise<void> {
 
   // 7. Optional Baget admin server. Gated on env so a pure-nanoclaw
   //    install runs untouched. Required env: BAGET_ADMIN_TOKEN +
-  //    BAGET_TELEGRAM_BOT_USERNAME. Port defaults to 8443.
+  //    BAGET_TELEGRAM_BOT_USERNAME. Port resolution: Railway sets PORT
+  //    automatically and routes the public ingress there, so prefer it
+  //    when present; fall back to BAGET_ADMIN_PORT (local dev) → 8443.
   if (process.env.BAGET_ADMIN_TOKEN) {
-    const port = parseInt(process.env.BAGET_ADMIN_PORT ?? '8443', 10);
+    const port = parseInt(process.env.PORT ?? process.env.BAGET_ADMIN_PORT ?? '8443', 10);
     const username = process.env.BAGET_TELEGRAM_BOT_USERNAME ?? 'baget_team_bot';
     bagetAdmin = createBagetAdminServer({
       port,

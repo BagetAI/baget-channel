@@ -33,7 +33,7 @@
 import http from 'http';
 import { randomUUID, timingSafeEqual } from 'crypto';
 
-import { tokenHash, verifyPairingTokenHmac } from '../baget-admin-server.js';
+import { registerExtraRoute, tokenHash, verifyPairingTokenHmac } from '../baget-admin-server.js';
 import { applyPersonaPrefix } from '../baget-persona.js';
 import { consumePairingToken } from '../db/baget-pairing-tokens.js';
 import { recordSeenUpdate, sweepOldSeenUpdates } from '../db/baget-seen-updates.js';
@@ -59,8 +59,6 @@ export interface BagetTelegramConfig {
   webhookSecret: string;
   /** Required so /start can verify pairing-token HMACs. */
   adminToken: string;
-  /** HTTP server port. The reverse proxy maps this to the public webhook URL. */
-  port: number;
   /** Default https://api.telegram.org. Tests override. */
   apiBaseUrl?: string;
   /** Optional override of the fetch implementation, for tests. */
@@ -84,7 +82,7 @@ interface TelegramUpdate {
 function buildAdapter(cfg: BagetTelegramConfig): ChannelAdapter {
   const apiBase = cfg.apiBaseUrl ?? 'https://api.telegram.org';
   const fetchFn = cfg.fetchImpl ?? fetch;
-  let server: http.Server | null = null;
+  let unregisterRoute: (() => void) | null = null;
   let setup: ChannelSetup | null = null;
 
   /**
@@ -454,28 +452,15 @@ function buildAdapter(cfg: BagetTelegramConfig): ChannelAdapter {
 
     async setup(s: ChannelSetup): Promise<void> {
       setup = s;
-      server = http.createServer((req, res) => {
-        handleWebhook(req, res).catch((err) => {
-          log.error('Baget telegram: webhook handler threw', { err });
-          if (!res.headersSent) {
-            try {
-              res.writeHead(500).end();
-            } catch {
-              // socket already gone
-            }
-          }
-        });
-      });
-      await new Promise<void>((resolve, reject) => {
-        const onError = (err: Error) => reject(err);
-        server!.once('error', onError);
-        server!.listen(cfg.port, () => {
-          server!.off('error', onError);
-          log.info('Baget telegram webhook listening', { port: cfg.port });
-          startSweep();
-          resolve();
-        });
-      });
+      // Share the admin server's HTTP listener instead of binding our
+      // own port. Railway exposes exactly one public port per service,
+      // so the webhook + admin routes must land on the same listener.
+      unregisterRoute = registerExtraRoute(
+        (method, url) => method === 'POST' && url === '/api/channels/telegram/webhook',
+        (req, res) => handleWebhook(req, res),
+      );
+      log.info('Baget telegram webhook registered on shared admin listener');
+      startSweep();
     },
 
     async teardown(): Promise<void> {
@@ -483,15 +468,15 @@ function buildAdapter(cfg: BagetTelegramConfig): ChannelAdapter {
         clearInterval(sweepHandle);
         sweepHandle = null;
       }
-      if (server) {
-        await new Promise<void>((resolve) => server!.close(() => resolve()));
-        server = null;
+      if (unregisterRoute) {
+        unregisterRoute();
+        unregisterRoute = null;
       }
       setup = null;
     },
 
     isConnected(): boolean {
-      return server !== null;
+      return unregisterRoute !== null;
     },
 
     deliver,
@@ -544,11 +529,11 @@ function parseTeamMembers(json: string | null | undefined): BagetTeamMembers | n
     const parsed = JSON.parse(json) as Partial<BagetTeamMembers>;
     if (
       typeof parsed.cos === 'string' &&
-      typeof parsed.strategist === 'string' &&
       typeof parsed.developer === 'string' &&
       typeof parsed.marketing === 'string' &&
       typeof parsed.analyst === 'string' &&
-      typeof parsed.design === 'string'
+      typeof parsed.design === 'string' &&
+      typeof parsed.ops === 'string'
     ) {
       return parsed as BagetTeamMembers;
     }
@@ -566,13 +551,26 @@ function parseTeamMembers(json: string | null | undefined): BagetTeamMembers | n
 // unset the adapter doesn't register and the host runs as a
 // pure-nanoclaw with no Baget channel.
 if (process.env.TELEGRAM_BOT_TOKEN) {
+  const webhookSecret = process.env.TELEGRAM_WEBHOOK_SECRET ?? '';
+  const adminToken = process.env.BAGET_ADMIN_TOKEN ?? '';
+  if (webhookSecret.length < 16) {
+    throw new Error(
+      'TELEGRAM_BOT_TOKEN is set but TELEGRAM_WEBHOOK_SECRET is missing or shorter than 16 chars. ' +
+        'Refusing to register the Baget Telegram adapter — every webhook would 401 silently.',
+    );
+  }
+  if (adminToken.length < 16) {
+    throw new Error(
+      'TELEGRAM_BOT_TOKEN is set but BAGET_ADMIN_TOKEN is missing or shorter than 16 chars. ' +
+        'Refusing to register the Baget Telegram adapter — pairing-token HMAC would default to the empty key.',
+    );
+  }
   registerChannelAdapter(BAGET_TELEGRAM_CHANNEL_TYPE, {
     factory: () =>
       buildAdapter({
         botToken: process.env.TELEGRAM_BOT_TOKEN!,
-        webhookSecret: process.env.TELEGRAM_WEBHOOK_SECRET ?? '',
-        adminToken: process.env.BAGET_ADMIN_TOKEN ?? '',
-        port: parseInt(process.env.TELEGRAM_WEBHOOK_PORT ?? '3001', 10),
+        webhookSecret,
+        adminToken,
       }),
   });
 }

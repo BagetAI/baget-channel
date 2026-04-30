@@ -63,8 +63,10 @@ COPY package.json ./
 # user can land new folders.
 RUN mkdir -p groups data && chmod 0777 groups data
 
-# Default ports — overridden via Railway service config.
-EXPOSE 3001
+# Single public port. Railway sets PORT and routes its public ingress
+# there. The host listens on PORT (falls back to BAGET_ADMIN_PORT → 8443
+# for local Docker runs). The Telegram webhook route is mounted on the
+# same listener via registerExtraRoute() — no second port needed.
 EXPOSE 8443
 
 # Drop privileges. node:20-bookworm-slim ships a `node` user (uid 1000).

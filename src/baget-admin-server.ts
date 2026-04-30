@@ -8,10 +8,15 @@
  *   POST   /baget/agent-groups                       — create / refresh + mint pairing token
  *   POST   /baget/agent-groups/:groupId/refresh-prompt — re-render prompt only
  *   DELETE /baget/agent-groups/:groupId              — soft-delete + unbind chat
+ *   GET    /healthz                                   — public, no auth
+ *   POST   /api/channels/telegram/webhook             — registered by the
+ *                                                       Baget Telegram channel
+ *                                                       via `registerExtraRoute`
  *
- * Listens on `BAGET_ADMIN_PORT` (default 8443). Separate from the
- * Telegram webhook server (`webhook-server.ts`) so we can put each
- * behind a different ingress / firewall rule on Railway.
+ * Listens on `PORT` (Railway's convention) → falls back to
+ * `BAGET_ADMIN_PORT` → 8443. Single HTTP listener for the whole service
+ * because Railway routes one public port per service; channel adapters
+ * register their webhook routes here via `registerExtraRoute()`.
  *
  * Design notes:
  *
@@ -44,7 +49,9 @@ import http from 'http';
 
 import {
   archiveBagetAgentGroup,
+  countMessagingGroupBindings,
   createBagetAgentGroup,
+  firstBoundChatId,
   getBagetAgentGroup,
   getBagetAgentGroupById,
   unarchiveBagetAgentGroup,
@@ -197,6 +204,40 @@ export interface BagetAdminServerConfig {
   now?: () => number;
 }
 
+/**
+ * External-route registration. Lets the Baget Telegram channel adapter
+ * (and any future adapter) share this server's HTTP listener instead of
+ * binding its own port. Required for Railway: a single service has
+ * exactly ONE public ingress port, so admin + webhook routes have to
+ * land on the same port.
+ *
+ * The handler is responsible for writing the entire response (status,
+ * headers, body). It receives the raw IncomingMessage / ServerResponse.
+ * Returning a Promise that rejects is logged but otherwise ignored —
+ * the registered handler must not leak the request thread.
+ */
+export type ExtraRouteMatcher = (method: string, url: string) => boolean;
+export type ExtraRouteHandler = (req: http.IncomingMessage, res: http.ServerResponse) => Promise<void> | void;
+
+const extraRoutes: Array<{ matcher: ExtraRouteMatcher; handler: ExtraRouteHandler }> = [];
+
+/**
+ * Register an extra route handler that the admin server will dispatch
+ * BEFORE its own admin routes (but AFTER the auth check is bypassed —
+ * extra routes manage their own auth). Returns an unregister function.
+ */
+export function registerExtraRoute(
+  matcher: ExtraRouteMatcher,
+  handler: ExtraRouteHandler,
+): () => void {
+  const entry = { matcher, handler };
+  extraRoutes.push(entry);
+  return () => {
+    const i = extraRoutes.indexOf(entry);
+    if (i >= 0) extraRoutes.splice(i, 1);
+  };
+}
+
 export type BagetAdminServer = {
   listen(): Promise<void>;
   close(): Promise<void>;
@@ -225,6 +266,17 @@ export function createBagetAdminServer(config: BagetAdminServerConfig): BagetAdm
       return;
     }
 
+    // Extra routes (Baget Telegram webhook, etc.) — dispatched BEFORE
+    // the bearer-auth gate because they bring their own auth (e.g. the
+    // X-Telegram-Bot-Api-Secret-Token check). Each handler owns the
+    // response. First match wins.
+    for (const { matcher, handler } of extraRoutes) {
+      if (matcher(method, url)) {
+        await handler(req, res);
+        return;
+      }
+    }
+
     // Auth FIRST — before reading the body, before logging the path.
     // Otherwise we'd give an attacker a free request log signal.
     if (!verifyAdminBearer(req.headers.authorization, config.adminToken)) {
@@ -232,17 +284,41 @@ export function createBagetAdminServer(config: BagetAdminServerConfig): BagetAdm
       return;
     }
 
-    // Route matching.
-    if (method === 'POST' && url === '/baget/agent-groups') {
+    // Route matching. Order is significant: by-tuple (status) is
+    // matched BEFORE the path-style routes since `?userId=…&companyId=…`
+    // is a query string, not a `:groupId` path segment, but bare-URL
+    // matching of `/baget/agent-groups` (no segment) needs to land on
+    // create OR by-tuple depending on method+query-presence.
+    const urlNoQuery = url.split('?')[0];
+    const queryString = url.includes('?') ? url.slice(url.indexOf('?') + 1) : '';
+
+    // Status: GET /baget/agent-groups/by-tuple?userId=…&companyId=…
+    // Lets the dashboard's pair modal flip from "waiting" to
+    // "Connected ✓" once the founder taps the deep link in Telegram.
+    if (method === 'GET' && urlNoQuery === '/baget/agent-groups/by-tuple') {
+      await handleStatusByTuple(res, queryString);
+      return;
+    }
+
+    if (method === 'POST' && urlNoQuery === '/baget/agent-groups') {
       await handleCreate(req, res);
       return;
     }
-    const refreshMatch = /^\/baget\/agent-groups\/([^/]+)\/refresh-prompt$/.exec(url);
+    // Body-keyed DELETE /baget/agent-groups (with body { userId, companyId })
+    // — matches the path-style DELETE /baget/agent-groups/:groupId
+    // semantically but lets the baget.ai bridge skip the get-then-
+    // delete dance (it doesn't track agent_group_id). Both shapes
+    // route through the same archive logic.
+    if (method === 'DELETE' && urlNoQuery === '/baget/agent-groups') {
+      await handleDeleteByTuple(req, res);
+      return;
+    }
+    const refreshMatch = /^\/baget\/agent-groups\/([^/]+)\/refresh-prompt$/.exec(urlNoQuery);
     if (method === 'POST' && refreshMatch) {
       await handleRefresh(req, res, refreshMatch[1]);
       return;
     }
-    const deleteMatch = /^\/baget\/agent-groups\/([^/]+)$/.exec(url);
+    const deleteMatch = /^\/baget\/agent-groups\/([^/]+)$/.exec(urlNoQuery);
     if (method === 'DELETE' && deleteMatch) {
       await handleDelete(res, deleteMatch[1]);
       return;
@@ -428,6 +504,125 @@ export function createBagetAdminServer(config: BagetAdminServerConfig): BagetAdm
     sendJson(res, 200, { ok: true, agentGroupId: groupId, archived: true, unboundChats: unbound });
   }
 
+  /**
+   * GET /baget/agent-groups/by-tuple?userId=…&companyId=…
+   *
+   * Status check for the dashboard's pair modal. Returns whether an
+   * agent_group exists for this (user, company), and whether it's
+   * been chat-bound (i.e., the founder completed `/start` on
+   * Telegram). The modal polls this every ~2s during the 5-min
+   * pairing window.
+   *
+   * Shape:
+   *   { ok: true, paired: boolean, agentGroupId?: string,
+   *     platformChatId?: string }
+   *
+   * - `paired: true` requires BOTH agent_group exists AND has at least
+   *   one binding in `messaging_group_agents`. Just provisioning the
+   *   group (POST /baget/agent-groups) is NOT pairing — only `/start`
+   *   creates the binding.
+   * - Archived groups return `paired: false` even if they have
+   *   leftover binding rows (the unbind in handleDelete is best-
+   *   effort; a stale row here would falsely show "paired" forever).
+   */
+  async function handleStatusByTuple(
+    res: http.ServerResponse,
+    queryString: string,
+  ): Promise<void> {
+    const params = new URLSearchParams(queryString);
+    const userId = params.get('userId') ?? '';
+    const companyId = params.get('companyId') ?? '';
+    if (!userId || !companyId) {
+      sendJson(res, 400, {
+        ok: false,
+        error: 'invalid_query',
+        message: 'userId and companyId query params are required',
+      });
+      return;
+    }
+    const existing = getBagetAgentGroup(userId, companyId);
+    if (!existing || existing.archived_at) {
+      sendJson(res, 200, { ok: true, paired: false });
+      return;
+    }
+    const bindingCount = countMessagingGroupBindings(existing.id);
+    if (bindingCount === 0) {
+      sendJson(res, 200, {
+        ok: true,
+        paired: false,
+        agentGroupId: existing.id,
+      });
+      return;
+    }
+    const platformChatId = firstBoundChatId(existing.id);
+    sendJson(res, 200, {
+      ok: true,
+      paired: true,
+      agentGroupId: existing.id,
+      ...(platformChatId ? { platformChatId } : {}),
+    });
+  }
+
+  /**
+   * DELETE /baget/agent-groups (body: { userId, companyId })
+   *
+   * Tuple-keyed sibling of `DELETE /baget/agent-groups/:groupId`. The
+   * dashboard tracks (user, company) but not agent_group_id; this
+   * shape lets the bridge call DELETE in one round-trip instead of
+   * the get-then-delete dance (re-provision to fetch the id, then
+   * DELETE by id). Same archive logic, same response shape.
+   *
+   * Returns 200 with `archived: false` when there's no group for the
+   * tuple (idempotent — the founder's intent is satisfied trivially
+   * when there's nothing to disconnect).
+   */
+  async function handleDeleteByTuple(
+    req: http.IncomingMessage,
+    res: http.ServerResponse,
+  ): Promise<void> {
+    const body = await readJson<{ userId?: string; companyId?: string }>(req);
+    if (!body.ok) {
+      sendJson(res, 400, { ok: false, error: 'invalid_body', message: body.error });
+      return;
+    }
+    const { userId, companyId } = body.value;
+    if (!userId || !companyId) {
+      sendJson(res, 400, {
+        ok: false,
+        error: 'invalid_body',
+        message: 'userId and companyId are required',
+      });
+      return;
+    }
+    const existing = getBagetAgentGroup(userId, companyId);
+    if (!existing) {
+      // Idempotent no-op — matches the path-style DELETE's 404 only
+      // when the row never existed; here we return 200 because the
+      // dashboard's intent ("disconnect this binding") is met when
+      // there's nothing to disconnect.
+      sendJson(res, 200, { ok: true, archived: false, unboundChats: 0 });
+      return;
+    }
+    if (existing.archived_at) {
+      // Already archived — also a no-op success.
+      sendJson(res, 200, {
+        ok: true,
+        agentGroupId: existing.id,
+        archived: false,
+        unboundChats: 0,
+      });
+      return;
+    }
+    archiveBagetAgentGroup(existing.id, new Date(now()).toISOString());
+    const unbound = unbindMessagingGroupsForAgent(existing.id);
+    sendJson(res, 200, {
+      ok: true,
+      agentGroupId: existing.id,
+      archived: true,
+      unboundChats: unbound,
+    });
+  }
+
   return {
     async listen(): Promise<void> {
       if (server) return;
@@ -480,7 +675,7 @@ function validateCreateBody(body: CreateAgentGroupBody): string | null {
   }
   const tm = body.teamMembers;
   if (!tm || typeof tm !== 'object') return 'teamMembers must be an object';
-  for (const role of ['cos', 'strategist', 'developer', 'marketing', 'analyst', 'design'] as const) {
+  for (const role of ['cos', 'developer', 'marketing', 'analyst', 'design', 'ops'] as const) {
     if (typeof tm[role] !== 'string' || tm[role].trim().length === 0) {
       return `teamMembers.${role} must be a non-empty string`;
     }

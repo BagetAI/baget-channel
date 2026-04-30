@@ -104,3 +104,47 @@ export function unbindMessagingGroupsForAgent(agentGroupId: string): number {
   const r = getDb().prepare('DELETE FROM messaging_group_agents WHERE agent_group_id = ?').run(agentGroupId);
   return r.changes;
 }
+
+/**
+ * Count the chat→agent bindings for this group. Used by the
+ * `GET /baget/agent-groups/by-tuple` status endpoint to tell the
+ * dashboard whether the founder has completed `/start` on Telegram
+ * (binding count > 0) vs the row exists but no chat is bound yet
+ * (count == 0 — provisioned but not paired).
+ *
+ * `messaging_group_agents` is the upstream table that wires platform
+ * chats to agent_groups; the Baget Telegram adapter inserts a row
+ * into it when the founder taps the deep link and consumes the
+ * pairing token. Existence of any row → "paired" from the dashboard's
+ * perspective.
+ */
+export function countMessagingGroupBindings(agentGroupId: string): number {
+  const row = getDb()
+    .prepare('SELECT COUNT(*) AS n FROM messaging_group_agents WHERE agent_group_id = ?')
+    .get(agentGroupId) as { n: number } | undefined;
+  return row?.n ?? 0;
+}
+
+/**
+ * First bound platform_chat_id for an agent_group, if any. The
+ * dashboard widget uses this to render the deep-link button as
+ * `t.me/<bot>` (open the existing chat) rather than the pairing
+ * deep-link with token. Returns null when nothing is bound.
+ *
+ * Filters to platform='telegram' since that's the only channel
+ * shipped today; widen the WHERE when Slack/WhatsApp adapters land.
+ */
+export function firstBoundChatId(agentGroupId: string): string | null {
+  const row = getDb()
+    .prepare(
+      `SELECT mg.platform_chat_id
+         FROM messaging_group_agents mga
+         JOIN messaging_groups mg ON mg.id = mga.messaging_group_id
+        WHERE mga.agent_group_id = ?
+          AND mg.platform = 'telegram'
+        ORDER BY mga.created_at ASC
+        LIMIT 1`,
+    )
+    .get(agentGroupId) as { platform_chat_id: string } | undefined;
+  return row?.platform_chat_id ?? null;
+}

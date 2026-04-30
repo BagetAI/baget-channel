@@ -51,21 +51,21 @@ const BAGET_TEMPLATE_FILE = path.join(BAGET_TEMPLATE_DIR, 'CLAUDE.md.template');
  */
 export type BagetTeamMembers = {
   cos: string;
-  strategist: string;
   developer: string;
   marketing: string;
   analyst: string;
   design: string;
+  ops: string;
 };
 
 const REQUIRED_PLACEHOLDERS: ReadonlyArray<string> = [
   'company_name',
   'cos_name',
-  'strategist_name',
   'developer_name',
   'marketing_name',
   'analyst_name',
   'design_name',
+  'ops_name',
 ];
 
 export interface RenderClaudeMdArgs {
@@ -95,11 +95,11 @@ export function renderBagetClaudeMd(args: RenderClaudeMdArgs): string {
   const vars: Record<string, string> = {
     company_name: args.companyName,
     cos_name: args.teamMembers.cos,
-    strategist_name: args.teamMembers.strategist,
     developer_name: args.teamMembers.developer,
     marketing_name: args.teamMembers.marketing,
     analyst_name: args.teamMembers.analyst,
     design_name: args.teamMembers.design,
+    ops_name: args.teamMembers.ops,
   };
 
   // Verify every required placeholder has a non-empty value before
