@@ -16,8 +16,30 @@ group folder; it has unfilled `{{placeholders}}`.
   the pairing API call).
 - **`container_config.json`** — env + secrets template. The host patches
   `BAGET_COMPANY_ID`, `BAGET_API_BASE_URL`, and the OneCLI secret name
-  per founder before writing to the group folder.
+  per founder before writing to the group folder. Also pins
+  `agent_provider: "opencode"` so the channel agent runs on Vertex
+  Gemini Flash (NOT the Anthropic SDK default — see "Provider config"
+  in `BAGET-DEPLOY.md`).
 - **`README.md`** — this file.
+
+## Prerequisite: `/add-opencode` must have been run
+
+This template assumes the upstream `/add-opencode` skill has been run
+on this nanoclaw install (it copies the OpenCode provider files in
+from the `providers` branch and wires both barrels). If the skill
+hasn't run, container spawn will fail with `Unknown provider: opencode`.
+
+Verify with:
+
+```bash
+ls container/agent-runner/src/providers/opencode.ts \
+   src/providers/opencode.ts
+# Both files should exist.
+```
+
+If missing, follow `BAGET-DEPLOY.md` § "Provider config" — it walks
+through the install steps + the env vars (`OPENCODE_PROVIDER=google`,
+`OPENCODE_MODEL=google/gemini-2.5-flash`).
 
 ## Install / pairing flow (production)
 

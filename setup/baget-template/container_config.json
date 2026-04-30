@@ -1,12 +1,16 @@
 {
   "_comment": "Container config for the Baget agent group. Mounts the baget-mcp tools (built into this fork's container/agent-runner) and threads the per-(user, company) channel token + company id from OneCLI / agent-group settings. Adjust BAGET_API_BASE_URL via /customize for staging vs prod.",
+  "agent_provider": "opencode",
+  "_agent_provider_note": "Use OpenCode (not the Anthropic Agent SDK default) so the channel agent runs on Vertex Gemini Flash — same model the dashboard worker uses, ~10× cheaper than Claude Sonnet for this workload, and matches the prompt-tuning the team-of-six persona is calibrated against. Requires `/add-opencode` to have been run on this nanoclaw install (the skill copies the OpenCode provider files in from the upstream `providers` branch). See BAGET-DEPLOY.md \"Provider config\" for the host env vars.",
   "env": {
     "BAGET_API_BASE_URL": "https://stg-app.baget.ai",
     "_BAGET_CHANNEL_TOKEN_note": "Injected by OneCLI from the agent vault (credential: baget-channel-token). Each agent has its own scoped token tied to (user_id, company_id, conversation_id). Revoking from the dashboard immediately invalidates writes.",
-    "_BAGET_COMPANY_ID_note": "Set per-agent-group from the founder's selected company at pairing time. Stored in agent_groups.container_config and re-injected on every spawn."
+    "_BAGET_COMPANY_ID_note": "Set per-agent-group from the founder's selected company at pairing time. Stored in agent_groups.container_config and re-injected on every spawn.",
+    "_OPENCODE_PROVIDER_note": "Set on the HOST (not in container_config). When `agent_provider=opencode`, the host injects OPENCODE_PROVIDER + OPENCODE_MODEL + OPENCODE_SMALL_MODEL into the spawned container. For Baget: OPENCODE_PROVIDER=google, OPENCODE_MODEL=google/gemini-2.5-flash (matches the dashboard worker's stack)."
   },
   "secrets": [
-    "baget-channel-token"
+    "baget-channel-token",
+    "_google-genai-api-key_note: register the Vertex/Google API key in OneCLI with --host-pattern=generativelanguage.googleapis.com so requests proxy through OneCLI without the key ever entering env. Then `onecli agents set-secrets --id <agent-id> --secret-ids <id>` to grant this agent access (selective mode default)."
   ],
   "mcp_servers": [
     {

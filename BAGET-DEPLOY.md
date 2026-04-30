@@ -203,6 +203,123 @@ The Railway service reads these at startup. Set them on the
 
 **Important:** `RUNTIME=single-process` does NOT bypass tenant isolation. Every founder still gets a distinct `agent_groups` row, distinct session DB files (3-DB model), and distinct OneCLI bearer-token credential. What it bypasses is the kernel-level Docker isolation between sessions — safe in our threat model because the agent has no shell. See § "Why we don't need DinD" above.
 
+## Provider config — Vertex Gemini Flash via OpenCode
+
+NanoClaw defaults to the **Anthropic Claude Agent SDK** as its agent
+provider. Baget runs on **Vertex Gemini Flash** for three reasons:
+
+1. **Cost.** Gemini Flash is ~10× cheaper per turn than Claude Sonnet
+   for our workload (read state → fire one MCP tool → format reply).
+   At any non-trivial founder volume the difference is real money.
+2. **Behavioral parity.** The dashboard worker tasks, briefing
+   generation, and in-app CoS chat all run on Vertex Gemini today.
+   Channel agent on Claude would diverge on persona behavior — the
+   role-tag format, the voice rules, the "no markdown" reply
+   discipline are all calibrated against Gemini's output.
+3. **Policy.** Per `feedback_no_openai.md` in the baget.ai repo:
+   `AI_PROVIDER=openai` is forbidden; staging + prod use Vertex
+   Gemini Flash. The fork inherits that policy.
+
+NanoClaw supports alternative providers via the `/add-opencode` skill
+(upstream `providers` branch). It swaps the Anthropic SDK for
+[OpenCode](https://github.com/opencode-ai/opencode), a multi-provider
+harness that supports OpenRouter, Google, DeepSeek, and direct API
+backends.
+
+### Install steps (one-time, on the Railway box)
+
+Run on the host where baget-channel is checked out, BEFORE the first
+`./container/build.sh`:
+
+```bash
+# 1. Run the upstream skill — it copies the OpenCode provider files
+#    in from the `providers` branch and wires both barrels.
+.claude/skills/add-opencode/SKILL.md   # follow the steps in this file
+
+# 2. Specifically, the skill does:
+git fetch upstream providers
+git show upstream/providers:src/providers/opencode.ts                                    > src/providers/opencode.ts
+git show upstream/providers:container/agent-runner/src/providers/opencode.ts             > container/agent-runner/src/providers/opencode.ts
+git show upstream/providers:container/agent-runner/src/providers/mcp-to-opencode.ts      > container/agent-runner/src/providers/mcp-to-opencode.ts
+echo "import './opencode.js';" >> src/providers/index.ts
+echo "import './opencode.js';" >> container/agent-runner/src/providers/index.ts
+
+# 3. Add the OpenCode SDK as a container/agent-runner dep. Pin to 1.4.x
+#    — the 1.14.x SDK has a breaking session API change.
+cd container/agent-runner && bun add @opencode-ai/sdk@1.4.17 && cd -
+
+# 4. Edit container/Dockerfile (idempotent — skip if already present):
+#    (a) Add `ARG OPENCODE_VERSION=1.4.17` to the Pin CLI versions block
+#    (b) Append `"opencode-ai@${OPENCODE_VERSION}"` to the pnpm install -g block
+
+# 5. Build
+pnpm run build
+./container/build.sh
+```
+
+### Env vars (host side — Railway env tab)
+
+Add these alongside the table above. They're only consulted when the
+`agent_groups.container_config.agent_provider` field is `"opencode"`
+(set in `setup/baget-template/container_config.json` for new groups).
+
+| Var | Required | Value (Baget) | Purpose |
+|-----|---------|--------------|---------|
+| `OPENCODE_PROVIDER` | yes | `google` | OpenCode provider id. `google` = Vertex/Google Generative AI. |
+| `OPENCODE_MODEL` | yes | `google/gemini-2.5-flash` | Full model id in `provider/model` form. Pin to a specific version (NOT `latest`) so prompt behavior stays stable. |
+| `OPENCODE_SMALL_MODEL` | no | `google/gemini-2.5-flash-lite` | Optional lighter model OpenCode uses for small tool decisions (intent classification, etc.). Defaults to `OPENCODE_MODEL` when unset. |
+| `ANTHROPIC_BASE_URL` | only for non-`anthropic` providers | `https://generativelanguage.googleapis.com/v1beta` | Confusingly named — OpenCode uses this as the upstream provider's base URL regardless of what provider it actually is. For Vertex, use the Generative Language API endpoint. |
+
+### Credential — Google API key via OneCLI
+
+Don't put the Google API key in the env. Register it with OneCLI so
+it's injected via `HTTPS_PROXY` at request time and never enters the
+container's process env.
+
+```bash
+# Register
+onecli secrets create --name google-genai-api-key \
+  --host-pattern generativelanguage.googleapis.com \
+  --value "$GOOGLE_API_KEY"
+
+# Grant the Baget agent group access (selective mode default —
+# secrets are NOT auto-assigned). Replace <agent-id> with the id from
+# `onecli agents list`. Always include existing secret IDs in the
+# `--secret-ids` list — `set-secrets` REPLACES, not appends.
+onecli agents set-secrets --id <agent-id> --secret-ids <existing>,google-genai-api-key
+```
+
+### Verify the provider switch
+
+After the build:
+
+```bash
+# Health check should show the provider in startup logs:
+railway logs --service "baget-channel - main" --filter "provider"
+# Expected: [opencode-provider] starting agent runner with model=google/gemini-2.5-flash
+#  NOT:     [claude-provider] ...
+```
+
+If you see `claude-provider` in the logs, the `/add-opencode` skill
+didn't install correctly OR `agent_groups.container_config.agent_provider`
+is still null/`"claude"` for the test group. Re-check
+`setup/baget-template/container_config.json` and any existing rows.
+
+### Existing-group migration
+
+The `agent_provider` field is read at container spawn time, so flipping
+it on existing rows takes effect on the next message. For active
+agent groups created before this PR:
+
+```sql
+UPDATE agent_groups
+   SET container_config = jsonb_set(container_config, '{agent_provider}', '"opencode"')
+ WHERE folder LIKE 'baget-%';
+```
+
+(SQLite equivalent if your DATABASE_URL points at the local v2.db:
+use `json_set(container_config, '$.agent_provider', 'opencode')`.)
+
 ## Build & deploy
 
 ```bash
