@@ -1,0 +1,22 @@
+{
+  "_comment": "Container config for the Baget agent group. Mounts the baget-mcp tools (built into this fork's container/agent-runner) and threads the per-(user, company) channel token + company id from OneCLI / agent-group settings. Adjust BAGET_API_BASE_URL via /customize for staging vs prod.",
+  "env": {
+    "BAGET_API_BASE_URL": "https://stg-app.baget.ai",
+    "_BAGET_CHANNEL_TOKEN_note": "Injected by OneCLI from the agent vault (credential: baget-channel-token). Each agent has its own scoped token tied to (user_id, company_id, conversation_id). Revoking from the dashboard immediately invalidates writes.",
+    "_BAGET_COMPANY_ID_note": "Set per-agent-group from the founder's selected company at pairing time. Stored in agent_groups.container_config and re-injected on every spawn."
+  },
+  "secrets": [
+    "baget-channel-token"
+  ],
+  "mcp_servers": [
+    {
+      "name": "baget",
+      "_comment": "baget-mcp lives in container/agent-runner/src/mcp-tools/baget.ts and is registered automatically by the barrel import. No separate MCP server process — the same container/agent-runner stdio transport carries baget tools alongside core/scheduling/interactive/agents."
+    }
+  ],
+  "skills": [
+    "_BUILTIN_web_search",
+    "_BUILTIN_web_fetch",
+    "_BUILTIN_schedule_message"
+  ]
+}
