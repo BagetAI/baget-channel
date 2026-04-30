@@ -1,0 +1,534 @@
+/**
+ * Baget admin pairing server.
+ *
+ * One HTTP server, three routes, all behind a constant-time bearer-token
+ * check against `BAGET_ADMIN_TOKEN`. Wire contract is documented in
+ * BAGET-DEPLOY.md "Pairing contract: baget.ai ↔ baget-channel".
+ *
+ *   POST   /baget/agent-groups                       — create / refresh + mint pairing token
+ *   POST   /baget/agent-groups/:groupId/refresh-prompt — re-render prompt only
+ *   DELETE /baget/agent-groups/:groupId              — soft-delete + unbind chat
+ *
+ * Listens on `BAGET_ADMIN_PORT` (default 8443). Separate from the
+ * Telegram webhook server (`webhook-server.ts`) so we can put each
+ * behind a different ingress / firewall rule on Railway.
+ *
+ * Design notes:
+ *
+ *   - **Idempotency.** `POST /baget/agent-groups` is idempotent on
+ *     `(userId, companyId)` per the contract. The renderer
+ *     (`provisionBagetGroup`) is already idempotent on the folder slug;
+ *     this server tracks the (userId, companyId, agent_group_id) tuple
+ *     in `agent_groups` and re-uses an existing row instead of inserting
+ *     a duplicate. Re-pairing a previously-archived group resurrects it
+ *     (clears `archived_at`).
+ *
+ *   - **Pairing token.** HMAC-SHA256 over `<payload>` using
+ *     `BAGET_ADMIN_TOKEN` as the key. Payload is URL-safe base64 of
+ *     `{ uid, cid, agid, exp }`. The DB stores ONLY the SHA256 of the
+ *     concatenated `<payload>.<hmac>` so a leak of the row table doesn't
+ *     leak live tokens (forging still requires the HMAC key).
+ *
+ *   - **Concurrency.** All routes serialize via SQLite — better-sqlite3
+ *     is synchronous so two parallel POSTs against the same
+ *     (userId, companyId) race only on the partial UNIQUE index, which
+ *     rejects the second insert. The retry path catches it and falls
+ *     through to the refresh branch.
+ *
+ *   - **Error format.** All non-2xx responses are
+ *     `{ ok: false, error: <code>, message: <human> }` so the baget.ai
+ *     bridge can branch on `error` programmatically.
+ */
+import { createHash, createHmac, randomBytes, timingSafeEqual } from 'crypto';
+import http from 'http';
+import path from 'path';
+
+import { GROUPS_DIR } from './config.js';
+import {
+  archiveBagetAgentGroup,
+  createBagetAgentGroup,
+  getBagetAgentGroup,
+  unarchiveBagetAgentGroup,
+  updateBagetTeamMembers,
+} from './db/baget-agent-groups.js';
+import { insertPairingToken, sweepExpiredPairingTokens } from './db/baget-pairing-tokens.js';
+import { provisionBagetGroup, type BagetTeamMembers } from './baget-pairing.js';
+import { log } from './log.js';
+
+// ── Auth ──
+
+/**
+ * Constant-time bearer-token check. Returns false on any malformed
+ * header — we never log the supplied token (even truncated) because a
+ * partial leak narrows brute-force time.
+ */
+export function verifyAdminBearer(
+  headerValue: string | string[] | undefined,
+  expectedToken: string,
+): boolean {
+  if (typeof headerValue !== 'string') return false;
+  const m = /^Bearer\s+(.+)$/i.exec(headerValue.trim());
+  if (!m) return false;
+  const supplied = m[1];
+  // timingSafeEqual requires equal-length buffers — pad both to the
+  // longer of the two with constant zeros so we don't leak the expected
+  // token's length on a length mismatch.
+  const a = Buffer.from(supplied, 'utf8');
+  const b = Buffer.from(expectedToken, 'utf8');
+  const max = Math.max(a.length, b.length);
+  const ap = Buffer.alloc(max);
+  const bp = Buffer.alloc(max);
+  a.copy(ap);
+  b.copy(bp);
+  // If lengths differ, force a mismatch even when padded bytes happen
+  // to align (zero-padded buffers can collide).
+  const sameLen = a.length === b.length ? 1 : 0;
+  return timingSafeEqual(ap, bp) && sameLen === 1;
+}
+
+// ── Pairing token mint ──
+
+const PAIRING_TOKEN_TTL_MS = 5 * 60 * 1000;
+
+interface PairingTokenPayload {
+  uid: string;
+  cid: string;
+  agid: string;
+  exp: number;
+}
+
+function b64url(buf: Buffer): string {
+  return buf.toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+/**
+ * Mint a single-use pairing token.
+ *
+ * Format: `<base64url(payload)>.<base64url(hmac)>`. The HMAC defends
+ * against forged tokens (you'd need BAGET_ADMIN_TOKEN to recompute it),
+ * the DB row defends against replay (single-use via CAS update).
+ *
+ * `exp` is encoded into the payload AND stored in the DB row. The DB
+ * is the source of truth — `consumePairingToken` checks the row's
+ * exp, not the payload's. Encoding exp in the payload is a courtesy to
+ * the consume endpoint so it can short-circuit obviously-stale tokens
+ * without a DB read.
+ */
+export function mintPairingToken(args: {
+  userId: string;
+  companyId: string;
+  agentGroupId: string;
+  adminToken: string;
+  now: number;
+}): { rawToken: string; expiresAt: string; expiresAtMs: number } {
+  const expiresAtMs = args.now + PAIRING_TOKEN_TTL_MS;
+  const payload: PairingTokenPayload = {
+    uid: args.userId,
+    cid: args.companyId,
+    agid: args.agentGroupId,
+    exp: expiresAtMs,
+  };
+  // 16 bytes of nonce keeps tokens distinct even on the millisecond
+  // collision case (two pairings in the same tick).
+  const nonce = randomBytes(16);
+  const payloadJson = JSON.stringify(payload);
+  const payloadB64 = b64url(Buffer.concat([nonce, Buffer.from(payloadJson, 'utf8')]));
+  const hmac = createHmac('sha256', args.adminToken).update(payloadB64).digest();
+  const hmacB64 = b64url(hmac);
+  const rawToken = `${payloadB64}.${hmacB64}`;
+  return { rawToken, expiresAt: new Date(expiresAtMs).toISOString(), expiresAtMs };
+}
+
+/**
+ * Verify a pairing token's HMAC. Used by the Telegram /start handler
+ * before consuming the row — defense-in-depth so a tampered token
+ * never even hits the DB.
+ */
+export function verifyPairingTokenHmac(rawToken: string, adminToken: string): boolean {
+  const dot = rawToken.lastIndexOf('.');
+  if (dot < 0) return false;
+  const payloadB64 = rawToken.slice(0, dot);
+  const hmacB64 = rawToken.slice(dot + 1);
+  if (payloadB64.length === 0 || hmacB64.length === 0) return false;
+  const expected = createHmac('sha256', adminToken).update(payloadB64).digest();
+  let supplied: Buffer;
+  try {
+    // Re-pad base64url to base64 so Buffer.from can decode it.
+    const padded = hmacB64 + '='.repeat((4 - (hmacB64.length % 4)) % 4);
+    supplied = Buffer.from(padded.replace(/-/g, '+').replace(/_/g, '/'), 'base64');
+  } catch {
+    return false;
+  }
+  if (supplied.length !== expected.length) return false;
+  return timingSafeEqual(supplied, expected);
+}
+
+// ── Request types ──
+
+export interface CreateAgentGroupBody {
+  userId: string;
+  companyId: string;
+  companyName: string;
+  teamMembers: BagetTeamMembers;
+  channelTokenCredentialName: string;
+  /** Default https://app.baget.ai. Must match the founder's environment. */
+  bagetApiBaseUrl: string;
+}
+
+export interface CreateAgentGroupResponse {
+  ok: true;
+  agentGroupId: string;
+  folder: string;
+  telegramDeepLink: string;
+  pairingTokenExpiresAt: string;
+}
+
+// ── Server ──
+
+export interface BagetAdminServerConfig {
+  port: number;
+  /** Required — the bearer token baget.ai signs requests with. */
+  adminToken: string;
+  /** Telegram bot username, e.g. `baget_team_bot`. Used to build the deep link. */
+  telegramBotUsername: string;
+  /**
+   * Function the route handlers use to ULID/UUID a new agent group.
+   * Wired as a parameter so tests can inject a deterministic generator.
+   */
+  generateAgentGroupId: () => string;
+  /** Function returning current time. Wired as a parameter so tests can fix the clock. */
+  now?: () => number;
+}
+
+export type BagetAdminServer = {
+  listen(): Promise<void>;
+  close(): Promise<void>;
+};
+
+export function createBagetAdminServer(config: BagetAdminServerConfig): BagetAdminServer {
+  if (!config.adminToken || config.adminToken.length < 16) {
+    throw new Error('BAGET_ADMIN_TOKEN must be at least 16 characters');
+  }
+  if (!config.telegramBotUsername) {
+    throw new Error('BAGET_TELEGRAM_BOT_USERNAME is required');
+  }
+
+  const now = config.now ?? Date.now;
+  let server: http.Server | null = null;
+
+  async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+    // Reject anything other than the documented routes.
+    const method = (req.method || 'GET').toUpperCase();
+    const url = req.url || '';
+
+    // /healthz is intentionally public (Railway probes it) and returns
+    // a 200 with no DB read so it stays cheap and never leaks state.
+    if (method === 'GET' && url === '/healthz') {
+      sendJson(res, 200, { ok: true });
+      return;
+    }
+
+    // Auth FIRST — before reading the body, before logging the path.
+    // Otherwise we'd give an attacker a free request log signal.
+    if (!verifyAdminBearer(req.headers.authorization, config.adminToken)) {
+      sendJson(res, 401, { ok: false, error: 'unauthorized', message: 'Bearer token missing or invalid' });
+      return;
+    }
+
+    // Route matching.
+    if (method === 'POST' && url === '/baget/agent-groups') {
+      await handleCreate(req, res);
+      return;
+    }
+    const refreshMatch = /^\/baget\/agent-groups\/([^/]+)\/refresh-prompt$/.exec(url);
+    if (method === 'POST' && refreshMatch) {
+      await handleRefresh(req, res, refreshMatch[1]);
+      return;
+    }
+    const deleteMatch = /^\/baget\/agent-groups\/([^/]+)$/.exec(url);
+    if (method === 'DELETE' && deleteMatch) {
+      await handleDelete(res, deleteMatch[1]);
+      return;
+    }
+
+    sendJson(res, 404, { ok: false, error: 'not_found', message: `No route for ${method} ${url}` });
+  }
+
+  async function handleCreate(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+    const body = await readJson<CreateAgentGroupBody>(req);
+    if (!body.ok) {
+      sendJson(res, 400, { ok: false, error: 'invalid_body', message: body.error });
+      return;
+    }
+    const validation = validateCreateBody(body.value);
+    if (validation) {
+      sendJson(res, 400, { ok: false, error: 'invalid_body', message: validation });
+      return;
+    }
+    const { userId, companyId, companyName, teamMembers, bagetApiBaseUrl, channelTokenCredentialName } = body.value;
+
+    // 1. Idempotent provision: render CLAUDE.local.md + write
+    //    container_config.json under groups/<folder>/. Pure file IO,
+    //    safe to re-run.
+    let provisioned: ReturnType<typeof provisionBagetGroup>;
+    try {
+      provisioned = provisionBagetGroup({
+        userId,
+        companyId,
+        companyName,
+        teamMembers,
+        bagetApiBaseUrl,
+        channelTokenCredentialName,
+      });
+    } catch (err) {
+      log.error('Baget provision failed', { userId, companyId, err });
+      sendJson(res, 500, {
+        ok: false,
+        error: 'provision_failed',
+        message: err instanceof Error ? err.message : String(err),
+      });
+      return;
+    }
+
+    // 2. Insert / resurrect the agent_groups row. Idempotent on
+    //    (userId, companyId) per the partial UNIQUE index.
+    const teamMembersJson = JSON.stringify(teamMembers);
+    const existing = getBagetAgentGroup(userId, companyId);
+    let agentGroupId: string;
+    if (existing) {
+      agentGroupId = existing.id;
+      if (existing.archived_at) {
+        unarchiveBagetAgentGroup(existing.id);
+      }
+      // Always refresh team names — a re-pair after a rename should
+      // pick up the new names without requiring a separate
+      // refresh-prompt call.
+      updateBagetTeamMembers(existing.id, teamMembersJson);
+    } else {
+      agentGroupId = config.generateAgentGroupId();
+      try {
+        createBagetAgentGroup({
+          id: agentGroupId,
+          name: companyName,
+          folder: provisioned.folder,
+          user_id: userId,
+          company_id: companyId,
+          baget_team_members: teamMembersJson,
+          created_at: new Date(now()).toISOString(),
+        });
+      } catch (err) {
+        // Race with a concurrent create — re-read and use the winner.
+        const winner = getBagetAgentGroup(userId, companyId);
+        if (!winner) {
+          log.error('Baget create race had no winner', { userId, companyId, err });
+          sendJson(res, 500, {
+            ok: false,
+            error: 'create_failed',
+            message: err instanceof Error ? err.message : String(err),
+          });
+          return;
+        }
+        agentGroupId = winner.id;
+      }
+    }
+
+    // 3. Mint pairing token + store SHA256.
+    const minted = mintPairingToken({
+      userId,
+      companyId,
+      agentGroupId,
+      adminToken: config.adminToken,
+      now: now(),
+    });
+    insertPairingToken({
+      rawToken: minted.rawToken,
+      userId,
+      companyId,
+      agentGroupId,
+      expiresAt: minted.expiresAt,
+      createdAt: new Date(now()).toISOString(),
+    });
+
+    // 4. Opportunistic cleanup of expired tokens (fire and forget).
+    sweepExpiredPairingTokens(new Date(now()).toISOString());
+
+    const response: CreateAgentGroupResponse = {
+      ok: true,
+      agentGroupId,
+      folder: provisioned.folder,
+      telegramDeepLink: `https://t.me/${config.telegramBotUsername}?start=${minted.rawToken}`,
+      pairingTokenExpiresAt: minted.expiresAt,
+    };
+    sendJson(res, 200, response);
+  }
+
+  async function handleRefresh(
+    req: http.IncomingMessage,
+    res: http.ServerResponse,
+    groupId: string,
+  ): Promise<void> {
+    const body = await readJson<CreateAgentGroupBody>(req);
+    if (!body.ok) {
+      sendJson(res, 400, { ok: false, error: 'invalid_body', message: body.error });
+      return;
+    }
+    const validation = validateCreateBody(body.value);
+    if (validation) {
+      sendJson(res, 400, { ok: false, error: 'invalid_body', message: validation });
+      return;
+    }
+    // Refresh requires the row to already exist for this groupId.
+    const existing = getBagetAgentGroup(body.value.userId, body.value.companyId);
+    if (!existing || existing.id !== groupId) {
+      sendJson(res, 404, {
+        ok: false,
+        error: 'group_not_found',
+        message: `No Baget agent_group ${groupId} for the supplied (userId, companyId)`,
+      });
+      return;
+    }
+    try {
+      provisionBagetGroup({
+        userId: body.value.userId,
+        companyId: body.value.companyId,
+        companyName: body.value.companyName,
+        teamMembers: body.value.teamMembers,
+        bagetApiBaseUrl: body.value.bagetApiBaseUrl,
+        channelTokenCredentialName: body.value.channelTokenCredentialName,
+      });
+    } catch (err) {
+      log.error('Baget refresh failed', { groupId, err });
+      sendJson(res, 500, {
+        ok: false,
+        error: 'refresh_failed',
+        message: err instanceof Error ? err.message : String(err),
+      });
+      return;
+    }
+    updateBagetTeamMembers(groupId, JSON.stringify(body.value.teamMembers));
+    sendJson(res, 200, { ok: true, agentGroupId: groupId, folder: existing.folder });
+  }
+
+  async function handleDelete(res: http.ServerResponse, groupId: string): Promise<void> {
+    // Soft-delete only — leaves the rendered prompt + container config
+    // on disk so a future re-pair can resurrect them. Concrete unbind
+    // (drop the messaging_group_agents row) is the responsibility of
+    // the channel adapter's own admin path; this endpoint handles the
+    // central agent_groups state.
+    archiveBagetAgentGroup(groupId, new Date(now()).toISOString());
+    sendJson(res, 200, { ok: true, agentGroupId: groupId, archived: true });
+  }
+
+  // Path resolution for the rendered group dir, in case future routes
+  // need it. Kept here so the server file is the single owner of the
+  // path shape.
+  void path.join(GROUPS_DIR, '_'); // type-touch, never used at runtime
+
+  return {
+    async listen(): Promise<void> {
+      if (server) return;
+      server = http.createServer((req, res) => {
+        handleRequest(req, res).catch((err) => {
+          log.error('Baget admin handler threw', { err, url: req.url });
+          if (!res.headersSent) {
+            sendJson(res, 500, { ok: false, error: 'internal_error', message: 'See server logs' });
+          } else {
+            try {
+              res.end();
+            } catch {
+              // socket already gone
+            }
+          }
+        });
+      });
+      await new Promise<void>((resolve, reject) => {
+        const onError = (err: Error) => reject(err);
+        server!.once('error', onError);
+        server!.listen(config.port, () => {
+          server!.off('error', onError);
+          log.info('Baget admin server listening', { port: config.port });
+          resolve();
+        });
+      });
+    },
+
+    async close(): Promise<void> {
+      if (!server) return;
+      await new Promise<void>((resolve) => server!.close(() => resolve()));
+      server = null;
+    },
+  };
+}
+
+function validateCreateBody(body: CreateAgentGroupBody): string | null {
+  const required: Array<keyof CreateAgentGroupBody> = [
+    'userId',
+    'companyId',
+    'companyName',
+    'teamMembers',
+    'channelTokenCredentialName',
+    'bagetApiBaseUrl',
+  ];
+  for (const k of required) {
+    if (body[k] === undefined || body[k] === null || (typeof body[k] === 'string' && body[k] === '')) {
+      return `Missing required field: ${k}`;
+    }
+  }
+  const tm = body.teamMembers;
+  if (!tm || typeof tm !== 'object') return 'teamMembers must be an object';
+  for (const role of ['cos', 'strategist', 'developer', 'marketing', 'analyst', 'design'] as const) {
+    if (typeof tm[role] !== 'string' || tm[role].trim().length === 0) {
+      return `teamMembers.${role} must be a non-empty string`;
+    }
+  }
+  // Cap user-controlled strings on the way in so a 10MB body doesn't
+  // OOM us before we even start rendering.
+  if (body.userId.length > 64 || body.companyId.length > 64) {
+    return 'userId / companyId too long (max 64 chars)';
+  }
+  if (body.companyName.length > 200) return 'companyName too long (max 200 chars)';
+  return null;
+}
+
+async function readJson<T>(req: http.IncomingMessage): Promise<{ ok: true; value: T } | { ok: false; error: string }> {
+  return new Promise((resolve) => {
+    const chunks: Buffer[] = [];
+    let total = 0;
+    const MAX = 64 * 1024; // 64KB — pairing bodies are tiny
+    req.on('data', (chunk: Buffer) => {
+      total += chunk.length;
+      if (total > MAX) {
+        req.destroy();
+        resolve({ ok: false, error: 'body too large' });
+        return;
+      }
+      chunks.push(chunk);
+    });
+    req.on('end', () => {
+      const raw = Buffer.concat(chunks).toString('utf8');
+      try {
+        resolve({ ok: true, value: JSON.parse(raw) as T });
+      } catch (err) {
+        resolve({ ok: false, error: `invalid JSON: ${err instanceof Error ? err.message : String(err)}` });
+      }
+    });
+    req.on('error', (err) => resolve({ ok: false, error: err.message }));
+  });
+}
+
+function sendJson(res: http.ServerResponse, status: number, body: unknown): void {
+  if (res.headersSent) return;
+  const payload = JSON.stringify(body);
+  res.writeHead(status, {
+    'Content-Type': 'application/json; charset=utf-8',
+    'Content-Length': Buffer.byteLength(payload).toString(),
+  });
+  res.end(payload);
+}
+
+// Helper for callers (Telegram channel adapter) that need the same
+// hash function the DB layer uses internally. Re-exported so callers
+// don't reach into baget-pairing-tokens.ts directly.
+export function tokenHash(rawToken: string): string {
+  return createHash('sha256').update(rawToken, 'utf8').digest('hex');
+}

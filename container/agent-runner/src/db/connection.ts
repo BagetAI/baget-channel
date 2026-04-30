@@ -20,18 +20,16 @@
 import { Database } from 'bun:sqlite';
 import fs from 'fs';
 
-const DEFAULT_INBOUND_PATH = '/workspace/inbound.db';
-const DEFAULT_OUTBOUND_PATH = '/workspace/outbound.db';
-const DEFAULT_HEARTBEAT_PATH = '/workspace/.heartbeat';
+import { workspaceHeartbeatPath, workspaceInboundDbPath, workspaceOutboundDbPath } from '../workspace-paths.js';
 
 let _inbound: Database | null = null;
 let _outbound: Database | null = null;
-let _heartbeatPath: string = DEFAULT_HEARTBEAT_PATH;
+let _heartbeatPath: string | null = null;
 
 /** Inbound DB — container opens read-only (host is the sole writer). */
 export function getInboundDb(): Database {
   if (!_inbound) {
-    _inbound = new Database(DEFAULT_INBOUND_PATH, { readonly: true });
+    _inbound = new Database(workspaceInboundDbPath(), { readonly: true });
     _inbound.exec('PRAGMA busy_timeout = 5000');
   }
   return _inbound;
@@ -40,7 +38,7 @@ export function getInboundDb(): Database {
 /** Outbound DB — container owns this file (sole writer). */
 export function getOutboundDb(): Database {
   if (!_outbound) {
-    _outbound = new Database(DEFAULT_OUTBOUND_PATH);
+    _outbound = new Database(workspaceOutboundDbPath());
     _outbound.exec('PRAGMA journal_mode = DELETE');
     _outbound.exec('PRAGMA busy_timeout = 5000');
     _outbound.exec('PRAGMA foreign_keys = ON');
@@ -120,7 +118,7 @@ export function clearContainerToolInFlight(): void {
  * A file touch is cheaper and avoids cross-boundary DB write contention.
  */
 export function touchHeartbeat(): void {
-  const p = _heartbeatPath;
+  const p = _heartbeatPath ?? (_heartbeatPath = workspaceHeartbeatPath());
   const now = new Date();
   try {
     fs.utimesSync(p, now, now);

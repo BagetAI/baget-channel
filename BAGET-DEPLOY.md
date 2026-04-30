@@ -179,3 +179,88 @@ message — those are looked up server-side after auth.
 | 6 | baget.ai dashboard CTA + backend bridge | day 5 (separate PR on baget.ai) |
 | 7 | Feature-flag staging traffic | day 5 |
 | 8 | Soak + delete deprecated `apps/web/src/lib/channels/*` | sprint+1 |
+
+## Env vars (single-process mode)
+
+The Railway service reads these at startup. Set them on the
+`baget-channel - main` service env tab.
+
+| Var | Required | Default | Purpose |
+|-----|---------|---------|---------|
+| `RUNTIME` | yes | `docker` | Set to `single-process` on Railway. Skips Docker readiness check, spawns the agent runner as a child Bun process per session. |
+| `ANTHROPIC_API_KEY` | yes | — | Claude Agent SDK auth. Read by the agent-runner provider. |
+| `TELEGRAM_BOT_TOKEN` | yes | — | Bot token for `@baget_team_bot`. Single shared bot across all founders; per-founder routing happens via `messaging_group_agents`. |
+| `TELEGRAM_WEBHOOK_SECRET` | yes | — | Echoed in `X-Telegram-Bot-Api-Secret-Token` on every webhook delivery. Constant-time-checked. |
+| `TELEGRAM_WEBHOOK_PORT` | no | `3001` | HTTP server port for inbound Telegram webhooks. |
+| `BAGET_TELEGRAM_BOT_USERNAME` | yes | `baget_team_bot` | Used to build the `t.me/<username>?start=<token>` deep link returned by the pairing API. |
+| `BAGET_ADMIN_TOKEN` | yes | — | Bearer token shared with `baget.ai`. ≥ 16 chars. Rotate by changing both ends; rotate on any incident. Also used as the HMAC key for pairing tokens. |
+| `BAGET_ADMIN_PORT` | no | `8443` | HTTP port for the admin pairing API. |
+| `BAGET_API_BASE_URL` | yes | — | The baget.ai public API the agent fans tool calls into (`https://app.baget.ai` for prod, `https://stg-app.baget.ai` for staging). Written into each rendered `container_config.json`. |
+| `ONECLI_URL`, `ONECLI_API_KEY` | yes (docker) / no (single-process) | — | Vault config. In single-process mode the agent inherits the host process env, so OneCLI is optional. |
+| `BAGET_BUN_PATH` | no | `bun` | Override the `bun` binary path. Useful for local dev where bun lives at `~/.bun/bin/bun`. |
+| `DATABASE_URL` | no | `data/v2.db` | Currently the host writes a per-volume SQLite file under `data/`. Future: switch to a managed Postgres if multi-replica becomes a thing. |
+| `WEBHOOK_PORT` | no | `3000` | Used by the upstream Chat-SDK webhook server (legacy). Distinct from `TELEGRAM_WEBHOOK_PORT` above. |
+
+**Important:** `RUNTIME=single-process` does NOT bypass tenant isolation. Every founder still gets a distinct `agent_groups` row, distinct session DB files (3-DB model), and distinct OneCLI bearer-token credential. What it bypasses is the kernel-level Docker isolation between sessions — safe in our threat model because the agent has no shell. See § "Why we don't need DinD" above.
+
+## Build & deploy
+
+```bash
+# Local Dockerfile build (smoke check)
+docker build -t baget-channel:dev .
+
+# Railway-managed deploy: railway.json declares Dockerfile builder, so a
+# `git push` to a Railway-linked branch is enough.
+git push origin baget/single-process-mode
+
+# Health check (Railway probes /healthz on the admin port — no auth required)
+curl -fsS https://nanoclaw.baget.ai/healthz
+```
+
+## Telegram webhook setup
+
+After the service is up:
+
+```bash
+# Tell Telegram where to deliver updates. Use the same secret you set
+# in TELEGRAM_WEBHOOK_SECRET so the channel adapter accepts them.
+curl -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/setWebhook" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "url": "https://nanoclaw.baget.ai/api/channels/telegram/webhook",
+    "secret_token": "${TELEGRAM_WEBHOOK_SECRET}",
+    "allowed_updates": ["message"]
+  }'
+```
+
+The `/api/channels/telegram/webhook` path is owned by the
+`baget-telegram` channel adapter, which listens on
+`TELEGRAM_WEBHOOK_PORT` (3001 by default). Put a Railway-managed
+reverse proxy in front of it on `nanoclaw.baget.ai`.
+
+## Pairing flow end-to-end (smoke test)
+
+```bash
+# 1. baget.ai backend asks baget-channel to provision the founder.
+curl -X POST https://nanoclaw.baget.ai/baget/agent-groups \
+  -H "Authorization: Bearer ${BAGET_ADMIN_TOKEN}" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "userId": "user-uuid-...",
+    "companyId": "company-uuid-...",
+    "companyName": "Acme",
+    "teamMembers": {
+      "cos": "Louis", "strategist": "Tristan", "developer": "Valentin",
+      "marketing": "Chloé", "analyst": "Théo", "design": "Nicolas"
+    },
+    "channelTokenCredentialName": "baget-channel-token-user-co",
+    "bagetApiBaseUrl": "https://app.baget.ai"
+  }'
+# → { ok: true, agentGroupId, folder, telegramDeepLink, pairingTokenExpiresAt }
+
+# 2. Founder taps deep link, lands at @baget_team_bot, types /start.
+#    Telegram delivers a webhook update to baget-channel.
+#    The adapter consumes the pairing token + binds the chat.
+
+# 3. Send any DM. Reply comes back as `🧭 Louis: …`.
+```
