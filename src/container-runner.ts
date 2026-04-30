@@ -20,7 +20,13 @@ import {
   TIMEZONE,
 } from './config.js';
 import { readContainerConfig, writeContainerConfig } from './container-config.js';
-import { CONTAINER_RUNTIME_BIN, hostGatewayArgs, readonlyMountArgs, stopContainer } from './container-runtime.js';
+import {
+  CONTAINER_RUNTIME_BIN,
+  hostGatewayArgs,
+  isSingleProcessMode,
+  readonlyMountArgs,
+  stopContainer,
+} from './container-runtime.js';
 import { composeGroupClaudeMd } from './claude-md-compose.js';
 import { getAgentGroup } from './db/agent-groups.js';
 import { getDb, hasTable } from './db/connection.js';
@@ -60,6 +66,26 @@ const activeContainers = new Map<string, { process: ChildProcess; containerName:
  */
 const wakePromises = new Map<string, Promise<boolean>>();
 
+/**
+ * Per-agent-group concurrency gate (Baget single-process mode).
+ *
+ * The original docker model isolates each session in its own kernel
+ * namespace, so a runaway agent eats only its own container's memory.
+ * In single-process mode every session shares the host's RAM — a single
+ * misbehaving founder could OOM the whole Railway service if their agent
+ * is wedged in a long tool-loop while ten more inbound messages arrive.
+ *
+ * The gate is per-(user, company), which in our schema is
+ * 1:1 with `agent_group_id`. Each agent_group serializes its own turns:
+ * a second wake while a turn is in flight chains onto the existing
+ * promise instead of spawning a parallel runner. Different founders are
+ * still concurrent — no global serialization.
+ *
+ * Empty in docker mode (where Docker's per-container memory limit
+ * provides the same protection more directly).
+ */
+const groupTurnPromises = new Map<string, Promise<unknown>>();
+
 export function getActiveContainerCount(): number {
   return activeContainers.size;
 }
@@ -90,7 +116,15 @@ export function wakeContainer(session: Session): Promise<boolean> {
     log.debug('Container wake already in-flight — joining existing promise', { sessionId: session.id });
     return existing;
   }
-  const promise = spawnContainer(session)
+
+  // In single-process mode, queue this wake behind any in-flight turn for
+  // the same agent_group. In docker mode, Docker's per-container memory
+  // limit + kernel isolation provide the same protection more directly,
+  // so the gate is bypassed.
+  const groupId = session.agent_group_id;
+  const prevTurn = isSingleProcessMode() ? groupTurnPromises.get(groupId) : undefined;
+  const promise = (prevTurn ? prevTurn.catch(() => undefined) : Promise.resolve())
+    .then(() => spawnContainer(session))
     .then(() => true)
     .catch((err) => {
       log.warn('wakeContainer failed — host-sweep will retry', { sessionId: session.id, err });
@@ -98,8 +132,17 @@ export function wakeContainer(session: Session): Promise<boolean> {
     })
     .finally(() => {
       wakePromises.delete(session.id);
+      // Only clear the group gate if WE were the latest entry. If a newer
+      // wake arrived after us and replaced the slot, leave it — that
+      // wake's `.finally` will clear its own slot.
+      if (groupTurnPromises.get(groupId) === promise) {
+        groupTurnPromises.delete(groupId);
+      }
     });
   wakePromises.set(session.id, promise);
+  if (isSingleProcessMode()) {
+    groupTurnPromises.set(groupId, promise);
+  }
   return promise;
 }
 
@@ -133,6 +176,14 @@ async function spawnContainer(session: Session): Promise<void> {
   const { provider, contribution } = resolveProviderContribution(session, agentGroup, containerConfig);
 
   const mounts = buildMounts(agentGroup, session, containerConfig, contribution);
+
+  // Single-process branch — Baget on Railway. Skip docker entirely; spawn
+  // the agent runner as a child Node process with workspace paths mapped
+  // via env vars (see container/agent-runner/src/workspace-paths.ts).
+  if (isSingleProcessMode()) {
+    return spawnSingleProcessRunner(agentGroup, session, mounts, contribution);
+  }
+
   const containerName = `nanoclaw-v2-${agentGroup.folder}-${Date.now()}`;
   // OneCLI agent identifier is always the agent group id — stable across
   // sessions and reversible via getAgentGroup() for approval routing.
@@ -196,10 +247,219 @@ export function killContainer(sessionId: string, reason: string): void {
   if (!entry) return;
 
   log.info('Killing container', { sessionId, reason, containerName: entry.containerName });
+  if (isSingleProcessMode()) {
+    // No docker container to stop — the entry is a child Node process.
+    // SIGTERM first, then SIGKILL via the close handler if it lingers.
+    try {
+      entry.process.kill('SIGTERM');
+    } catch (err) {
+      log.warn('SIGTERM failed in single-process mode', { sessionId, err });
+      try {
+        entry.process.kill('SIGKILL');
+      } catch {
+        // process already gone
+      }
+    }
+    return;
+  }
   try {
     stopContainer(entry.containerName);
   } catch {
     entry.process.kill('SIGKILL');
+  }
+}
+
+/**
+ * Single-process spawn: start the agent runner as a child Node process.
+ *
+ * No Docker, no namespaces — just Node + tsx loading the same
+ * agent-runner code that runs inside containers. Workspace paths are
+ * remapped via the BAGET_WORKSPACE env var; the runner's
+ * workspace-paths.ts honors it to find inbound.db / outbound.db /
+ * container.json on the host filesystem instead of /workspace.
+ *
+ * Provider-contributed env (e.g., XDG_DATA_HOME for opencode) and the
+ * additional `extra` mounts both flow into the child via env vars and
+ * symlinks respectively — see prepareSingleProcessExtras().
+ *
+ * Memory + CPU isolation is best-effort (Node `process.resourceUsage`
+ * + the per-group concurrency gate above). The OneCLI HTTPS proxy is
+ * skipped — in single-process mode the runner's outbound HTTP traffic
+ * uses the host process env, which the host already sets up.
+ */
+async function spawnSingleProcessRunner(
+  agentGroup: AgentGroup,
+  session: Session,
+  mounts: VolumeMount[],
+  providerContribution: ProviderContainerContribution,
+): Promise<void> {
+  const sessDir = sessionDir(agentGroup.id, session.id);
+  const groupDir = path.resolve(GROUPS_DIR, agentGroup.folder);
+
+  // Materialize the workspace layout on the host: <sessDir> already
+  // contains inbound.db / outbound.db; we add `agent` (symlink to
+  // groups/<folder>/) and `extra/<name>` (symlinks to provider-contributed
+  // RO dirs) so the runner's workspace-paths helpers resolve correctly.
+  prepareSingleProcessExtras(sessDir, groupDir, mounts);
+
+  // Resolve the agent-runner entry point. The runner uses `bun:sqlite`
+  // directly (db/connection.ts:20), so we MUST run it under bun in
+  // single-process mode — same runtime the docker image uses, just
+  // spawned without the docker container around it. The `bun` binary
+  // is expected on PATH (the Railway Dockerfile installs it).
+  //
+  // BAGET_BUN_PATH overrides for local dev where bun lives at
+  // ~/.bun/bin/bun rather than /usr/local/bin/bun.
+  const projectRoot = process.cwd();
+  const agentRunnerEntry = path.join(projectRoot, 'container', 'agent-runner', 'src', 'index.ts');
+  if (!fs.existsSync(agentRunnerEntry)) {
+    throw new Error(`Agent runner entry not found at ${agentRunnerEntry}`);
+  }
+  const bunBin = process.env.BAGET_BUN_PATH || 'bun';
+
+  // Build the child env with an explicit allowlist — passing the full
+  // host env would leak BAGET_ADMIN_TOKEN, TELEGRAM_*, ONECLI_API_KEY,
+  // and any other host secret into every spawned runner's
+  // /proc/<pid>/environ. The agent has no shell, but a buggy MCP tool
+  // that logged process.env would dump them. Allowlist instead.
+  //
+  // The allowlist includes: standard system vars (PATH, HOME, LANG,
+  // NODE_*), Claude SDK auth (ANTHROPIC_API_KEY), and provider-
+  // contributed env. Everything else is explicitly NOT propagated.
+  const childEnv: NodeJS.ProcessEnv = {
+    PATH: process.env.PATH,
+    HOME: process.env.HOME,
+    LANG: process.env.LANG,
+    LC_ALL: process.env.LC_ALL,
+    NODE_OPTIONS: process.env.NODE_OPTIONS,
+    NODE_ENV: process.env.NODE_ENV,
+    ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY,
+    ANTHROPIC_BASE_URL: process.env.ANTHROPIC_BASE_URL,
+    // Proxy settings for outbound HTTP. The OneCLI gateway uses these
+    // to route the agent's API traffic through the per-(user, company)
+    // bearer-token injection layer in docker mode; on Railway the host
+    // ingress may also set them. Either way, the runner's outbound
+    // fetches need them or they bypass the proxy and land 401.
+    HTTP_PROXY: process.env.HTTP_PROXY,
+    HTTPS_PROXY: process.env.HTTPS_PROXY,
+    NO_PROXY: process.env.NO_PROXY,
+    // Workspace + identity
+    TZ: TIMEZONE,
+    BAGET_WORKSPACE: sessDir,
+    BAGET_AGENT_GROUP_ID: agentGroup.id,
+    BAGET_AGENT_GROUP_NAME: agentGroup.name,
+    BAGET_SESSION_ID: session.id,
+  };
+  if (providerContribution.env) {
+    for (const [k, v] of Object.entries(providerContribution.env)) {
+      childEnv[k] = v;
+    }
+  }
+
+  // Clear any orphan heartbeat — same reason as the docker branch.
+  fs.rmSync(heartbeatPath(agentGroup.id, session.id), { force: true });
+
+  const containerName = `single-process-${agentGroup.folder}-${session.id}-${Date.now()}`;
+  log.info('Spawning single-process runner', {
+    sessionId: session.id,
+    agentGroup: agentGroup.name,
+    containerName,
+    sessDir,
+  });
+
+  const child = spawn(bunBin, ['run', agentRunnerEntry], {
+    stdio: ['ignore', 'pipe', 'pipe'],
+    env: childEnv,
+    cwd: path.join(sessDir, 'agent'),
+  });
+
+  activeContainers.set(session.id, { process: child, containerName });
+  markContainerRunning(session.id);
+
+  child.stderr?.on('data', (data) => {
+    for (const line of data.toString().trim().split('\n')) {
+      if (line) log.debug(line, { runner: agentGroup.folder });
+    }
+  });
+  child.stdout?.on('data', () => {});
+
+  // Resolve only when the child closes — this is what makes the
+  // per-agent_group concurrency gate actually serialize turns
+  // (groupTurnPromises in wakeContainer awaits the returned promise).
+  // Without this, the gate would only serialize spawn calls, leaving
+  // a runaway founder's agent free to fan out N child processes.
+  await new Promise<void>((resolve) => {
+    child.on('close', (code) => {
+      activeContainers.delete(session.id);
+      markContainerStopped(session.id);
+      stopTypingRefresh(session.id);
+      log.info('Single-process runner exited', { sessionId: session.id, code, containerName });
+      resolve();
+    });
+    child.on('error', (err) => {
+      activeContainers.delete(session.id);
+      markContainerStopped(session.id);
+      stopTypingRefresh(session.id);
+      log.error('Single-process runner spawn error', { sessionId: session.id, err });
+      resolve();
+    });
+  });
+}
+
+/**
+ * Materialize the workspace layout on the host so the runner's
+ * workspace-paths helpers resolve correctly without bind mounts.
+ *
+ * Done with symlinks rather than copies so admin changes to
+ * groups/<folder>/CLAUDE.local.md / container.json take effect on the
+ * next runner spawn (composeGroupClaudeMd in buildMounts already
+ * regenerates the composed CLAUDE.md every spawn).
+ *
+ * Symlink reuse: if a link already points at the correct target we
+ * leave it. Mismatched targets are unlinked + recreated.
+ */
+function prepareSingleProcessExtras(sessDir: string, groupDir: string, mounts: VolumeMount[]): void {
+  fs.mkdirSync(sessDir, { recursive: true });
+
+  // <sessDir>/agent → groups/<folder>
+  ensureSymlink(path.join(sessDir, 'agent'), groupDir);
+
+  // <sessDir>/extra/<name> for each provider-contributed RO mount whose
+  // container path is under /workspace/extra. Skip mounts targeting
+  // /workspace/agent or /workspace itself (the agent symlink covers them).
+  const extraMounts = mounts.filter((m) => m.containerPath.startsWith('/workspace/extra/'));
+  if (extraMounts.length > 0) {
+    fs.mkdirSync(path.join(sessDir, 'extra'), { recursive: true });
+    for (const m of extraMounts) {
+      const name = m.containerPath.slice('/workspace/extra/'.length);
+      if (!name || name.includes('/') || name.includes('..')) continue;
+      ensureSymlink(path.join(sessDir, 'extra', name), m.hostPath);
+    }
+  }
+}
+
+function ensureSymlink(linkPath: string, target: string): void {
+  let needsCreate = true;
+  try {
+    const stat = fs.lstatSync(linkPath);
+    if (stat.isSymbolicLink()) {
+      const current = fs.readlinkSync(linkPath);
+      if (current === target) {
+        needsCreate = false;
+      } else {
+        fs.unlinkSync(linkPath);
+      }
+    } else {
+      // Not a symlink — refuse to overwrite (could be a real dir with
+      // user data). Caller should investigate.
+      throw new Error(`Refusing to overwrite non-symlink at ${linkPath}`);
+    }
+  } catch (err) {
+    const e = err as NodeJS.ErrnoException;
+    if (e.code !== 'ENOENT') throw err;
+  }
+  if (needsCreate) {
+    fs.symlinkSync(target, linkPath);
   }
 }
 

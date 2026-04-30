@@ -6,6 +6,14 @@ export interface AgentGroup {
   folder: string;
   agent_provider: string | null;
   created_at: string;
+  /** Baget user UUID — set by the Baget pairing API; NULL otherwise. */
+  user_id?: string | null;
+  /** Baget company UUID — set by the Baget pairing API; NULL otherwise. */
+  company_id?: string | null;
+  /** ISO timestamp when the group was soft-deleted. NULL = active. */
+  archived_at?: string | null;
+  /** JSON-encoded BagetTeamMembers — six per-founder names. NULL for non-Baget rows. */
+  baget_team_members?: string | null;
 }
 
 export type UnknownSenderPolicy = 'strict' | 'request_approval' | 'public';

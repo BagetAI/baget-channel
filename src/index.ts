@@ -6,6 +6,9 @@
  */
 import path from 'path';
 
+import { randomUUID } from 'crypto';
+
+import { createBagetAdminServer, type BagetAdminServer } from './baget-admin-server.js';
 import { DATA_DIR } from './config.js';
 import { enforceStartupBackoff, resetCircuitBreaker } from './circuit-breaker.js';
 import { migrateGroupsToClaudeLocal } from './claude-md-compose.js';
@@ -163,8 +166,27 @@ async function main(): Promise<void> {
   startHostSweep();
   log.info('Host sweep started');
 
+  // 7. Optional Baget admin server. Gated on env so a pure-nanoclaw
+  //    install runs untouched. Required env: BAGET_ADMIN_TOKEN +
+  //    BAGET_TELEGRAM_BOT_USERNAME. Port resolution: Railway sets PORT
+  //    automatically and routes the public ingress there, so prefer it
+  //    when present; fall back to BAGET_ADMIN_PORT (local dev) → 8443.
+  if (process.env.BAGET_ADMIN_TOKEN) {
+    const port = parseInt(process.env.PORT ?? process.env.BAGET_ADMIN_PORT ?? '8443', 10);
+    const username = process.env.BAGET_TELEGRAM_BOT_USERNAME ?? 'baget_team_bot';
+    bagetAdmin = createBagetAdminServer({
+      port,
+      adminToken: process.env.BAGET_ADMIN_TOKEN,
+      telegramBotUsername: username,
+      generateAgentGroupId: () => `ag-${randomUUID()}`,
+    });
+    await bagetAdmin.listen();
+  }
+
   log.info('NanoClaw running');
 }
+
+let bagetAdmin: BagetAdminServer | null = null;
 
 /** Graceful shutdown. */
 async function shutdown(signal: string): Promise<void> {
@@ -178,6 +200,14 @@ async function shutdown(signal: string): Promise<void> {
   }
   stopDeliveryPolls();
   stopHostSweep();
+  if (bagetAdmin) {
+    try {
+      await bagetAdmin.close();
+    } catch (err) {
+      log.warn('Baget admin server close threw', { err });
+    }
+    bagetAdmin = null;
+  }
   try {
     await teardownChannelAdapters();
   } finally {

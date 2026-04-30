@@ -32,12 +32,11 @@ import { buildSystemPromptAddendum } from './destinations.js';
 import './providers/index.js';
 import { createProvider, type ProviderName } from './providers/factory.js';
 import { runPollLoop } from './poll-loop.js';
+import { workspaceAgentDir, workspaceExtraDir } from './workspace-paths.js';
 
 function log(msg: string): void {
   console.error(`[agent-runner] ${msg}`);
 }
-
-const CWD = '/workspace/agent';
 
 async function main(): Promise<void> {
   const config = loadConfig();
@@ -53,9 +52,9 @@ async function main(): Promise<void> {
   // memory lives in /workspace/agent/CLAUDE.local.md (auto-loaded).
   const instructions = buildSystemPromptAddendum(config.assistantName || undefined);
 
-  // Discover additional directories mounted at /workspace/extra/*
+  // Discover additional directories mounted at <workspace>/extra/*
   const additionalDirectories: string[] = [];
-  const extraBase = '/workspace/extra';
+  const extraBase = workspaceExtraDir();
   if (fs.existsSync(extraBase)) {
     for (const entry of fs.readdirSync(extraBase)) {
       const fullPath = path.join(extraBase, entry);
@@ -96,7 +95,7 @@ async function main(): Promise<void> {
   await runPollLoop({
     provider,
     providerName,
-    cwd: CWD,
+    cwd: workspaceAgentDir(),
     systemContext: { instructions },
   });
 }

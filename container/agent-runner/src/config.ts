@@ -1,13 +1,15 @@
 /**
- * Runner config — reads /workspace/agent/container.json at startup.
+ * Runner config — reads <workspace>/agent/container.json at startup.
  *
- * This file is mounted read-only inside the container. The host writes it;
- * the runner only reads. All NanoClaw-specific configuration lives here
- * instead of environment variables.
+ * In docker mode, this file is mounted read-only inside the container.
+ * In single-process mode, it lives on the host filesystem at the path
+ * resolved by `workspaceContainerConfigPath()` (override via BAGET_WORKSPACE).
+ * Either way the runner only reads. All NanoClaw-specific configuration
+ * lives here instead of environment variables.
  */
 import fs from 'fs';
 
-const CONFIG_PATH = '/workspace/agent/container.json';
+import { workspaceContainerConfigPath } from './workspace-paths.js';
 
 export interface RunnerConfig {
   provider: string;
@@ -29,11 +31,12 @@ let _config: RunnerConfig | null = null;
 export function loadConfig(): RunnerConfig {
   if (_config) return _config;
 
+  const configPath = workspaceContainerConfigPath();
   let raw: Record<string, unknown> = {};
   try {
-    raw = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'));
+    raw = JSON.parse(fs.readFileSync(configPath, 'utf8'));
   } catch {
-    console.error(`[config] Failed to read ${CONFIG_PATH}, using defaults`);
+    console.error(`[config] Failed to read ${configPath}, using defaults`);
   }
 
   _config = {

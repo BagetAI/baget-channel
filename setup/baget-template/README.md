@@ -8,8 +8,9 @@ group folder; it has unfilled `{{placeholders}}`.
 ## Files
 
 - **`CLAUDE.md.template`** — persona prompt with `{{cos_name}}`,
-  `{{strategist_name}}`, `{{developer_name}}`, `{{marketing_name}}`,
-  `{{analyst_name}}`, `{{design_name}}`, `{{company_name}}` placeholders.
+  `{{developer_name}}`, `{{marketing_name}}`, `{{analyst_name}}`,
+  `{{design_name}}`, `{{ops_name}}`, `{{company_name}}` placeholders.
+  Six personas, one per `@baget/shared::AgentRole` (intern excluded).
   Rendered by `src/baget-pairing.ts::renderBagetClaudeMd()` with the
   founder's actual team names (resolved on the baget.ai side via
   `getAgentName(companyId, role)` from `@baget/shared`, then passed in
@@ -52,11 +53,11 @@ const md = renderBagetClaudeMd({
   companyName: 'Acme',
   teamMembers: {
     cos: 'Louis',
-    strategist: 'Nicolas',
     developer: 'Tristan',
     marketing: 'Valentin',
     analyst: 'Chloé',
     design: 'Théo',
+    ops: 'Marie',
   },
 });
 fs.writeFileSync('groups/baget-localdev/CLAUDE.local.md', md);

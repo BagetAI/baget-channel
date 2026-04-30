@@ -7,3 +7,5 @@
 // self-registration import below.
 
 import './cli.js';
+// Baget telegram channel — self-registers when TELEGRAM_BOT_TOKEN is set.
+import './baget-telegram.js';

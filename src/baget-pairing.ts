@@ -51,21 +51,21 @@ const BAGET_TEMPLATE_FILE = path.join(BAGET_TEMPLATE_DIR, 'CLAUDE.md.template');
  */
 export type BagetTeamMembers = {
   cos: string;
-  strategist: string;
   developer: string;
   marketing: string;
   analyst: string;
   design: string;
+  ops: string;
 };
 
 const REQUIRED_PLACEHOLDERS: ReadonlyArray<string> = [
   'company_name',
   'cos_name',
-  'strategist_name',
   'developer_name',
   'marketing_name',
   'analyst_name',
   'design_name',
+  'ops_name',
 ];
 
 export interface RenderClaudeMdArgs {
@@ -95,11 +95,11 @@ export function renderBagetClaudeMd(args: RenderClaudeMdArgs): string {
   const vars: Record<string, string> = {
     company_name: args.companyName,
     cos_name: args.teamMembers.cos,
-    strategist_name: args.teamMembers.strategist,
     developer_name: args.teamMembers.developer,
     marketing_name: args.teamMembers.marketing,
     analyst_name: args.teamMembers.analyst,
     design_name: args.teamMembers.design,
+    ops_name: args.teamMembers.ops,
   };
 
   // Verify every required placeholder has a non-empty value before
@@ -108,9 +108,7 @@ export function renderBagetClaudeMd(args: RenderClaudeMdArgs): string {
   for (const key of REQUIRED_PLACEHOLDERS) {
     const v = vars[key];
     if (typeof v !== 'string' || v.trim().length === 0) {
-      throw new Error(
-        `Baget template render: required placeholder "${key}" is empty or missing`,
-      );
+      throw new Error(`Baget template render: required placeholder "${key}" is empty or missing`);
     }
   }
 
@@ -124,9 +122,7 @@ export function renderBagetClaudeMd(args: RenderClaudeMdArgs): string {
   });
   for (const key of seenPlaceholders) {
     if (!(key in vars)) {
-      throw new Error(
-        `Baget template render: template uses {{${key}}} but renderer has no value for it`,
-      );
+      throw new Error(`Baget template render: template uses {{${key}}} but renderer has no value for it`);
     }
   }
 
@@ -197,9 +193,7 @@ export interface ProvisionedBagetGroup {
   claudeLocalPath: string;
 }
 
-export function provisionBagetGroup(
-  args: ProvisionBagetGroupArgs,
-): ProvisionedBagetGroup {
+export function provisionBagetGroup(args: ProvisionBagetGroupArgs): ProvisionedBagetGroup {
   const folder = bagetGroupFolderName(args.userId, args.companyId);
   const groupDir = path.resolve(GROUPS_DIR, folder);
   fs.mkdirSync(groupDir, { recursive: true });
@@ -232,10 +226,9 @@ export function provisionBagetGroup(
       BAGET_API_BASE_URL: args.bagetApiBaseUrl,
       BAGET_COMPANY_ID: args.companyId,
     },
-    secrets: [
-      ...(baseConfig.secrets ?? []),
-      args.channelTokenCredentialName,
-    ].filter((v, i, arr) => arr.indexOf(v) === i),
+    secrets: [...(baseConfig.secrets ?? []), args.channelTokenCredentialName].filter(
+      (v, i, arr) => arr.indexOf(v) === i,
+    ),
   };
 
   // Strip the _*_note keys we use for human reference in the template.
