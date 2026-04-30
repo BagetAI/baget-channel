@@ -41,14 +41,14 @@
  */
 import { createHash, createHmac, randomBytes, timingSafeEqual } from 'crypto';
 import http from 'http';
-import path from 'path';
 
-import { GROUPS_DIR } from './config.js';
 import {
   archiveBagetAgentGroup,
   createBagetAgentGroup,
   getBagetAgentGroup,
+  getBagetAgentGroupById,
   unarchiveBagetAgentGroup,
+  unbindMessagingGroupsForAgent,
   updateBagetTeamMembers,
 } from './db/baget-agent-groups.js';
 import { insertPairingToken, sweepExpiredPairingTokens } from './db/baget-pairing-tokens.js';
@@ -410,19 +410,30 @@ export function createBagetAdminServer(config: BagetAdminServerConfig): BagetAdm
   }
 
   async function handleDelete(res: http.ServerResponse, groupId: string): Promise<void> {
-    // Soft-delete only — leaves the rendered prompt + container config
-    // on disk so a future re-pair can resurrect them. Concrete unbind
-    // (drop the messaging_group_agents row) is the responsibility of
-    // the channel adapter's own admin path; this endpoint handles the
-    // central agent_groups state.
-    archiveBagetAgentGroup(groupId, new Date(now()).toISOString());
-    sendJson(res, 200, { ok: true, agentGroupId: groupId, archived: true });
-  }
+    // Tenant guard: only Baget-provisioned rows (user_id IS NOT NULL)
+    // can be archived through this endpoint. A baget.ai bug or
+    // compromise that points DELETE at an unrelated agent_group_id
+    // (e.g. a non-Baget legacy group) will get a 404 instead of
+    // silently stamping `archived_at` on someone else's row.
+    const existing = getBagetAgentGroupById(groupId);
+    if (!existing || !existing.user_id) {
+      sendJson(res, 404, {
+        ok: false,
+        error: 'group_not_found',
+        message: `No Baget agent_group with id ${groupId}`,
+      });
+      return;
+    }
 
-  // Path resolution for the rendered group dir, in case future routes
-  // need it. Kept here so the server file is the single owner of the
-  // path shape.
-  void path.join(GROUPS_DIR, '_'); // type-touch, never used at runtime
+    // Soft-delete the row + drop every chat→agent wiring it owns.
+    // The rendered prompt + container_config.json stay on disk so a
+    // future re-pair (POST /baget/agent-groups for the same user/co)
+    // resurrects them. Without the unbind, post-archive DMs would
+    // continue waking a runner against an archived group.
+    archiveBagetAgentGroup(groupId, new Date(now()).toISOString());
+    const unbound = unbindMessagingGroupsForAgent(groupId);
+    sendJson(res, 200, { ok: true, agentGroupId: groupId, archived: true, unboundChats: unbound });
+  }
 
   return {
     async listen(): Promise<void> {

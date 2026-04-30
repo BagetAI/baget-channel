@@ -90,3 +90,19 @@ export function archiveBagetAgentGroup(id: string, archivedAt: string): void {
 export function unarchiveBagetAgentGroup(id: string): void {
   getDb().prepare('UPDATE agent_groups SET archived_at = NULL WHERE id = ?').run(id);
 }
+
+/**
+ * Drop every `messaging_group_agents` row that wires a chat to this
+ * agent_group. Used by `DELETE /baget/agent-groups/:groupId` to make
+ * sure post-archive DMs from the founder's chat fall through the
+ * router's no-agent path instead of waking a soft-deleted runner.
+ *
+ * Returns the number of rows dropped — 0 is fine (founder may never
+ * have completed pairing).
+ */
+export function unbindMessagingGroupsForAgent(agentGroupId: string): number {
+  const r = getDb()
+    .prepare('DELETE FROM messaging_group_agents WHERE agent_group_id = ?')
+    .run(agentGroupId);
+  return r.changes;
+}

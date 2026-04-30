@@ -317,12 +317,26 @@ async function spawnSingleProcessRunner(
   }
   const bunBin = process.env.BAGET_BUN_PATH || 'bun';
 
+  // Build the child env with an explicit allowlist — passing the full
+  // host env would leak BAGET_ADMIN_TOKEN, TELEGRAM_*, ONECLI_API_KEY,
+  // and any other host secret into every spawned runner's
+  // /proc/<pid>/environ. The agent has no shell, but a buggy MCP tool
+  // that logged process.env would dump them. Allowlist instead.
+  //
+  // The allowlist includes: standard system vars (PATH, HOME, LANG,
+  // NODE_*), Claude SDK auth (ANTHROPIC_API_KEY), and provider-
+  // contributed env. Everything else is explicitly NOT propagated.
   const childEnv: NodeJS.ProcessEnv = {
-    ...process.env,
+    PATH: process.env.PATH,
+    HOME: process.env.HOME,
+    LANG: process.env.LANG,
+    LC_ALL: process.env.LC_ALL,
+    NODE_OPTIONS: process.env.NODE_OPTIONS,
+    ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY,
+    ANTHROPIC_BASE_URL: process.env.ANTHROPIC_BASE_URL,
+    // Workspace + identity
     TZ: TIMEZONE,
     BAGET_WORKSPACE: sessDir,
-    // Identity fields the runner reads from container.json — set as env
-    // vars too for callers that inspect them in logs.
     BAGET_AGENT_GROUP_ID: agentGroup.id,
     BAGET_AGENT_GROUP_NAME: agentGroup.name,
     BAGET_SESSION_ID: session.id,
@@ -360,18 +374,26 @@ async function spawnSingleProcessRunner(
   });
   child.stdout?.on('data', () => {});
 
-  child.on('close', (code) => {
-    activeContainers.delete(session.id);
-    markContainerStopped(session.id);
-    stopTypingRefresh(session.id);
-    log.info('Single-process runner exited', { sessionId: session.id, code, containerName });
-  });
-
-  child.on('error', (err) => {
-    activeContainers.delete(session.id);
-    markContainerStopped(session.id);
-    stopTypingRefresh(session.id);
-    log.error('Single-process runner spawn error', { sessionId: session.id, err });
+  // Resolve only when the child closes — this is what makes the
+  // per-agent_group concurrency gate actually serialize turns
+  // (groupTurnPromises in wakeContainer awaits the returned promise).
+  // Without this, the gate would only serialize spawn calls, leaving
+  // a runaway founder's agent free to fan out N child processes.
+  await new Promise<void>((resolve) => {
+    child.on('close', (code) => {
+      activeContainers.delete(session.id);
+      markContainerStopped(session.id);
+      stopTypingRefresh(session.id);
+      log.info('Single-process runner exited', { sessionId: session.id, code, containerName });
+      resolve();
+    });
+    child.on('error', (err) => {
+      activeContainers.delete(session.id);
+      markContainerStopped(session.id);
+      stopTypingRefresh(session.id);
+      log.error('Single-process runner spawn error', { sessionId: session.id, err });
+      resolve();
+    });
   });
 }
 

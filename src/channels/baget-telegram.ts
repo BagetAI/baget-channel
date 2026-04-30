@@ -31,7 +31,7 @@
  *     Telegram's 25s timeout never bites us.
  */
 import http from 'http';
-import { timingSafeEqual } from 'crypto';
+import { randomUUID, timingSafeEqual } from 'crypto';
 
 import { tokenHash, verifyPairingTokenHmac } from '../baget-admin-server.js';
 import { applyPersonaPrefix } from '../baget-persona.js';
@@ -174,7 +174,19 @@ function buildAdapter(cfg: BagetTelegramConfig): ChannelAdapter {
     }
     recentUpdates.add(update.update_id);
     // Persistent dedup. `recordSeenUpdate` returns false on duplicate.
-    const fresh = recordSeenUpdate(update.update_id, new Date().toISOString());
+    // A SQL failure (disk full, transient) MUST NOT silently drop the
+    // update — the in-process Set already deduped, so falling through
+    // to processing is at-most-once-per-process which is the correct
+    // best-effort behavior. Surface the error to ops.
+    let fresh = true;
+    try {
+      fresh = recordSeenUpdate(update.update_id, new Date().toISOString());
+    } catch (err) {
+      log.error('Baget telegram: persistent dedup write failed — falling back to in-memory only', {
+        err,
+        updateId: update.update_id,
+      });
+    }
     if (!fresh) return;
 
     const msg = update.message ?? update.edited_message;
@@ -217,19 +229,26 @@ function buildAdapter(cfg: BagetTelegramConfig): ChannelAdapter {
 
   /**
    * Pairing token consume → bind chat to (messaging_group → agent_group).
-   * On any failure path we send a friendly error back to the founder and
-   * silently drop the message — never leak which step failed (token
-   * unknown vs expired vs already-used) to avoid giving an attacker a
-   * confirmation oracle.
+   *
+   * SECURITY: every failure path the FOUNDER sees is the same string.
+   * This prevents a remote attacker from using the bot's reply as an
+   * oracle to distinguish:
+   *   - a forged token (HMAC mismatch)
+   *   - a never-issued token
+   *   - a stale token (expired)
+   *   - a replay (already used)
+   * The structured log lines DO include the reason for ops triage —
+   * log access is treated as privileged.
    */
   async function handleStartCommand(msg: UpdateMessage, rawToken: string): Promise<void> {
     const chatId = msg.chat.id;
+    const FAILURE_MSG = "That pairing link isn't valid or has expired. Generate a fresh one from the dashboard.";
 
     // 1. HMAC pre-check — defense in depth so a tampered token never
     //    even hits the DB.
     if (!verifyPairingTokenHmac(rawToken, cfg.adminToken)) {
       log.warn('Baget telegram: /start token failed HMAC check', { chatId });
-      await sendBotMessage(chatId, 'That pairing link looks malformed or expired. Try again from the dashboard.');
+      await sendBotMessage(chatId, FAILURE_MSG);
       return;
     }
 
@@ -237,12 +256,7 @@ function buildAdapter(cfg: BagetTelegramConfig): ChannelAdapter {
     const result = consumePairingToken(rawToken, new Date().toISOString());
     if (!result.ok) {
       log.warn('Baget telegram: /start token consume failed', { chatId, reason: result.reason });
-      await sendBotMessage(
-        chatId,
-        result.reason === 'expired'
-          ? "That pairing link expired. Generate a fresh one from the dashboard."
-          : "That pairing link isn't valid. Generate a fresh one from the dashboard.",
-      );
+      await sendBotMessage(chatId, FAILURE_MSG);
       return;
     }
 
@@ -256,25 +270,32 @@ function buildAdapter(cfg: BagetTelegramConfig): ChannelAdapter {
         chatId,
         agentGroupId: row.agent_group_id,
       });
-      await sendBotMessage(chatId, 'Your team channel was deactivated. Re-enable it from the dashboard.');
+      await sendBotMessage(chatId, FAILURE_MSG);
       return;
     }
 
     // 4. Bind: ensure messaging_group + messaging_group_agents.
+    //    UUID-based ids so two rapid /start calls in the same ms can't
+    //    collide on PK insert.
     const platformId = platformIdFor(chatId);
     let mg = getMessagingGroupByPlatform(BAGET_TELEGRAM_CHANNEL_TYPE, platformId);
     const nowIso = new Date().toISOString();
     if (!mg) {
-      const id = `mg-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
-      createMessagingGroup({
-        id,
-        channel_type: BAGET_TELEGRAM_CHANNEL_TYPE,
-        platform_id: platformId,
-        name: msg.from?.first_name ?? null,
-        is_group: 0,
-        unknown_sender_policy: 'public',
-        created_at: nowIso,
-      });
+      try {
+        createMessagingGroup({
+          id: `mg-${randomUUID()}`,
+          channel_type: BAGET_TELEGRAM_CHANNEL_TYPE,
+          platform_id: platformId,
+          name: msg.from?.first_name ?? null,
+          is_group: 0,
+          unknown_sender_policy: 'public',
+          created_at: nowIso,
+        });
+      } catch {
+        // Concurrent /start raced and created the row first. The
+        // UNIQUE(channel_type, platform_id) constraint rejected ours;
+        // re-read and proceed with the winner.
+      }
       mg = getMessagingGroupByPlatform(BAGET_TELEGRAM_CHANNEL_TYPE, platformId);
       if (!mg) {
         log.error('Baget telegram: failed to read back messaging_group after insert', { chatId });
@@ -285,18 +306,25 @@ function buildAdapter(cfg: BagetTelegramConfig): ChannelAdapter {
 
     const existingMga = getMessagingGroupAgentByPair(mg.id, row.agent_group_id);
     if (!existingMga) {
-      createMessagingGroupAgent({
-        id: `mga-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`,
-        messaging_group_id: mg.id,
-        agent_group_id: row.agent_group_id,
-        engage_mode: 'pattern',
-        engage_pattern: '.', // every message in this DM
-        sender_scope: 'all',
-        ignored_message_policy: 'drop',
-        session_mode: 'shared',
-        priority: 0,
-        created_at: nowIso,
-      });
+      try {
+        createMessagingGroupAgent({
+          id: `mga-${randomUUID()}`,
+          messaging_group_id: mg.id,
+          agent_group_id: row.agent_group_id,
+          engage_mode: 'pattern',
+          engage_pattern: '.', // every message in this DM
+          sender_scope: 'all',
+          ignored_message_policy: 'drop',
+          session_mode: 'shared',
+          priority: 0,
+          created_at: nowIso,
+        });
+      } catch {
+        // UNIQUE(messaging_group_id, agent_group_id) — concurrent bind
+        // landed first. Both racing tokens belonged to the same agent
+        // group (single-use semantics gate that), so the existing row
+        // is the right one to keep.
+      }
     }
 
     // 5. Welcome the founder. Use the team's CoS persona for the first
@@ -327,25 +355,44 @@ function buildAdapter(cfg: BagetTelegramConfig): ChannelAdapter {
 
     // Resolve the agent_group from the messaging_group → applyPersonaPrefix.
     // We don't currently have the agent_group_id on the OutboundMessage
-    // payload, so look it up via messaging_group → first wired agent
-    // (Baget chats only ever have one agent wired).
+    // payload, so look it up via messaging_group's wired agents.
+    //
+    // SECURITY: refuse to deliver if the chat has more than one wired
+    // agent. Baget founders are 1:1 chat↔agent_group by construction.
+    // A multi-bind state would let the model in agent_group A render
+    // its reply with agent_group B's team-name prefix — a one-call
+    // cross-tenant impersonation if the schema ever permits it. We
+    // detect it here and drop loud rather than silently render under
+    // the wrong identity. Single-bind is enforced by the /start
+    // handler's UNIQUE constraint, but this is the second-line check.
     const mg = getMessagingGroupByPlatform(BAGET_TELEGRAM_CHANNEL_TYPE, platformId);
     let prefixed = text;
     if (mg) {
-      const wired = getFirstAgentForMg(mg.id);
-      if (wired) {
-        const ag = getBagetAgentGroupById(wired.agent_group_id);
+      const wired = getMessagingGroupAgents(mg.id);
+      if (wired.length > 1) {
+        log.error('Baget telegram: refusing to deliver — chat has >1 wired agent_group', {
+          platformId,
+          mgId: mg.id,
+          count: wired.length,
+        });
+        return undefined;
+      }
+      const single = wired[0];
+      if (single) {
+        const ag = getBagetAgentGroupById(single.agent_group_id);
+        if (ag?.archived_at) {
+          log.warn('Baget telegram: drop deliver — agent_group archived', {
+            platformId,
+            agentGroupId: single.agent_group_id,
+          });
+          return undefined;
+        }
         const team = parseTeamMembers(ag?.baget_team_members);
         if (team) prefixed = applyPersonaPrefix(text, team);
       }
     }
 
     return sendBotMessage(chatId, prefixed);
-  }
-
-  function getFirstAgentForMg(messagingGroupId: string) {
-    const agents = getMessagingGroupAgents(messagingGroupId);
-    return agents[0] ?? null;
   }
 
   async function sendBotMessage(chatId: number | string, text: string): Promise<string | undefined> {
