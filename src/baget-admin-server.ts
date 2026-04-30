@@ -1,13 +1,15 @@
 /**
  * Baget admin pairing server.
  *
- * One HTTP server, three routes, all behind a constant-time bearer-token
+ * One HTTP server, all routes behind a constant-time bearer-token
  * check against `BAGET_ADMIN_TOKEN`. Wire contract is documented in
  * BAGET-DEPLOY.md "Pairing contract: baget.ai ↔ baget-channel".
  *
  *   POST   /baget/agent-groups                       — create / refresh + mint pairing token
  *   POST   /baget/agent-groups/:groupId/refresh-prompt — re-render prompt only
- *   DELETE /baget/agent-groups/:groupId              — soft-delete + unbind chat
+ *   DELETE /baget/agent-groups/:groupId              — soft-delete by id (path-style)
+ *   DELETE /baget/agent-groups                       — soft-delete by (userId, companyId) body
+ *   GET    /baget/agent-groups/by-tuple              — status check for the dashboard pair modal
  *   GET    /healthz                                   — public, no auth
  *   POST   /api/channels/telegram/webhook             — registered by the
  *                                                       Baget Telegram channel
