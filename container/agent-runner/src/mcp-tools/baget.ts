@@ -323,6 +323,97 @@ const listDocuments: McpToolDefinition = {
   },
 };
 
+const readDocument: McpToolDefinition = {
+  tool: {
+    name: 'baget_read_document',
+    description:
+      "Read the full markdown body of a single document. Use after `baget_list_documents` has surfaced the right one — pass the `id` from that listing. Returns the entire content; you should summarize for the founder rather than dumping verbatim. Use when the founder asks 'what's in the BP?', 'summarize the brand guide', 'tell me about the deck'.",
+    inputSchema: {
+      type: 'object',
+      properties: {
+        id: { type: 'string', format: 'uuid' },
+      },
+      required: ['id'],
+      additionalProperties: false,
+    },
+  },
+  async handler(args) {
+    const ctx = requireCompanyId();
+    if (!ctx.ok) return fail(ctx.error);
+    const id = String(args.id ?? '');
+    if (!id) return fail('id is required');
+    const result = await bagetFetch({
+      method: 'GET',
+      path: `/api/companies/${ctx.companyId}/documents/${encodeURIComponent(id)}`,
+    });
+    if (!result.ok) {
+      // 404 → return null (matches the in-app `read_document` tool's
+      // shape) so the model can recover with "I couldn't find that
+      // document." rather than throwing.
+      if (result.status === 404) return ok('null');
+      return fail(`read_document failed: ${result.error}`);
+    }
+    return ok(JSON.stringify(result.data, null, 2));
+  },
+};
+
+const listRecentBatches: McpToolDefinition = {
+  tool: {
+    name: 'baget_list_recent_batches',
+    description:
+      "List the company's last 5 batches with task counts (done / in-progress / pending / errored) + sample task titles. The open batch (`isCurrent: true`) is what the team is working on right now. Use when the founder asks 'what shipped this week?', 'what's the team working on?', 'what tasks are running?', 'show me recent batches'.",
+    inputSchema: { type: 'object', properties: {}, additionalProperties: false },
+  },
+  async handler() {
+    const ctx = requireCompanyId();
+    if (!ctx.ok) return fail(ctx.error);
+    const result = await bagetFetch({
+      method: 'GET',
+      path: `/api/companies/${ctx.companyId}/batches/recent`,
+    });
+    if (!result.ok) return fail(`list_recent_batches failed: ${result.error}`);
+    return ok(JSON.stringify(result.data, null, 2));
+  },
+};
+
+const listReminders: McpToolDefinition = {
+  tool: {
+    name: 'baget_list_reminders',
+    description:
+      "List the founder's pending reminders for this company (id, firesAt, promptText, createdAt). Up to 10 rows, ordered by firesAt ASC (next-to-fire first). Use when the founder asks 'what reminders do I have?', 'show my reminders', 'what am I going to be pinged about?', or before `baget_cancel_reminder` to look up an id.",
+    inputSchema: { type: 'object', properties: {}, additionalProperties: false },
+  },
+  async handler() {
+    const ctx = requireCompanyId();
+    if (!ctx.ok) return fail(ctx.error);
+    const result = await bagetFetch({
+      method: 'GET',
+      path: `/api/companies/${ctx.companyId}/reminders`,
+    });
+    if (!result.ok) return fail(`list_reminders failed: ${result.error}`);
+    return ok(JSON.stringify(result.data, null, 2));
+  },
+};
+
+const listPendingApprovals: McpToolDefinition = {
+  tool: {
+    name: 'baget_list_pending_approvals',
+    description:
+      "List things waiting on the founder's approval — pending cycle proposals (the CoS-suggested next-batch direction) and ad drafts ready to launch. Use when the founder asks 'anything pending my approval?', 'what's waiting on me?', 'do I have anything to review?'. Each item has a `type` discriminator (`cycle-proposal` or `ad-draft`) and the relevant fields. Empty array when nothing is pending.",
+    inputSchema: { type: 'object', properties: {}, additionalProperties: false },
+  },
+  async handler() {
+    const ctx = requireCompanyId();
+    if (!ctx.ok) return fail(ctx.error);
+    const result = await bagetFetch({
+      method: 'GET',
+      path: `/api/companies/${ctx.companyId}/pending-approvals`,
+    });
+    if (!result.ok) return fail(`list_pending_approvals failed: ${result.error}`);
+    return ok(JSON.stringify(result.data, null, 2));
+  },
+};
+
 // ── WRITE tools (direct — no approval card needed) ────────────────────────────
 
 const setDirection: McpToolDefinition = {
@@ -614,6 +705,64 @@ const resumeAd: McpToolDefinition = {
   },
 };
 
+const setReminder: McpToolDefinition = {
+  tool: {
+    name: 'baget_set_reminder',
+    description:
+      "Schedule a reminder. Use when the founder says 'remind me at <time> to <thing>', 'ping me in 2 hours about X', 'don't let me forget Y'. Pass `firesAt` as ISO 8601 datetime — distill from the founder's natural-language phrase; use the founder's timezone (in `baget_get_company_overview`) for ambiguous wall-clock times. RUNS IMMEDIATELY (free). Returns the reminder id.",
+    inputSchema: {
+      type: 'object',
+      properties: {
+        firesAt: {
+          type: 'string',
+          description: 'ISO 8601 datetime when the reminder should fire (UTC).',
+        },
+        promptText: {
+          type: 'string',
+          description: 'What the bot should say at fire time. Max 500 chars.',
+          minLength: 1,
+          maxLength: 500,
+        },
+      },
+      required: ['firesAt', 'promptText'],
+      additionalProperties: false,
+    },
+  },
+  async handler(args) {
+    return dispatchDirect({
+      action: 'set-reminder',
+      payload: {
+        firesAt: String(args.firesAt),
+        promptText: String(args.promptText),
+      },
+      fallbackMessage: 'Reminder set.',
+    });
+  },
+};
+
+const cancelReminder: McpToolDefinition = {
+  tool: {
+    name: 'baget_cancel_reminder',
+    description:
+      "Cancel a pending reminder by id. Use when the founder says 'cancel that reminder', 'forget the X reminder', 'I don't need the reminder about Y anymore'. Call `baget_list_reminders` first to find the id (the model never invents reminder ids). RUNS IMMEDIATELY (free).",
+    inputSchema: {
+      type: 'object',
+      properties: {
+        id: { type: 'string', format: 'uuid' },
+      },
+      required: ['id'],
+      additionalProperties: false,
+    },
+  },
+  async handler(args) {
+    return dispatchDirect({
+      action: 'cancel-reminder',
+      payload: { id: String(args.id) },
+      fallbackMessage: 'Reminder cancelled.',
+    });
+  },
+};
+
 // ── WRITE tools (approval-gated) ─────────────────────────────────────────────
 
 const launchBatch: McpToolDefinition = {
@@ -734,6 +883,10 @@ registerTools([
   getCompanyOverview,
   queryMetrics,
   listDocuments,
+  readDocument,
+  listRecentBatches,
+  listReminders,
+  listPendingApprovals,
   // Write — direct
   setDirection,
   updateMetric,
@@ -747,6 +900,8 @@ registerTools([
   rejectPending,
   pauseAd,
   resumeAd,
+  setReminder,
+  cancelReminder,
   // Write — approval-gated
   launchBatch,
   editDocument,
@@ -754,4 +909,4 @@ registerTools([
   sendCampaign,
 ]);
 
-log('baget MCP tools registered: 3 read + 12 direct write + 4 approval-gated = 19 total');
+log('baget MCP tools registered: 7 read + 14 direct write + 4 approval-gated = 25 total');
