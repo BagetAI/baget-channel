@@ -17,7 +17,8 @@ group folder; it has unfilled `{{placeholders}}`.
   the pairing API call).
 - **`container_config.json`** — env + secrets template. The host patches
   `BAGET_COMPANY_ID`, `BAGET_API_BASE_URL`, and the OneCLI secret name
-  per founder before writing to the group folder.
+  per founder before writing the runtime `container.json` into the group
+  folder.
 - **`README.md`** — this file.
 
 ## Install / pairing flow (production)
@@ -33,7 +34,7 @@ The full pairing flow is documented in `BAGET-DEPLOY.md`. Summary:
      UUIDs.
    - Renders `CLAUDE.md.template` → writes to
      `groups/<folder>/CLAUDE.local.md`.
-   - Patches + writes `container_config.json` to the same folder.
+   - Patches + writes `container.json` to the same folder.
    - Inserts the `agent_groups` row.
 4. Returns a single-use Telegram deep link to the founder.
 5. Founder taps `/start <token>` → channel adapter binds the chat to
@@ -64,7 +65,7 @@ fs.writeFileSync('groups/baget-localdev/CLAUDE.local.md', md);
 "
 
 # Copy + patch container config:
-cp setup/baget-template/container_config.json groups/baget-localdev/
+cp setup/baget-template/container_config.json groups/baget-localdev/container.json
 # Edit:
 #   - BAGET_API_BASE_URL → https://stg-app.baget.ai
 #   - Add BAGET_COMPANY_ID with your test company's UUID

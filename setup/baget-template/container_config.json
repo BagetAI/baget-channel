@@ -1,5 +1,7 @@
 {
   "_comment": "Container config for the Baget agent group. Mounts the baget-mcp tools (built into this fork's container/agent-runner) and threads the per-(user, company) channel token + company id from OneCLI / agent-group settings. Adjust BAGET_API_BASE_URL via /customize for staging vs prod.",
+  "provider": "gemini",
+  "_provider_note": "Agent-runner LLM provider. 'gemini' uses @google/genai and reads GOOGLE_GENERATIVE_AI_API_KEY (falling back to GOOGLE_AI_API_KEY) from env. Other options: 'mock' for offline smoke and 'claude' for the legacy SDK path.",
   "env": {
     "BAGET_API_BASE_URL": "https://stg-app.baget.ai",
     "_BAGET_CHANNEL_TOKEN_note": "Injected by OneCLI from the agent vault (credential: baget-channel-token). Each agent has its own scoped token tied to (user_id, company_id, conversation_id). Revoking from the dashboard immediately invalidates writes.",

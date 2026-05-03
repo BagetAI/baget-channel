@@ -42,7 +42,7 @@ WORKDIR /app
 # Install bun for the agent-runner spawns. Pinned to a known-good
 # version — bumping Bun is a deliberate change because the agent-runner's
 # bun:sqlite + bun:test usage tends to drift on Bun majors.
-ARG BUN_VERSION=1.1.45
+ARG BUN_VERSION=1.2.20
 RUN apt-get update \
     && apt-get install -y --no-install-recommends curl ca-certificates unzip \
     && curl -fsSL https://bun.sh/install | bash -s -- "bun-v${BUN_VERSION}" \
@@ -57,6 +57,17 @@ COPY --from=builder /app/dist ./dist
 COPY container ./container
 COPY setup ./setup
 COPY package.json ./
+
+# Install the agent-runner's OWN dependencies. The agent-runner has its
+# own package.json (container/agent-runner/package.json) with deps the
+# host doesn't share — `@anthropic-ai/claude-agent-sdk`, `@google/genai`,
+# `@modelcontextprotocol/sdk`, `zod`. Without this, every spawned
+# single-process runner crashes
+# immediately on the `import './providers/claude.js'` barrel:
+#   `Cannot find module '@anthropic-ai/claude-agent-sdk'`
+# Bun resolves modules from the script's local node_modules, so we
+# install at /app/container/agent-runner/node_modules.
+RUN cd /app/container/agent-runner && bun install --production
 
 # Pre-create groups/ + data/ — first request to provision a Baget
 # agent_group needs them present. Made world-writable so the runtime

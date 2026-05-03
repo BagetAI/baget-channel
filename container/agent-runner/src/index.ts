@@ -32,6 +32,7 @@ import { buildSystemPromptAddendum } from './destinations.js';
 import './providers/index.js';
 import { createProvider, type ProviderName } from './providers/factory.js';
 import { runPollLoop } from './poll-loop.js';
+import { buildProviderSystemInstructions } from './system-prompt.js';
 import { workspaceAgentDir, workspaceExtraDir } from './workspace-paths.js';
 
 function log(msg: string): void {
@@ -50,7 +51,10 @@ async function main(): Promise<void> {
   // /workspace/agent/CLAUDE.md — the composed entry imports the shared
   // base (/app/CLAUDE.md) and each enabled module's fragment. Per-group
   // memory lives in /workspace/agent/CLAUDE.local.md (auto-loaded).
-  const instructions = buildSystemPromptAddendum(config.assistantName || undefined);
+  const instructions = buildProviderSystemInstructions(
+    providerName,
+    buildSystemPromptAddendum(config.assistantName || undefined),
+  );
 
   // Discover additional directories mounted at <workspace>/extra/*
   const additionalDirectories: string[] = [];

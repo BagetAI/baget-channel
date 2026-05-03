@@ -30,6 +30,7 @@ export interface PollLoopConfig {
    */
   providerName: string;
   cwd: string;
+  signal?: AbortSignal;
   systemContext?: {
     instructions?: string;
   };
@@ -46,6 +47,8 @@ export interface PollLoopConfig {
  * 6. Loop
  */
 export async function runPollLoop(config: PollLoopConfig): Promise<void> {
+  if (config.signal?.aborted) return;
+
   // Resume the agent's prior session from a previous container run if one
   // was persisted. The continuation is opaque to the poll-loop — the
   // provider decides how to use it (Claude resumes a .jsonl transcript,
@@ -62,7 +65,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
   clearStaleProcessingAcks();
 
   let pollCount = 0;
-  while (true) {
+  while (!config.signal?.aborted) {
     // Skip system messages — they're responses for MCP tools (e.g., ask_user_question)
     const messages = getPendingMessages().filter((m) => m.kind !== 'system');
     pollCount++;
@@ -73,7 +76,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     }
 
     if (messages.length === 0) {
-      await sleep(POLL_INTERVAL_MS);
+      await sleep(POLL_INTERVAL_MS, config.signal);
       continue;
     }
 
@@ -86,7 +89,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     // the "store as context, don't engage" contract. Host-side countDueMessages
     // gates the same way for wake-from-cold (see src/db/session-db.ts).
     if (!messages.some((m) => m.trigger === 1)) {
-      await sleep(POLL_INTERVAL_MS);
+      await sleep(POLL_INTERVAL_MS, config.signal);
       continue;
     }
 
@@ -171,7 +174,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     const skippedSet = new Set(skipped);
     const processingIds = ids.filter((id) => !commandIds.includes(id) && !skippedSet.has(id));
     try {
-      const result = await processQuery(query, routing, processingIds, config.providerName);
+      const result = await processQuery(query, routing, processingIds, config.providerName, config.signal);
       if (result.continuation && result.continuation !== continuation) {
         continuation = result.continuation;
         setContinuation(config.providerName, continuation);
@@ -205,6 +208,8 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     markCompleted(processingIds);
     log(`Completed ${ids.length} message(s)`);
   }
+
+  log('Poll loop stopped');
 }
 
 /**
@@ -250,9 +255,15 @@ async function processQuery(
   routing: RoutingContext,
   initialBatchIds: string[],
   providerName: string,
+  signal?: AbortSignal,
 ): Promise<QueryResult> {
   let queryContinuation: string | undefined;
   let done = false;
+
+  const abortListener = () => {
+    query.abort();
+  };
+  signal?.addEventListener('abort', abortListener, { once: true });
 
   // Concurrent polling: push follow-ups into the active query as they arrive.
   // We do NOT force-end the stream on silence — keeping the query open is
@@ -261,7 +272,7 @@ async function processQuery(
   // claim age (see src/host-sweep.ts); if something is truly stuck, the host
   // will kill the container and messages get reset to pending.
   const pollHandle = setInterval(() => {
-    if (done) return;
+    if (done || signal?.aborted) return;
 
     // Skip system messages (MCP tool responses) and /clear (needs fresh query).
     // Thread routing is the router's concern — if a message landed in this
@@ -317,6 +328,7 @@ async function processQuery(
   } finally {
     done = true;
     clearInterval(pollHandle);
+    signal?.removeEventListener('abort', abortListener);
   }
 
   return { continuation: queryContinuation };
@@ -432,6 +444,21 @@ function sendToDestination(dest: DestinationEntry, body: string, routing: Routin
   });
 }
 
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) return Promise.resolve();
+
+  return new Promise((resolve) => {
+    const timeout = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+
+    const onAbort = () => {
+      clearTimeout(timeout);
+      signal?.removeEventListener('abort', onAbort);
+      resolve();
+    };
+
+    signal?.addEventListener('abort', onAbort, { once: true });
+  });
 }

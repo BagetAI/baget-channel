@@ -378,7 +378,7 @@ async function spawnSingleProcessRunner(
 
   child.stderr?.on('data', (data) => {
     for (const line of data.toString().trim().split('\n')) {
-      if (line) log.debug(line, { runner: agentGroup.folder });
+      if (line) log.warn(line, { runner: agentGroup.folder });
     }
   });
   child.stdout?.on('data', () => {});
@@ -480,6 +480,13 @@ export function resolveProviderName(
   containerConfigProvider: string | null | undefined,
 ): string {
   return (sessionProvider || agentGroupProvider || containerConfigProvider || 'claude').toLowerCase();
+}
+
+export function resolveAssistantName(agentGroup: Pick<AgentGroup, 'name' | 'company_id'>): string | undefined {
+  // Baget founder groups impersonate a team of roles, not a single assistant.
+  // Using the company name here makes the model answer "I am <company>" when
+  // asked who it is, which fights the Louis/Valentin/... persona layer.
+  return agentGroup.company_id ? undefined : agentGroup.name;
 }
 
 function resolveProviderContribution(
@@ -675,8 +682,13 @@ function ensureRuntimeFields(
     containerConfig.groupName = agentGroup.name;
     dirty = true;
   }
-  if (containerConfig.assistantName !== agentGroup.name) {
-    containerConfig.assistantName = agentGroup.name;
+  const assistantName = resolveAssistantName(agentGroup);
+  if ((containerConfig.assistantName ?? undefined) !== assistantName) {
+    if (assistantName) {
+      containerConfig.assistantName = assistantName;
+    } else {
+      delete containerConfig.assistantName;
+    }
     dirty = true;
   }
   if (dirty) {

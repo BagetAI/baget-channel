@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { resolveProviderName } from './container-runner.js';
+import { resolveAssistantName, resolveProviderName } from './container-runner.js';
 
 describe('resolveProviderName', () => {
   it('prefers session over group and container.json', () => {
@@ -28,5 +28,15 @@ describe('resolveProviderName', () => {
   it('treats empty string as unset (falls through)', () => {
     expect(resolveProviderName('', 'codex', null)).toBe('codex');
     expect(resolveProviderName(null, '', 'opencode')).toBe('opencode');
+  });
+});
+
+describe('resolveAssistantName', () => {
+  it('uses the agent group name for standard agents', () => {
+    expect(resolveAssistantName({ name: 'Andy', company_id: null })).toBe('Andy');
+  });
+
+  it('omits assistantName for Baget founder groups', () => {
+    expect(resolveAssistantName({ name: 'Acme', company_id: 'company-1' })).toBeUndefined();
   });
 });
