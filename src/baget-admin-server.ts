@@ -60,10 +60,13 @@ import {
   unbindMessagingGroupsForAgent,
   updateBagetTeamMembers,
 } from './db/baget-agent-groups.js';
+import {
+  deleteChannelToken,
+  upsertChannelToken,
+} from './db/baget-channel-tokens.js';
 import { insertPairingToken, sweepExpiredPairingTokens } from './db/baget-pairing-tokens.js';
 import { provisionBagetGroup, type BagetTeamMembers } from './baget-pairing.js';
 import { bindBagetTelegramChat, sendBagetTelegramWelcome } from './channels/baget-telegram-bind.js';
-import { persistChannelToken } from './baget-channel-secret.js';
 import { log } from './log.js';
 
 // ── Auth ──
@@ -156,10 +159,12 @@ export interface CreateAgentGroupBody {
   bagetApiBaseUrl: string;
   /**
    * Plaintext per-(user, company) bearer token from baget.ai's
-   * `mintChannelToken`. Persisted into our OneCLI vault under
-   * `channelTokenCredentialName` so the per-founder agent container
-   * reads it as `BAGET_CHANNEL_TOKEN` env on every spawn and uses it
-   * to call back into baget.ai's bearer-auth routes.
+   * `mintChannelToken`. UPSERTed into the local `baget_channel_tokens`
+   * table keyed by agent_group_id (single-process mode — see
+   * `src/db/baget-channel-tokens.ts` and migration 015 for the
+   * architecture context). The host's `spawnSingleProcessRunner` reads
+   * the row at every spawn and injects the value as
+   * `BAGET_CHANNEL_TOKEN` env into the child Bun runner.
    *
    * Optional for backwards-compat: pre-bridge baget.ai builds (and
    * the legacy /start <token> path) don't supply it. When omitted,
@@ -170,8 +175,13 @@ export interface CreateAgentGroupBody {
    * versions can mark this required.
    *
    * NEVER log this. NEVER echo in error messages. The persist helper
-   * (`persistChannelToken` in `baget-channel-secret.ts`) scrubs it
-   * from any OneCLI stderr before logging.
+   * (`upsertChannelToken` in `db/baget-channel-tokens.ts`) only logs
+   * the agent_group_id — never the token value.
+   *
+   * Note: `channelTokenCredentialName` above is preserved in the body
+   * shape for backwards compat (older callers send it; we ignore it
+   * on this path because per-(user, company) keying is already done
+   * by agent_group_id in single-process mode).
    */
   channelToken?: string;
 }
@@ -382,21 +392,31 @@ export function createBagetAdminServer(config: BagetAdminServerConfig): BagetAdm
 
   /**
    * Shared post-provision step: if baget.ai supplied `channelToken`,
-   * persist it into our OneCLI vault so the agent container reads it
-   * as `BAGET_CHANNEL_TOKEN` env on every spawn. Returns true on
-   * success (or when no token was supplied — backwards compat path);
-   * returns false after writing a 500 response on persist failure.
+   * UPSERT it into the per-agent_group row in `baget_channel_tokens`
+   * so the host's spawnSingleProcessRunner can inject it as
+   * `BAGET_CHANNEL_TOKEN` env on every spawn. Returns true on success
+   * (or when no token was supplied — backwards compat path); returns
+   * false after writing a 500 response on persist failure.
    *
-   * The host-pattern is derived from `bagetApiBaseUrl` because OneCLI
-   * scopes secret injection per-host. A founder on staging
-   * (stg-app.baget.ai) gets a token that only injects on that host;
-   * prod (app.baget.ai) gets a separate one — no cross-env leak.
+   * Why agent_group_id (not credential-name / host-pattern):
+   *   The OneCLI-vault persistence model (docker mode) needed those
+   *   fields because the gateway scoped secret injection per-host and
+   *   per-agent. In single-process mode the host injects directly into
+   *   the child env at spawn time keyed by agent_group_id — which is
+   *   already the right granularity (1:1 with a (user, company) tuple
+   *   via the partial UNIQUE index on agent_groups). The old fields
+   *   are no longer load-bearing.
+   *
+   *   `bagetApiBaseUrl` and `channelTokenCredentialName` arrive in the
+   *   request body for backwards compat (and the rendered
+   *   container.json still uses bagetApiBaseUrl), but we no longer
+   *   need them on this path.
    */
-  async function maybePersistChannelToken(
+  function maybePersistChannelToken(
     res: http.ServerResponse,
     body: CreateAgentGroupBody,
-    agentName: string,
-  ): Promise<boolean> {
+    agentGroupId: string,
+  ): boolean {
     if (!body.channelToken) {
       // Backwards-compat: pre-bridge baget.ai builds (and the legacy
       // /start <token> path) don't supply this. The agent container
@@ -405,36 +425,30 @@ export function createBagetAdminServer(config: BagetAdminServerConfig): BagetAdm
       return true;
     }
 
-    let hostPattern: string;
     try {
-      hostPattern = new URL(body.bagetApiBaseUrl).host;
-    } catch {
-      // Already validated as non-empty in validateCreateBody, but the
-      // URL parser is the load-bearing check for actual URL-shape.
-      sendJson(res, 400, {
-        ok: false,
-        error: 'invalid_body',
-        message: 'bagetApiBaseUrl must be a valid URL',
-      });
-      return false;
-    }
-
-    try {
-      await persistChannelToken({
-        agentName,
-        credentialName: body.channelTokenCredentialName,
+      upsertChannelToken({
+        agentGroupId,
         tokenValue: body.channelToken,
-        hostPattern,
+        now: new Date(now()).toISOString(),
+      });
+      log.info('Baget channel-token: persisted to SQLite', {
+        agentGroupId,
+        // Never log channelToken — the wrapper above sanitizes by
+        // omission.
       });
       return true;
     } catch (err) {
-      // persistChannelToken already logged the scrubbed error. Don't
-      // double-log here — and definitely don't surface the original
-      // err to the wire (it might contain CLI argv).
+      // Catch-all because better-sqlite3 throws on disk-full / locked /
+      // schema-mismatch / FK-violation. Never surface err.message to
+      // the wire because it could contain SQL fragments.
+      log.error('Baget channel-token: SQLite UPSERT failed', {
+        agentGroupId,
+        err: err instanceof Error ? err.message : String(err),
+      });
       sendJson(res, 500, {
         ok: false,
         error: 'channel_token_persist_failed',
-        message: 'Failed to persist channel token in OneCLI vault',
+        message: 'Failed to persist channel token to local store',
       });
       return false;
     }
@@ -519,11 +533,11 @@ export function createBagetAdminServer(config: BagetAdminServerConfig): BagetAdm
     }
 
     // 2b. Persist baget.ai's per-(user, company) bearer token into
-    //     OneCLI so the per-spawn agent container reads it as
-    //     BAGET_CHANNEL_TOKEN env. Skip silently when baget.ai didn't
-    //     supply one (backwards-compat with pre-bridge builds and the
-    //     legacy /start <token> path).
-    if (!(await maybePersistChannelToken(res, body.value, companyName))) {
+    //     `baget_channel_tokens` so spawnSingleProcessRunner reads it
+    //     as BAGET_CHANNEL_TOKEN env on every spawn. Skip silently
+    //     when baget.ai didn't supply one (backwards-compat with
+    //     pre-bridge builds and the legacy /start <token> path).
+    if (!maybePersistChannelToken(res, body.value, agentGroupId)) {
       // The helper already wrote the 500 response. Note: the
       // agent_groups row above is committed and will get re-used on
       // a retry; the pairing token mint below is skipped on this
@@ -680,10 +694,10 @@ export function createBagetAdminServer(config: BagetAdminServerConfig): BagetAdm
     //     persist fails, we don't want a "bound chat" without the
     //     token to back its calls — the founder would DM the bot,
     //     get a useless reply, and not know why. Bail before bind.
-    if (!(await maybePersistChannelToken(res, body.value, companyName))) {
+    if (!maybePersistChannelToken(res, body.value, agentGroupId)) {
       // The helper already wrote the 500. The agent_groups row above
-      // is committed; a retry will hit the existing row + retry the
-      // OneCLI persist (idempotent via delete-then-create).
+      // is committed; a retry will hit the existing row + UPSERT the
+      // token (idempotent via INSERT … ON CONFLICT … DO UPDATE).
       return;
     }
 
@@ -810,9 +824,23 @@ export function createBagetAdminServer(config: BagetAdminServerConfig): BagetAdm
     // future re-pair (POST /baget/agent-groups for the same user/co)
     // resurrects them. Without the unbind, post-archive DMs would
     // continue waking a runner against an archived group.
+    //
+    // Drop the channel token FIRST so any in-flight spawn that
+    // squeezes through after the archive stamp lands sees no token
+    // and the agent surfaces "re-pair" to the founder. baget.ai's
+    // resolveChannelToken is the second-line guarantee — it 401s any
+    // bearer whose row is revoked there — but defense in depth is
+    // cheap.
+    const tokenDeleted = deleteChannelToken(groupId);
     archiveBagetAgentGroup(groupId, new Date(now()).toISOString());
     const unbound = unbindMessagingGroupsForAgent(groupId);
-    sendJson(res, 200, { ok: true, agentGroupId: groupId, archived: true, unboundChats: unbound });
+    sendJson(res, 200, {
+      ok: true,
+      agentGroupId: groupId,
+      archived: true,
+      unboundChats: unbound,
+      channelTokenDeleted: tokenDeleted > 0,
+    });
   }
 
   /**
@@ -918,6 +946,9 @@ export function createBagetAdminServer(config: BagetAdminServerConfig): BagetAdm
       });
       return;
     }
+    // Token first → archive → unbind. Same fail-closed ordering as
+    // the path-style DELETE (handleDelete above).
+    const tokenDeleted = deleteChannelToken(existing.id);
     archiveBagetAgentGroup(existing.id, new Date(now()).toISOString());
     const unbound = unbindMessagingGroupsForAgent(existing.id);
     sendJson(res, 200, {
@@ -925,6 +956,7 @@ export function createBagetAdminServer(config: BagetAdminServerConfig): BagetAdm
       agentGroupId: existing.id,
       archived: true,
       unboundChats: unbound,
+      channelTokenDeleted: tokenDeleted > 0,
     });
   }
 
