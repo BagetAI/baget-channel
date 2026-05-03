@@ -17,7 +17,7 @@
  * Logging discipline:
  *   `tokenValue` MUST NEVER be logged. Helper signatures intentionally
  *   omit it from any debug-friendly return shape. Callers serialize only
- *   `agentGroupId` and `persisted_at` for telemetry.
+ *   `agentGroupId` and `persistedAt` for telemetry.
  */
 import { getDb } from './connection.js';
 
@@ -26,6 +26,22 @@ export interface ChannelTokenRow {
   token_value: string;
   persisted_at: string;
   rotated_from_at: string | null;
+}
+
+/**
+ * Result of a single-row read at spawn time. Bundles the raw bearer
+ * with the safe-to-log metadata so the spawn path runs ONE prepared-
+ * statement walk, not two — and the breadcrumb describes the same
+ * generation that's about to be injected (no TOCTOU window between a
+ * separate value read and a separate metadata read).
+ */
+export interface ChannelTokenReadResult {
+  /** Raw bearer to inject as `BAGET_CHANNEL_TOKEN`. NEVER log. */
+  tokenValue: string;
+  /** ISO timestamp the row was written/last rotated to. Safe to log. */
+  persistedAt: string;
+  /** ISO of the prior persisted_at when this is a rotation, else null. Safe to log. */
+  rotatedFromAt: string | null;
 }
 
 /**
@@ -38,8 +54,14 @@ export interface ChannelTokenRow {
  * via `rotateChannelToken`. Never log it. Validation of length/charset
  * is the caller's responsibility (validateCreateBody in
  * baget-admin-server.ts already enforces base64url + 30..256 chars).
+ *
+ * The persisted_at timestamp is generated inside the helper so callers
+ * can't accidentally pass a numeric ms-epoch instead of an ISO string —
+ * the previous design had a `now: string` param that invited that
+ * exact bug for any future caller.
  */
-export function upsertChannelToken(args: { agentGroupId: string; tokenValue: string; now: string }): void {
+export function upsertChannelToken(args: { agentGroupId: string; tokenValue: string }): void {
+  const persistedAt = new Date().toISOString();
   getDb()
     .prepare(
       `INSERT INTO baget_channel_tokens (agent_group_id, token_value, persisted_at, rotated_from_at)
@@ -49,42 +71,46 @@ export function upsertChannelToken(args: { agentGroupId: string; tokenValue: str
          token_value     = excluded.token_value,
          persisted_at    = excluded.persisted_at`,
     )
-    .run(args.agentGroupId, args.tokenValue, args.now);
+    .run(args.agentGroupId, args.tokenValue, persistedAt);
 }
 
 /**
- * Spawn-time read. Returns the raw token verbatim so the host can inject
- * it into the child runner env. NEVER log the return value. Returns null
- * when no token exists for this agent_group — the agent-runner side
- * surfaces a clear "re-pair from dashboard" error to the founder.
+ * Spawn-time atomic read: returns the bearer + safe-to-log metadata in
+ * one SELECT, or null when no token exists for this agent_group. NEVER
+ * log the `tokenValue` field of the return; the `persistedAt` /
+ * `rotatedFromAt` fields are explicitly safe.
+ *
+ * Folding metadata into the same SELECT prevents the post-rotation
+ * TOCTOU window where the spawn path could read the new value but log
+ * the old metadata (or vice versa).
  */
-export function getChannelToken(agentGroupId: string): string | null {
+export function getChannelToken(agentGroupId: string): ChannelTokenReadResult | null {
   const row = getDb()
-    .prepare('SELECT token_value FROM baget_channel_tokens WHERE agent_group_id = ?')
-    .get(agentGroupId) as { token_value: string } | undefined;
-  return row?.token_value ?? null;
+    .prepare(
+      'SELECT token_value, persisted_at, rotated_from_at FROM baget_channel_tokens WHERE agent_group_id = ?',
+    )
+    .get(agentGroupId) as
+    | { token_value: string; persisted_at: string; rotated_from_at: string | null }
+    | undefined;
+  if (!row) return null;
+  return {
+    tokenValue: row.token_value,
+    persistedAt: row.persisted_at,
+    rotatedFromAt: row.rotated_from_at,
+  };
 }
 
 /**
  * Hard-delete on agent_group archive (called from the admin DELETE
  * handler). Returns the change count — 0 is fine when the founder never
  * supplied a channel token (pre-bridge baget.ai builds).
+ *
+ * In production this is the load-bearing cleanup path: agent_groups
+ * uses soft-delete via archived_at, NOT row delete, so the FK CASCADE
+ * in migration 015 only fires under operator hard-delete (cleanup
+ * scripts). Don't rely on the cascade in normal flows.
  */
 export function deleteChannelToken(agentGroupId: string): number {
   const r = getDb().prepare('DELETE FROM baget_channel_tokens WHERE agent_group_id = ?').run(agentGroupId);
   return r.changes;
-}
-
-/**
- * Sentinel-only metadata getter for telemetry. Returns the persisted_at
- * + rotated_from_at columns WITHOUT the token value — safe to log. Used
- * by the spawn path to emit a breadcrumb on first inject after rotation.
- */
-export function getChannelTokenMeta(
-  agentGroupId: string,
-): { persisted_at: string; rotated_from_at: string | null } | null {
-  const row = getDb()
-    .prepare('SELECT persisted_at, rotated_from_at FROM baget_channel_tokens WHERE agent_group_id = ?')
-    .get(agentGroupId) as { persisted_at: string; rotated_from_at: string | null } | undefined;
-  return row ?? null;
 }

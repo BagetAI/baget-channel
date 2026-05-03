@@ -41,8 +41,10 @@
  *   reasoning applies as for any other host secret on Railway: if the
  *   container is compromised, all secrets in /app/data and process.env
  *   are exposed. The token rotates at every re-pair (UPSERT replaces),
- *   and baget.ai's resolveChannelToken can revoke any leaked token by
- *   stamping channel_tokens.revoked_at on its side.
+ *   and baget.ai's side has its own revocation column on a separate
+ *   `channel_tokens` table (see baget.ai's `apps/web/src/lib/channel-
+ *   token.ts` for the resolver — verify the schema there before
+ *   relying on it as the second-line revocation guarantee).
  */
 import type Database from 'better-sqlite3';
 

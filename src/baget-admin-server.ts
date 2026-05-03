@@ -60,10 +60,8 @@ import {
   unbindMessagingGroupsForAgent,
   updateBagetTeamMembers,
 } from './db/baget-agent-groups.js';
-import {
-  deleteChannelToken,
-  upsertChannelToken,
-} from './db/baget-channel-tokens.js';
+import { deleteChannelToken, upsertChannelToken } from './db/baget-channel-tokens.js';
+import { getDb } from './db/connection.js';
 import { insertPairingToken, sweepExpiredPairingTokens } from './db/baget-pairing-tokens.js';
 import { provisionBagetGroup, type BagetTeamMembers } from './baget-pairing.js';
 import { bindBagetTelegramChat, sendBagetTelegramWelcome } from './channels/baget-telegram-bind.js';
@@ -429,21 +427,28 @@ export function createBagetAdminServer(config: BagetAdminServerConfig): BagetAdm
       upsertChannelToken({
         agentGroupId,
         tokenValue: body.channelToken,
-        now: new Date(now()).toISOString(),
       });
       log.info('Baget channel-token: persisted to SQLite', {
         agentGroupId,
-        // Never log channelToken — the wrapper above sanitizes by
-        // omission.
+        // Never log channelToken — the helper signature omits it from
+        // any return shape, and we don't echo from the body either.
       });
       return true;
     } catch (err) {
       // Catch-all because better-sqlite3 throws on disk-full / locked /
-      // schema-mismatch / FK-violation. Never surface err.message to
-      // the wire because it could contain SQL fragments.
+      // schema-mismatch / FK-violation. We log only the error CLASS +
+      // CODE — never `err.message`. SQLite error messages can echo
+      // bound parameter values when CHECK constraints or RAISE triggers
+      // are present, and `tokenValue` is one of the bound parameters.
+      // Today's schema has no CHECK / RAISE on this table, so the leak
+      // vector is theoretical, but the principle ("don't log raw err
+      // strings near a secret column") survives schema drift.
+      const errCode = (err as { code?: string }).code ?? 'unknown';
+      const errName = err instanceof Error ? err.constructor.name : typeof err;
       log.error('Baget channel-token: SQLite UPSERT failed', {
         agentGroupId,
-        err: err instanceof Error ? err.message : String(err),
+        errCode,
+        errName,
       });
       sendJson(res, 500, {
         ok: false,
@@ -825,21 +830,28 @@ export function createBagetAdminServer(config: BagetAdminServerConfig): BagetAdm
     // resurrects them. Without the unbind, post-archive DMs would
     // continue waking a runner against an archived group.
     //
-    // Drop the channel token FIRST so any in-flight spawn that
-    // squeezes through after the archive stamp lands sees no token
-    // and the agent surfaces "re-pair" to the founder. baget.ai's
-    // resolveChannelToken is the second-line guarantee — it 401s any
-    // bearer whose row is revoked there — but defense in depth is
-    // cheap.
-    const tokenDeleted = deleteChannelToken(groupId);
-    archiveBagetAgentGroup(groupId, new Date(now()).toISOString());
-    const unbound = unbindMessagingGroupsForAgent(groupId);
+    // Token-drop → archive → unbind, all wrapped in a single SQLite
+    // transaction. better-sqlite3 transactions execute synchronously
+    // so this is a true atomic unit of work — either all three
+    // statements land or none do. Without the wrapper, an exception
+    // mid-sequence (disk full, lock contention) could leave the token
+    // gone but archived_at still NULL — the dashboard would show
+    // "active" while the agent surfaces "re-pair" on every spawn.
+    // baget.ai's resolveChannelToken is still the second-line
+    // guarantee for any in-flight spawn that grabbed the token
+    // microseconds before the transaction landed.
+    const result = getDb().transaction(() => {
+      const tokenDeleted = deleteChannelToken(groupId);
+      archiveBagetAgentGroup(groupId, new Date(now()).toISOString());
+      const unbound = unbindMessagingGroupsForAgent(groupId);
+      return { tokenDeleted, unbound };
+    })();
     sendJson(res, 200, {
       ok: true,
       agentGroupId: groupId,
       archived: true,
-      unboundChats: unbound,
-      channelTokenDeleted: tokenDeleted > 0,
+      unboundChats: result.unbound,
+      channelTokenDeleted: result.tokenDeleted > 0,
     });
   }
 
@@ -946,17 +958,21 @@ export function createBagetAdminServer(config: BagetAdminServerConfig): BagetAdm
       });
       return;
     }
-    // Token first → archive → unbind. Same fail-closed ordering as
-    // the path-style DELETE (handleDelete above).
-    const tokenDeleted = deleteChannelToken(existing.id);
-    archiveBagetAgentGroup(existing.id, new Date(now()).toISOString());
-    const unbound = unbindMessagingGroupsForAgent(existing.id);
+    // Token-drop → archive → unbind in one atomic transaction —
+    // same fail-closed ordering and same atomicity guarantee as the
+    // path-style DELETE (handleDelete above).
+    const result = getDb().transaction(() => {
+      const tokenDeleted = deleteChannelToken(existing.id);
+      archiveBagetAgentGroup(existing.id, new Date(now()).toISOString());
+      const unbound = unbindMessagingGroupsForAgent(existing.id);
+      return { tokenDeleted, unbound };
+    })();
     sendJson(res, 200, {
       ok: true,
       agentGroupId: existing.id,
       archived: true,
-      unboundChats: unbound,
-      channelTokenDeleted: tokenDeleted > 0,
+      unboundChats: result.unbound,
+      channelTokenDeleted: result.tokenDeleted > 0,
     });
   }
 
