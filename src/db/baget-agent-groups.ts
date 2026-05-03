@@ -135,16 +135,52 @@ export function countMessagingGroupBindings(agentGroupId: string): number {
  * shipped today; widen the WHERE when Slack/WhatsApp adapters land.
  */
 export function firstBoundChatId(agentGroupId: string): string | null {
+  const TELEGRAM_PLATFORM_PREFIX = 'baget-telegram:';
   const row = getDb()
     .prepare(
-      `SELECT mg.platform_chat_id
+      `SELECT mg.platform_id
          FROM messaging_group_agents mga
          JOIN messaging_groups mg ON mg.id = mga.messaging_group_id
         WHERE mga.agent_group_id = ?
-          AND mg.platform = 'telegram'
+          AND mg.channel_type = 'baget-telegram'
         ORDER BY mga.created_at ASC
         LIMIT 1`,
     )
-    .get(agentGroupId) as { platform_chat_id: string } | undefined;
-  return row?.platform_chat_id ?? null;
+    .get(agentGroupId) as { platform_id: string } | undefined;
+  if (!row?.platform_id) return null;
+  return row.platform_id.startsWith(TELEGRAM_PLATFORM_PREFIX)
+    ? row.platform_id.slice(TELEGRAM_PLATFORM_PREFIX.length)
+    : row.platform_id;
+}
+
+/**
+ * Baget founder Telegram chats are 1:1 DMs. Once a founder chat is
+ * explicitly paired, it must bypass the generic unknown-sender approval
+ * flow even if the founder messaged the shared bot before tapping the deep
+ * link. This reconciles any already-bound Baget Telegram chats back to the
+ * founder-DM shape: direct/public, never denied.
+ */
+export function normalizeBoundBagetTelegramFounderChannels(): number {
+  const result = getDb()
+    .prepare(
+      `UPDATE messaging_groups
+        SET unknown_sender_policy = 'public',
+            is_group = 0,
+            denied_at = NULL
+      WHERE id IN (
+        SELECT DISTINCT mg.id
+          FROM messaging_groups mg
+          JOIN messaging_group_agents mga ON mga.messaging_group_id = mg.id
+          JOIN agent_groups ag ON ag.id = mga.agent_group_id
+         WHERE mg.channel_type = 'baget-telegram'
+           AND ag.company_id IS NOT NULL
+      )
+        AND (
+          unknown_sender_policy <> 'public'
+          OR is_group <> 0
+          OR denied_at IS NOT NULL
+        )`,
+    )
+    .run();
+  return result.changes;
 }

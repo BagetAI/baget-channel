@@ -37,13 +37,15 @@ import { registerExtraRoute } from '../baget-admin-server.js';
 import { applyPersonaPrefix } from '../baget-persona.js';
 import { consumePairingToken } from '../db/baget-pairing-tokens.js';
 import { recordSeenUpdate, sweepOldSeenUpdates } from '../db/baget-seen-updates.js';
-import { getBagetAgentGroupById } from '../db/baget-agent-groups.js';
+import { getBagetAgentGroupById, normalizeBoundBagetTelegramFounderChannels } from '../db/baget-agent-groups.js';
 import {
   createMessagingGroup,
   createMessagingGroupAgent,
   getMessagingGroupAgentByPair,
   getMessagingGroupAgents,
   getMessagingGroupByPlatform,
+  setMessagingGroupDeniedAt,
+  updateMessagingGroup,
 } from '../db/messaging-groups.js';
 import { log } from '../log.js';
 import type { BagetTeamMembers } from '../baget-pairing.js';
@@ -315,6 +317,19 @@ function buildAdapter(cfg: BagetTelegramConfig): ChannelAdapter {
         await sendBotMessage(chatId, 'Something went wrong wiring this chat. Try the link again in a minute.');
         return;
       }
+    } else {
+      // A founder may DM the shared bot before tapping the deep link. In that
+      // case the router auto-creates a placeholder messaging_group with the
+      // default request_approval policy. Pairing upgrades that row into the
+      // real founder channel: direct DM, public to the paired founder, and no
+      // lingering denied flag from earlier unwired traffic.
+      updateMessagingGroup(mg.id, {
+        name: msg.from?.first_name ?? mg.name,
+        is_group: 0,
+        unknown_sender_policy: 'public',
+      });
+      if (mg.denied_at) setMessagingGroupDeniedAt(mg.id, null);
+      mg = getMessagingGroupByPlatform(BAGET_TELEGRAM_CHANNEL_TYPE, platformId) ?? mg;
     }
 
     const existingMga = getMessagingGroupAgentByPair(mg.id, row.agent_group_id);
@@ -453,6 +468,10 @@ function buildAdapter(cfg: BagetTelegramConfig): ChannelAdapter {
 
     async setup(s: ChannelSetup): Promise<void> {
       setup = s;
+      const normalized = normalizeBoundBagetTelegramFounderChannels();
+      if (normalized > 0) {
+        log.info('Baget telegram: normalized paired founder channels', { normalized });
+      }
       // Share the admin server's HTTP listener instead of binding our
       // own port. Railway exposes exactly one public port per service,
       // so the webhook + admin routes must land on the same listener.

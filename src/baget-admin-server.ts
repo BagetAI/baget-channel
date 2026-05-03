@@ -313,7 +313,7 @@ export function createBagetAdminServer(config: BagetAdminServerConfig): BagetAdm
     const { userId, companyId, companyName, teamMembers, bagetApiBaseUrl, channelTokenCredentialName } = body.value;
 
     // 1. Idempotent provision: render CLAUDE.local.md + write
-    //    container_config.json under groups/<folder>/. Pure file IO,
+    //    runtime container.json under groups/<folder>/. Pure file IO,
     //    safe to re-run.
     let provisioned: ReturnType<typeof provisionBagetGroup>;
     try {
@@ -467,7 +467,7 @@ export function createBagetAdminServer(config: BagetAdminServerConfig): BagetAdm
     }
 
     // Soft-delete the row + drop every chat→agent wiring it owns.
-    // The rendered prompt + container_config.json stay on disk so a
+    // The rendered prompt + container.json stay on disk so a
     // future re-pair (POST /baget/agent-groups for the same user/co)
     // resurrects them. Without the unbind, post-archive DMs would
     // continue waking a runner against an archived group.

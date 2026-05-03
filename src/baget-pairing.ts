@@ -16,9 +16,9 @@
  *        - Renders setup/baget-template/CLAUDE.md.template with the
  *          provided team names → writes to
  *          groups/baget-<userId>-<companyId>/CLAUDE.local.md
- *        - Copies setup/baget-template/container_config.json to
- *          the same folder, with BAGET_COMPANY_ID + secret name
- *          patched in
+ *        - Copies setup/baget-template/container_config.json into the
+ *          runtime `groups/<folder>/container.json`, with
+ *          BAGET_COMPANY_ID + secret name patched in
  *        - Inserts an `agent_groups` row in the central DB
  *        - Mints a single-use Telegram pairing token (5min TTL)
  *        - Returns { groupId, telegramDeepLink }
@@ -158,7 +158,7 @@ function sanitizeForPrompt(value: string): string {
 /**
  * Provision a Baget agent_group: render the prompt, write it to the
  * group folder as `CLAUDE.local.md` (which `composeGroupClaudeMd`
- * picks up on every spawn), and write a per-group container_config
+ * picks up on every spawn), and write a per-group runtime container config
  * derived from the template.
  *
  * Returns the resolved group folder name, NOT the agent_groups row id.
@@ -171,7 +171,7 @@ export interface ProvisionBagetGroupArgs {
   companyId: string;
   companyName: string;
   teamMembers: BagetTeamMembers;
-  /** Source for the BAGET_API_BASE_URL env in container_config. Must
+  /** Source for the BAGET_API_BASE_URL env in container.json. Must
    *  match the founder's environment (staging vs prod). */
   bagetApiBaseUrl: string;
   /** OneCLI credential name for this founder's channel token. The
@@ -209,7 +209,8 @@ export function provisionBagetGroup(args: ProvisionBagetGroupArgs): ProvisionedB
   fs.renameSync(tmpClaude, claudeLocalPath);
 
   // 2. Container config — start from the template, override env fields
-  //    with founder-specific values.
+  //    with founder-specific values, and write the result to the
+  //    runtime `container.json` file that the runner actually mounts.
   const tmplConfigPath = path.join(BAGET_TEMPLATE_DIR, 'container_config.json');
   if (!fs.existsSync(tmplConfigPath)) {
     throw new Error(`container_config template not found at ${tmplConfigPath}`);
@@ -238,7 +239,7 @@ export function provisionBagetGroup(args: ProvisionBagetGroupArgs): ProvisionedB
     }
   }
 
-  const configPath = path.join(groupDir, 'container_config.json');
+  const configPath = path.join(groupDir, 'container.json');
   const tmpConfig = `${configPath}.tmp.${process.pid}.${Date.now()}`;
   fs.writeFileSync(tmpConfig, JSON.stringify(config, null, 2), {
     encoding: 'utf8',

@@ -115,7 +115,7 @@ describe('renderBagetClaudeMd', () => {
 });
 
 describe('provisionBagetGroup', () => {
-  it('writes CLAUDE.local.md and container_config.json into the right folder', () => {
+  it('writes CLAUDE.local.md and container.json into the right folder', () => {
     const result = provisionBagetGroup({
       userId: 'aaaaaaaa-1111-1111-1111-111111111111',
       companyId: 'bbbbbbbb-2222-2222-2222-222222222222',
@@ -131,9 +131,10 @@ describe('provisionBagetGroup', () => {
     expect(md).toContain('Acme');
     expect(md).toContain('Louis');
 
-    const cfgPath = path.join(result.groupDir, 'container_config.json');
+    const cfgPath = path.join(result.groupDir, 'container.json');
     expect(fs.existsSync(cfgPath)).toBe(true);
     const cfg = JSON.parse(fs.readFileSync(cfgPath, 'utf8'));
+    expect(cfg.provider).toBe('gemini');
     expect(cfg.env.BAGET_API_BASE_URL).toBe('https://app.baget.ai');
     expect(cfg.env.BAGET_COMPANY_ID).toBe('bbbbbbbb-2222-2222-2222-222222222222');
     expect(cfg.secrets).toContain('baget-channel-token-aaaaaaaa-bbbbbbbb');
