@@ -70,9 +70,16 @@ COPY package.json ./
 RUN cd /app/container/agent-runner && bun install --production
 
 # Pre-create groups/ + data/ — first request to provision a Baget
-# agent_group needs them present. Made world-writable so the runtime
-# user can land new folders.
-RUN mkdir -p groups data && chmod 0777 groups data
+# agent_group needs them present.
+#
+# Owned by the `node` user (UID/GID 1000 in node:20-bookworm-slim,
+# matching `USER node` below) with 0755 so only the runtime user can
+# write. The original `chmod 0777` was a multi-tenant exposure: any
+# compromised process in the container could clobber another founder's
+# rendered `CLAUDE.local.md` or `container.json`. We don't have shells
+# in the agent containers today, but the fix is cheap and removes the
+# class of attack from the threat model.
+RUN mkdir -p groups data && chown -R node:node groups data && chmod 0755 groups data
 
 # Single public port. Railway sets PORT and routes its public ingress
 # there. The host listens on PORT (falls back to BAGET_ADMIN_PORT → 8443
