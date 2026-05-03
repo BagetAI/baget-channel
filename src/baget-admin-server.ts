@@ -65,7 +65,12 @@ import { killActiveSessionsForAgent } from './container-runner.js';
 import { deleteChannelToken, upsertChannelToken } from './db/baget-channel-tokens.js';
 import { getDb } from './db/connection.js';
 import { insertPairingToken, sweepExpiredPairingTokens } from './db/baget-pairing-tokens.js';
-import { provisionBagetGroup, type BagetTeamMembers } from './baget-pairing.js';
+import {
+  ALL_ROLES,
+  OPTIONAL_ROLES,
+  provisionBagetGroup,
+  type BagetTeamMembers,
+} from './baget-pairing.js';
 import { bindBagetTelegramChat, sendBagetTelegramWelcome } from './channels/baget-telegram-bind.js';
 import { log } from './log.js';
 
@@ -1125,8 +1130,7 @@ export function validateCreateBody(body: CreateAgentGroupBody): string | null {
   // as "not hired" — fine. If present, it must be a non-empty string;
   // anything else (number, boolean, empty/whitespace string) is a
   // structural bug from the dashboard side and we want a clear error.
-  const knownRoles = ['cos', 'developer', 'marketing', 'analyst', 'design', 'ops'] as const;
-  for (const role of ['developer', 'marketing', 'analyst', 'design', 'ops'] as const) {
+  for (const role of OPTIONAL_ROLES) {
     const v = (tm as Record<string, unknown>)[role];
     if (v === undefined || v === null) continue;
     if (typeof v !== 'string' || v.trim().length === 0) {
@@ -1139,8 +1143,8 @@ export function validateCreateBody(body: CreateAgentGroupBody): string | null {
   // with no signal. Only enforce on string-shaped keys to avoid choking
   // on `__proto__`-style noise from JSON.parse on untrusted input.
   for (const key of Object.keys(tm)) {
-    if (!(knownRoles as readonly string[]).includes(key)) {
-      return `teamMembers.${key} is not a known role (allowed: ${knownRoles.join(', ')})`;
+    if (!(ALL_ROLES as readonly string[]).includes(key)) {
+      return `teamMembers.${key} is not a known role (allowed: ${ALL_ROLES.join(', ')})`;
     }
   }
   // Cap user-controlled strings on the way in so a 10MB body doesn't

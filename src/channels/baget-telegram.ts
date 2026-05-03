@@ -40,7 +40,7 @@ import { recordSeenUpdate, sweepOldSeenUpdates } from '../db/baget-seen-updates.
 import { getBagetAgentGroupById, normalizeBoundBagetTelegramFounderChannels } from '../db/baget-agent-groups.js';
 import { getMessagingGroupAgents, getMessagingGroupByPlatform } from '../db/messaging-groups.js';
 import { log } from '../log.js';
-import type { BagetTeamMembers } from '../baget-pairing.js';
+import { OPTIONAL_ROLES, type BagetTeamMembers } from '../baget-pairing.js';
 import type { ChannelAdapter, ChannelSetup, OutboundMessage } from './adapter.js';
 import { registerChannelAdapter } from './channel-registry.js';
 import {
@@ -539,7 +539,7 @@ function parseTeamMembers(json: string | null | undefined): BagetTeamMembers | n
   // means the dashboard wrote a malformed row — treat the whole record
   // as unparseable so the founder gets a generic welcome rather than a
   // half-broken persona resolution.
-  for (const role of ['developer', 'marketing', 'analyst', 'design', 'ops'] as const) {
+  for (const role of OPTIONAL_ROLES) {
     const v = obj[role];
     if (v === undefined || v === null) continue;
     if (typeof v !== 'string' || v.trim().length === 0) return null;

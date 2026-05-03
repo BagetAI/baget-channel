@@ -69,9 +69,25 @@ export type BagetTeamMembers = {
   ops?: string;
 };
 
-/** The optional specialist roles, in template order. CoS is always present. */
-const OPTIONAL_ROLES = ['developer', 'marketing', 'analyst', 'design', 'ops'] as const;
-type OptionalRole = (typeof OPTIONAL_ROLES)[number];
+/**
+ * The optional specialist roles, in template order. CoS is always
+ * present (handled separately in the renderer + validator). Exported
+ * so `baget-admin-server.ts` and `channels/baget-telegram.ts` can
+ * import the canonical list — keeping all role-set knowledge in one
+ * file prevents drift when a new role lands.
+ */
+export const OPTIONAL_ROLES = ['developer', 'marketing', 'analyst', 'design', 'ops'] as const;
+export type OptionalRole = (typeof OPTIONAL_ROLES)[number];
+
+/**
+ * Every role the fork knows about, in stable order. CoS first, then
+ * specialists. Used by the validator to reject unknown role keys.
+ * Intern is intentionally not here — the fork doesn't model an
+ * intern persona; baget.ai is responsible for filtering it before
+ * the wire payload arrives.
+ */
+export const ALL_ROLES = ['cos', ...OPTIONAL_ROLES] as const;
+export type AllRole = (typeof ALL_ROLES)[number];
 
 /**
  * Required placeholders that MUST have a non-empty value at render time.
