@@ -60,6 +60,7 @@ import {
   unbindMessagingGroupsForAgent,
   updateBagetTeamMembers,
 } from './db/baget-agent-groups.js';
+import { persistChannelTokenToOneCLI } from './baget-channel-secret.js';
 import { deleteChannelToken, upsertChannelToken } from './db/baget-channel-tokens.js';
 import { getDb } from './db/connection.js';
 import { insertPairingToken, sweepExpiredPairingTokens } from './db/baget-pairing-tokens.js';
@@ -172,14 +173,16 @@ export interface CreateAgentGroupBody {
    * Once baget.ai's bridge code goes live in prod, future fork
    * versions can mark this required.
    *
-   * NEVER log this. NEVER echo in error messages. The persist helper
-   * (`upsertChannelToken` in `db/baget-channel-tokens.ts`) only logs
-   * the agent_group_id — never the token value.
+   * NEVER log this. NEVER echo in error messages. Both persist
+   * helpers (`upsertChannelToken` for SQLite,
+   * `persistChannelTokenToOneCLI` for the docker-mode vault) log
+   * only safe metadata — the value never leaves this function.
    *
-   * Note: `channelTokenCredentialName` above is preserved in the body
-   * shape for backwards compat (older callers send it; we ignore it
-   * on this path because per-(user, company) keying is already done
-   * by agent_group_id in single-process mode).
+   * Note: `channelTokenCredentialName` above is the OneCLI secret
+   * name used by the docker-mode persist path. Single-process mode
+   * keys by agent_group_id and ignores this field — but we still
+   * require it on the wire because (a) docker-mode operators need
+   * it, and (b) older bridge callers always send it.
    */
   channelToken?: string;
 }
@@ -391,30 +394,42 @@ export function createBagetAdminServer(config: BagetAdminServerConfig): BagetAdm
   /**
    * Shared post-provision step: if baget.ai supplied `channelToken`,
    * UPSERT it into the per-agent_group row in `baget_channel_tokens`
-   * so the host's spawnSingleProcessRunner can inject it as
-   * `BAGET_CHANNEL_TOKEN` env on every spawn. Returns true on success
-   * (or when no token was supplied — backwards compat path); returns
-   * false after writing a 500 response on persist failure.
+   * (always — single-process spawn reads from there) AND persist into
+   * the OneCLI vault when `RUNTIME=docker` (because docker-mode agent
+   * containers can't read the host's SQLite file — the gateway proxy
+   * is the load-bearing injection layer there). Returns true on
+   * success (or when no token was supplied — backwards compat path);
+   * returns false after writing a 500 response on either persist
+   * path failing.
    *
-   * Why agent_group_id (not credential-name / host-pattern):
-   *   The OneCLI-vault persistence model (docker mode) needed those
-   *   fields because the gateway scoped secret injection per-host and
-   *   per-agent. In single-process mode the host injects directly into
-   *   the child env at spawn time keyed by agent_group_id — which is
-   *   already the right granularity (1:1 with a (user, company) tuple
-   *   via the partial UNIQUE index on agent_groups). The old fields
-   *   are no longer load-bearing.
+   * Two-mode persist rationale:
+   *   - SQLite always: `spawnSingleProcessRunner` reads from this
+   *     table to populate `BAGET_CHANNEL_TOKEN` in child env. Even on
+   *     a docker-mode host the SQLite write is harmless (docker spawn
+   *     ignores it) and keeps the audit timeline consistent across
+   *     runtime switches.
+   *   - OneCLI on `RUNTIME=docker`: the gateway intercepts each
+   *     agent container's outbound fetches and injects
+   *     `Authorization: Bearer <token>` based on host-pattern + agent
+   *     name. Without this branch, newly-paired groups in docker mode
+   *     would silently lose their bearer (the Codex P1 catch on
+   *     PR #3).
    *
-   *   `bagetApiBaseUrl` and `channelTokenCredentialName` arrive in the
-   *   request body for backwards compat (and the rendered
-   *   container.json still uses bagetApiBaseUrl), but we no longer
-   *   need them on this path.
+   * Why agent_group_id (not credential-name / host-pattern) for the
+   * SQLite path:
+   *   In single-process mode the host injects directly into the
+   *   child env at spawn time, keyed by agent_group_id — already the
+   *   right granularity (1:1 with a (user, company) tuple via the
+   *   partial UNIQUE index on agent_groups). The OneCLI fields stay
+   *   request-required because the docker-mode persist still uses
+   *   them.
    */
-  function maybePersistChannelToken(
+  async function maybePersistChannelToken(
     res: http.ServerResponse,
     body: CreateAgentGroupBody,
     agentGroupId: string,
-  ): boolean {
+    agentName: string,
+  ): Promise<boolean> {
     if (!body.channelToken) {
       // Backwards-compat: pre-bridge baget.ai builds (and the legacy
       // /start <token> path) don't supply this. The agent container
@@ -423,6 +438,7 @@ export function createBagetAdminServer(config: BagetAdminServerConfig): BagetAdm
       return true;
     }
 
+    // ── 1. SQLite UPSERT (always — single-process is the Baget path) ──
     try {
       upsertChannelToken({
         agentGroupId,
@@ -433,7 +449,6 @@ export function createBagetAdminServer(config: BagetAdminServerConfig): BagetAdm
         // Never log channelToken — the helper signature omits it from
         // any return shape, and we don't echo from the body either.
       });
-      return true;
     } catch (err) {
       // Catch-all because better-sqlite3 throws on disk-full / locked /
       // schema-mismatch / FK-violation. We log only the error CLASS +
@@ -457,6 +472,47 @@ export function createBagetAdminServer(config: BagetAdminServerConfig): BagetAdm
       });
       return false;
     }
+
+    // ── 2. OneCLI vault (docker-mode only) ──
+    // Containers in docker mode can't read /app/data/v2.db — the
+    // gateway proxy injects bearers via host-pattern matching. Keep
+    // the original delete-then-create idempotency the helper provides.
+    if (process.env.RUNTIME === 'docker') {
+      let hostPattern: string;
+      try {
+        hostPattern = new URL(body.bagetApiBaseUrl).host;
+      } catch {
+        sendJson(res, 400, {
+          ok: false,
+          error: 'invalid_body',
+          message: 'bagetApiBaseUrl must be a valid URL',
+        });
+        return false;
+      }
+
+      try {
+        await persistChannelTokenToOneCLI({
+          agentName,
+          credentialName: body.channelTokenCredentialName,
+          tokenValue: body.channelToken,
+          hostPattern,
+        });
+      } catch {
+        // The helper already logged the scrubbed error. The SQLite
+        // row was committed above — don't roll it back; on retry the
+        // upsert is idempotent and the OneCLI delete-then-create is
+        // also idempotent. Returning 500 here means the docker-mode
+        // caller knows the OneCLI side didn't land.
+        sendJson(res, 500, {
+          ok: false,
+          error: 'channel_token_persist_failed',
+          message: 'Failed to persist channel token to OneCLI vault',
+        });
+        return false;
+      }
+    }
+
+    return true;
   }
 
   async function handleCreate(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
@@ -542,7 +598,7 @@ export function createBagetAdminServer(config: BagetAdminServerConfig): BagetAdm
     //     as BAGET_CHANNEL_TOKEN env on every spawn. Skip silently
     //     when baget.ai didn't supply one (backwards-compat with
     //     pre-bridge builds and the legacy /start <token> path).
-    if (!maybePersistChannelToken(res, body.value, agentGroupId)) {
+    if (!(await maybePersistChannelToken(res, body.value, agentGroupId, companyName))) {
       // The helper already wrote the 500 response. Note: the
       // agent_groups row above is committed and will get re-used on
       // a retry; the pairing token mint below is skipped on this
@@ -699,7 +755,7 @@ export function createBagetAdminServer(config: BagetAdminServerConfig): BagetAdm
     //     persist fails, we don't want a "bound chat" without the
     //     token to back its calls — the founder would DM the bot,
     //     get a useless reply, and not know why. Bail before bind.
-    if (!maybePersistChannelToken(res, body.value, agentGroupId)) {
+    if (!(await maybePersistChannelToken(res, body.value, agentGroupId, companyName))) {
       // The helper already wrote the 500. The agent_groups row above
       // is committed; a retry will hit the existing row + UPSERT the
       // token (idempotent via INSERT … ON CONFLICT … DO UPDATE).

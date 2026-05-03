@@ -55,13 +55,19 @@ export interface ChannelTokenReadResult {
  * is the caller's responsibility (validateCreateBody in
  * baget-admin-server.ts already enforces base64url + 30..256 chars).
  *
- * The persisted_at timestamp is generated inside the helper so callers
- * can't accidentally pass a numeric ms-epoch instead of an ISO string —
- * the previous design had a `now: string` param that invited that
- * exact bug for any future caller.
+ * The persisted_at timestamp is generated inside the helper by default
+ * so callers can't accidentally pass a numeric ms-epoch instead of an
+ * ISO string. Tests can pass an explicit `now: Date` for deterministic
+ * audit-chain assertions — the type-checker rejects ms-epoch numbers
+ * at the call site, which is the footgun the original `now: string`
+ * design invited.
  */
-export function upsertChannelToken(args: { agentGroupId: string; tokenValue: string }): void {
-  const persistedAt = new Date().toISOString();
+export function upsertChannelToken(args: {
+  agentGroupId: string;
+  tokenValue: string;
+  now?: Date;
+}): void {
+  const persistedAt = (args.now ?? new Date()).toISOString();
   getDb()
     .prepare(
       `INSERT INTO baget_channel_tokens (agent_group_id, token_value, persisted_at, rotated_from_at)

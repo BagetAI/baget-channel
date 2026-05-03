@@ -61,36 +61,41 @@ describe('upsertChannelToken (insert path)', () => {
 });
 
 describe('upsertChannelToken (rotate path)', () => {
-  it('overwrites the value and stamps rotated_from_at to the prior persisted_at', () => {
-    upsertChannelToken({ agentGroupId: 'ag-1', tokenValue: 'token-old' });
-    const first = getChannelToken('ag-1');
-    expect(first?.rotatedFromAt).toBeNull();
+  // Deterministic clock for rotate tests — addresses Gemini MEDIUM
+  // review finding ("upsertChannelToken bypasses test-injected now").
+  // Each call advances a fixed second so rotated_from_at chains can
+  // be asserted by exact equality without race-y wall-clock reads.
+  const T0 = new Date('2026-04-30T10:00:00Z');
+  const T1 = new Date('2026-04-30T10:00:01Z');
+  const T2 = new Date('2026-04-30T10:00:02Z');
 
-    upsertChannelToken({ agentGroupId: 'ag-1', tokenValue: 'token-new' });
-    const second = getChannelToken('ag-1');
-    expect(second?.tokenValue).toBe('token-new');
-    expect(second?.rotatedFromAt).toBe(first?.persistedAt);
-    // persistedAt advances or stays equal (clock resolution); never goes back.
-    expect(second?.persistedAt && second?.persistedAt >= (first?.persistedAt ?? '')).toBe(true);
+  it('overwrites the value and stamps rotated_from_at to the prior persisted_at', () => {
+    upsertChannelToken({ agentGroupId: 'ag-1', tokenValue: 'token-old', now: T0 });
+    upsertChannelToken({ agentGroupId: 'ag-1', tokenValue: 'token-new', now: T1 });
+
+    expect(getChannelToken('ag-1')).toEqual({
+      tokenValue: 'token-new',
+      persistedAt: T1.toISOString(),
+      rotatedFromAt: T0.toISOString(),
+    });
   });
 
   it('preserves rotated_from_at as the most recent prior persisted_at across multiple rotations', () => {
-    upsertChannelToken({ agentGroupId: 'ag-1', tokenValue: 't1' });
-    const r1 = getChannelToken('ag-1');
-    upsertChannelToken({ agentGroupId: 'ag-1', tokenValue: 't2' });
-    const r2 = getChannelToken('ag-1');
-    upsertChannelToken({ agentGroupId: 'ag-1', tokenValue: 't3' });
-    const r3 = getChannelToken('ag-1');
+    upsertChannelToken({ agentGroupId: 'ag-1', tokenValue: 't1', now: T0 });
+    upsertChannelToken({ agentGroupId: 'ag-1', tokenValue: 't2', now: T1 });
+    upsertChannelToken({ agentGroupId: 'ag-1', tokenValue: 't3', now: T2 });
 
-    expect(r3?.tokenValue).toBe('t3');
-    expect(r3?.rotatedFromAt).toBe(r2?.persistedAt);
-    expect(r2?.rotatedFromAt).toBe(r1?.persistedAt);
+    expect(getChannelToken('ag-1')).toEqual({
+      tokenValue: 't3',
+      persistedAt: T2.toISOString(),
+      rotatedFromAt: T1.toISOString(),
+    });
   });
 
   it('does not bleed rotation timestamps across agent_groups', () => {
-    upsertChannelToken({ agentGroupId: 'ag-1', tokenValue: 't1' });
-    upsertChannelToken({ agentGroupId: 'ag-1', tokenValue: 't2' });
-    upsertChannelToken({ agentGroupId: 'ag-2', tokenValue: 'first-for-ag2' });
+    upsertChannelToken({ agentGroupId: 'ag-1', tokenValue: 't1', now: T0 });
+    upsertChannelToken({ agentGroupId: 'ag-1', tokenValue: 't2', now: T1 });
+    upsertChannelToken({ agentGroupId: 'ag-2', tokenValue: 'first-for-ag2', now: T2 });
     expect(getChannelToken('ag-2')?.rotatedFromAt).toBeNull();
   });
 
@@ -99,12 +104,14 @@ describe('upsertChannelToken (rotate path)', () => {
     // that the audit chain still advances — operators reading the
     // rotated_from_at column should know "this row was touched again"
     // even though the secret is unchanged.
-    upsertChannelToken({ agentGroupId: 'ag-1', tokenValue: 'same-value' });
-    const before = getChannelToken('ag-1');
-    upsertChannelToken({ agentGroupId: 'ag-1', tokenValue: 'same-value' });
-    const after = getChannelToken('ag-1');
-    expect(after?.tokenValue).toBe('same-value');
-    expect(after?.rotatedFromAt).toBe(before?.persistedAt);
+    upsertChannelToken({ agentGroupId: 'ag-1', tokenValue: 'same-value', now: T0 });
+    upsertChannelToken({ agentGroupId: 'ag-1', tokenValue: 'same-value', now: T1 });
+
+    expect(getChannelToken('ag-1')).toEqual({
+      tokenValue: 'same-value',
+      persistedAt: T1.toISOString(),
+      rotatedFromAt: T0.toISOString(),
+    });
   });
 });
 
