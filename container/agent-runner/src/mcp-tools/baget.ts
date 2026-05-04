@@ -24,6 +24,14 @@
  *     - baget_list_documents
  *     - baget_read_document
  *
+ *   FILE TRANSFER (1) — fetches a baget.ai-rendered artifact and ships
+ *   it through nanoclaw's per-channel send pipeline. Lives here rather
+ *   than next to core's `send_file` because the orchestration is
+ *   baget-specific (calls /render-pdf with the channel bearer to get a
+ *   blob URL, fetches the bytes, then defers to the same outbox-write
+ *   pattern `send_file` uses):
+ *     - baget_send_document_file
+ *
  *   WRITE — direct (free, immediate; calls /approval/execute):
  *     - baget_set_direction
  *     - baget_update_metric
@@ -58,6 +66,12 @@
  * approval flow channel-agnostic. Phase 4 may add per-channel rich UI
  * via channel adapter capabilities.
  */
+import fs from 'fs';
+import path from 'path';
+
+import { writeMessageOut } from '../db/messages-out.js';
+import { workspaceOutboxDir } from '../workspace-paths.js';
+import { generateId, resolveRouting } from './core.js';
 import { registerTools } from './server.js';
 import type { McpToolDefinition } from './types.js';
 
@@ -85,7 +99,17 @@ interface BagetFetchArgs {
   method: 'GET' | 'POST';
   path: string;
   body?: unknown;
+  /**
+   * Per-call abort timeout (ms). Defaults to 15s — fine for the read +
+   * approval/execute paths which return promptly. Override for routes
+   * that do real work server-side (render-pdf does pdfkit cold-import +
+   * markdown rendering + a Vercel Blob upload, easily 25-30s on a cold
+   * lambda). Caller sets `timeoutMs` to give themselves enough budget.
+   */
+  timeoutMs?: number;
 }
+
+const DEFAULT_FETCH_TIMEOUT_MS = 15_000;
 
 interface BagetFetchOk<T> {
   ok: true;
@@ -119,7 +143,7 @@ async function bagetFetch<T = unknown>(args: BagetFetchArgs): Promise<BagetFetch
       Authorization: `Bearer ${token}`,
     },
     body: args.body ? JSON.stringify(args.body) : undefined,
-    signal: AbortSignal.timeout(15_000),
+    signal: AbortSignal.timeout(args.timeoutMs ?? DEFAULT_FETCH_TIMEOUT_MS),
   });
 
   let data: unknown;
@@ -301,7 +325,7 @@ const listDocuments: McpToolDefinition = {
   tool: {
     name: 'baget_list_documents',
     description:
-      "List the founder's documents — business plan, brand guide, pitch deck, research, etc. Returns id, title, category, and createdAt for each. Call this first before referring to a specific document by name; never guess document ids. After listing, call `baget_read_document` with the chosen document's id to fetch its full content (e.g., when the founder asks to see, share, or send it).",
+      'List the founder\'s documents — business plan, brand guide, pitch deck, research, etc. Returns id, title, category, and createdAt for each. Call this first before referring to a specific document by name; never guess document ids. After listing, the next step depends on what the founder wants: call `baget_read_document` with the chosen document\'s id to fetch the markdown body and quote it INLINE in your reply (good for "what\'s in the BP?", "summarize the brand guide"); call `baget_send_document_file` with the chosen document\'s id to ship the actual FILE attachment (good for "send me the deck", "share the BP as a PDF").',
     inputSchema: { type: 'object', properties: {}, additionalProperties: false },
   },
   async handler() {
@@ -320,7 +344,7 @@ const readDocument: McpToolDefinition = {
   tool: {
     name: 'baget_read_document',
     description:
-      "Fetch the full content (markdown body) of a single document by id. Use this whenever the founder asks to SEE, SHARE, SEND, READ, VIEW, OR QUOTE a specific document — pitch deck, business plan, brand guide, research, etc. The chat surface can't transfer files, so this tool is how you 'send' a document: read it, then quote or excerpt the body inline in your reply. Call `baget_list_documents` FIRST to resolve a name (e.g., 'pitch deck') to a documentId; never guess document ids. If the founder wants the document as a downloadable file (PDF, etc.), point them to the dashboard's documents tab.",
+      'Fetch the markdown body of a single document so you can QUOTE OR SUMMARIZE its content INLINE in your reply. Use when the founder asks about WHAT a document SAYS — "what\'s in the BP?", "summarize the brand guide", "read me the deck\'s problem section", "what\'s the positioning?". Pairs with `baget_send_document_file` (which ships the actual file attachment) — pick THIS tool when the founder wants to discuss content, pick `baget_send_document_file` when they want to receive the file itself ("send me the deck", "give me the BP as a PDF"). Call `baget_list_documents` FIRST to resolve a name (e.g., \'pitch deck\') to a documentId; never guess document ids.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -357,6 +381,247 @@ const readDocument: McpToolDefinition = {
         ? (result.data as { document: unknown }).document
         : result.data;
     return ok(JSON.stringify(inner, null, 2));
+  },
+};
+
+// ── FILE TRANSFER tool ──────────────────────────────────────────────────────
+
+/**
+ * Telegram (and Slack/Discord) impose a hard upper bound on attachment
+ * size — Telegram bots cap at 50 MB. Library docs render to single-digit
+ * MB PDFs in practice, but a stray very-long document plus images could
+ * push past that. We surface a clean error rather than letting the host
+ * channel adapter fail silently after the file is on disk.
+ */
+const MAX_ATTACHMENT_BYTES = 45 * 1024 * 1024;
+
+/**
+ * Render-pdf timing budget. The server's Next.js route is `maxDuration =
+ * 30s` (set in render-pdf/route.ts), and a cold-start path (pdfkit
+ * dynamic import + a long markdown body + Vercel Blob upload) can
+ * realistically use most of that. Give the channel-side fetch a bit more
+ * headroom so we time out AFTER the server gives up rather than racing
+ * it — racing produces a misleading "client aborted" instead of a clean
+ * upstream error message.
+ */
+const RENDER_PDF_TIMEOUT_MS = 45_000;
+
+/**
+ * Blob fetch is a separate hop from /render-pdf. Vercel Blob is fast
+ * (cached at the edge) but a freshly-uploaded blob can take a beat to
+ * propagate. 30s is generous; in practice these complete in <500ms.
+ */
+const BLOB_FETCH_TIMEOUT_MS = 30_000;
+
+/**
+ * Vercel Blob storage hostname — the only public host the agent should
+ * follow when fetching a render-pdf response. Locking the destination
+ * closes the SSRF hole that would otherwise let a compromised baget.ai
+ * redirect the agent to internal services (e.g. AWS metadata IP) by
+ * crafting an arbitrary `blobUrl` in the response.
+ *
+ * Pattern: hostname must end in `.public.blob.vercel-storage.com` (the
+ * subdomain is the storage account suffix). Production blobs always
+ * land under that domain — see the route's `put({ access: "public" })`
+ * call. If we ever switch storage backends this allowlist needs to
+ * change in lockstep.
+ */
+const ALLOWED_BLOB_HOST_SUFFIX = '.public.blob.vercel-storage.com';
+
+const sendDocumentFile: McpToolDefinition = {
+  tool: {
+    name: 'baget_send_document_file',
+    description:
+      'Send a document to the founder as a real downloadable FILE attachment (PDF for markdown docs, the original media for image/video docs). Use when the founder asks to RECEIVE the document as a file: "send me the deck", "can you send the BP", "share the brand guide as a file", "give me the pitch deck PDF". Pairs with `baget_read_document` (which quotes content inline) — pick THIS tool when the founder wants the actual file they can forward, save, or print; pick `baget_read_document` when they want to discuss / summarize / quote the content. Call `baget_list_documents` FIRST to resolve a name (e.g. \'pitch deck\') to a documentId. Lands in the same chat thread as the conversation — no "to" parameter needed.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        documentId: {
+          type: 'string',
+          format: 'uuid',
+          description: 'UUID of the document to send; resolve via baget_list_documents.',
+        },
+        text: {
+          type: 'string',
+          maxLength: 1000,
+          description:
+            'Optional one-line caption to send with the file ("Here\'s the deck — let me know which sections you want expanded.").',
+        },
+      },
+      required: ['documentId'],
+      additionalProperties: false,
+    },
+  },
+  async handler(args) {
+    const ctx = requireCompanyId();
+    if (!ctx.ok) return fail(ctx.error);
+
+    const documentId = String(args.documentId ?? '').trim();
+    if (!documentId) return fail('documentId is required');
+
+    // 1. Ask baget.ai to render the document to a downloadable artifact.
+    //    Markdown docs become PDFs; image/video docs return their existing
+    //    media URL directly. Either way the response shape is the same:
+    //    { blobUrl, blobKey, filename, mimeType }. The route is bearer-aware
+    //    via the same hybrid-auth pattern as the LIST + per-doc routes.
+    //    encodeURIComponent neutralizes a hallucinated path traversal in
+    //    the model-supplied id. Render needs a longer timeout than the
+    //    default — see RENDER_PDF_TIMEOUT_MS comment.
+    const render = await bagetFetch<{ blobUrl: string; filename: string; mimeType: string }>({
+      method: 'POST',
+      path: `/api/companies/${ctx.companyId}/documents/${encodeURIComponent(documentId)}/render-pdf`,
+      timeoutMs: RENDER_PDF_TIMEOUT_MS,
+    });
+    if (!render.ok) return fail(`send_document_file failed: ${render.error}`);
+    // Null-check before destructuring — `bagetFetch` returns
+    // `data: null` on an empty / non-JSON response body even when
+    // `ok: true` (Gemini medium on PR #13). Without this guard the
+    // destructure throws an uncaught TypeError and crashes the runner.
+    if (!render.data || typeof render.data !== 'object') {
+      return fail('send_document_file got an empty or non-JSON response from /render-pdf');
+    }
+    const { blobUrl, filename } = render.data;
+    if (!blobUrl || !filename) {
+      return fail('send_document_file got an unexpected response from /render-pdf (missing blobUrl or filename)');
+    }
+
+    // 2. SSRF defense — only follow URLs hosted on Vercel Blob's public
+    //    storage domain. Without this guard, a compromised baget.ai
+    //    could craft a `blobUrl` pointing at internal infrastructure
+    //    (e.g. AWS instance metadata, Railway service mesh) and the
+    //    agent would dutifully fetch and ship the response. URL parsing
+    //    must happen BEFORE the fetch so we never even open the
+    //    connection to a disallowed host.
+    let parsedBlobUrl: URL;
+    try {
+      parsedBlobUrl = new URL(blobUrl);
+    } catch {
+      return fail(`send_document_file got an invalid blobUrl from /render-pdf: ${blobUrl}`);
+    }
+    if (parsedBlobUrl.protocol !== 'https:' || !parsedBlobUrl.hostname.endsWith(ALLOWED_BLOB_HOST_SUFFIX)) {
+      return fail(
+        `send_document_file refused to fetch a blobUrl outside the allowed Vercel Blob domain (host=${parsedBlobUrl.hostname}).`,
+      );
+    }
+
+    // 3. Resolve the destination — always reply in-place (the founder's
+    //    current chat thread). No `to` parameter exposed to the agent;
+    //    this is a 1:1 channel surface, not a fan-out tool.
+    const routing = resolveRouting(undefined);
+    if ('error' in routing) return fail(routing.error);
+
+    // 4. Pull the bytes from the validated blob URL. Vercel Blob URLs
+    //    are public-read by design (the dashboard's LibraryPicker uses
+    //    the same URLs unauthenticated); the URL itself is the capability.
+    //
+    //    OOM defense (Codex P1 + Gemini security-medium on PR #13):
+    //    enforce the size cap BEFORE buffering. A two-step check —
+    //    (a) Content-Length pre-check rejects a known-too-large response
+    //        without buffering at all (fast path, the usual case);
+    //    (b) streaming check during arrayBuffer aborts mid-read on a
+    //        stream that omits or lies about Content-Length.
+    //    `arrayBuffer()` alone would happily allocate the entire body
+    //    into memory before our `buffer.length > MAX` check ran, which
+    //    on a malicious 5GB response would OOM the runner and kill the
+    //    container before any clean error message could surface.
+    let buffer: Buffer;
+    try {
+      const blobRes = await fetch(parsedBlobUrl, { signal: AbortSignal.timeout(BLOB_FETCH_TIMEOUT_MS) });
+      if (!blobRes.ok) {
+        return fail(`send_document_file failed to fetch the rendered file (HTTP ${blobRes.status})`);
+      }
+
+      // (a) Pre-check Content-Length when present.
+      const contentLengthHeader = blobRes.headers.get('content-length');
+      if (contentLengthHeader !== null) {
+        const declaredBytes = Number(contentLengthHeader);
+        if (Number.isFinite(declaredBytes) && declaredBytes > MAX_ATTACHMENT_BYTES) {
+          return fail(
+            `send_document_file: rendered file is ${(declaredBytes / 1024 / 1024).toFixed(1)} MB, ` +
+              `over the ${MAX_ATTACHMENT_BYTES / 1024 / 1024} MB chat-attachment limit. ` +
+              `Tell the founder to download from the dashboard.`,
+          );
+        }
+      }
+
+      // (b) Stream the body into a buffer with a running size cap. The
+      //     reader is aborted as soon as accumulated bytes exceed the
+      //     cap, so a stream that omits Content-Length OR lies about
+      //     it (advertised < cap, actual >> cap) still can't OOM us.
+      const reader = blobRes.body?.getReader();
+      if (!reader) {
+        // No body stream — fall back to arrayBuffer which is bounded
+        // by the cap-check we'd do post-buffer (small responses only).
+        const arr = await blobRes.arrayBuffer();
+        if (arr.byteLength > MAX_ATTACHMENT_BYTES) {
+          return fail(
+            `send_document_file: rendered file is ${(arr.byteLength / 1024 / 1024).toFixed(1)} MB, ` +
+              `over the ${MAX_ATTACHMENT_BYTES / 1024 / 1024} MB chat-attachment limit. ` +
+              `Tell the founder to download from the dashboard.`,
+          );
+        }
+        buffer = Buffer.from(arr);
+      } else {
+        const chunks: Buffer[] = [];
+        let total = 0;
+        // eslint-disable-next-line no-constant-condition
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          if (!value) continue;
+          total += value.byteLength;
+          if (total > MAX_ATTACHMENT_BYTES) {
+            await reader.cancel();
+            return fail(
+              `send_document_file: rendered file is over the ` +
+                `${MAX_ATTACHMENT_BYTES / 1024 / 1024} MB chat-attachment limit. ` +
+                `Tell the founder to download from the dashboard.`,
+            );
+          }
+          chunks.push(Buffer.from(value));
+        }
+        buffer = Buffer.concat(chunks);
+      }
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      return fail(`send_document_file failed to fetch the rendered file: ${msg}`);
+    }
+
+    // 5. Stage the file in the per-message outbox dir (same shape the
+    //    core `send_file` tool uses — the host channel adapter scans
+    //    this layout and ships the file via Telegram sendDocument /
+    //    Slack files.upload / etc.). `path.basename` strips any path
+    //    separators in case a broken server-side slugifier ever leaks
+    //    `..` or `/`; the empty-string / dot-only check below catches
+    //    `"./"` and `""` which basename returns as-is.
+    const id = generateId();
+    const outboxDir = path.join(workspaceOutboxDir(), id);
+    const safeFilename = path.basename(filename);
+    if (!safeFilename || safeFilename === '.' || safeFilename === '..') {
+      return fail(`send_document_file got an unusable filename from /render-pdf: ${JSON.stringify(filename)}`);
+    }
+    try {
+      fs.mkdirSync(outboxDir, { recursive: true });
+      fs.writeFileSync(path.join(outboxDir, safeFilename), buffer);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      return fail(`send_document_file failed to stage the attachment locally: ${msg}`);
+    }
+
+    // 5. Enqueue the outbound message — the host wakes, sees the file
+    //    on disk + the messages_out row, and ships it on the channel.
+    const captionText = typeof args.text === 'string' ? args.text.trim() : '';
+    writeMessageOut({
+      id,
+      kind: 'chat',
+      platform_id: routing.platform_id,
+      channel_type: routing.channel_type,
+      thread_id: routing.thread_id,
+      content: JSON.stringify({ text: captionText, files: [safeFilename] }),
+    });
+
+    log(`send_document_file: ${id} → ${routing.resolvedName} (${safeFilename}, ${buffer.length} bytes)`);
+    return ok(`Sent ${safeFilename} (${(buffer.length / 1024).toFixed(0)} KB).`);
   },
 };
 
@@ -763,6 +1028,8 @@ registerTools([
   queryMetrics,
   listDocuments,
   readDocument,
+  // File transfer
+  sendDocumentFile,
   // Write — direct
   setDirection,
   updateMetric,
@@ -783,4 +1050,4 @@ registerTools([
   sendCampaign,
 ]);
 
-log('baget MCP tools registered: 4 read + 12 direct write + 4 approval-gated = 20 total');
+log('baget MCP tools registered: 4 read + 1 file-transfer + 12 direct write + 4 approval-gated = 21 total');

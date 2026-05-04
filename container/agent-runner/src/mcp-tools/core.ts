@@ -20,7 +20,9 @@ function log(msg: string): void {
   console.error(`[mcp-tools] ${msg}`);
 }
 
-function generateId(): string {
+// Exported so other tool modules (e.g. baget.ts's `send_document_file`)
+// can mint compatible message ids without duplicating the format.
+export function generateId(): string {
   return `msg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
@@ -48,12 +50,14 @@ function destinationList(): string {
  * the same channel the session is bound to, the session's thread_id is
  * preserved so replies land in the correct thread. Otherwise thread_id
  * is null (a cross-destination send starts a new conversation).
+ *
+ * Exported so other tool modules (e.g. baget.ts's `send_document_file`)
+ * can land outbox writes in the same thread as the live conversation
+ * without re-deriving routing.
  */
-function resolveRouting(
+export function resolveRouting(
   to: string | undefined,
-):
-  | { channel_type: string; platform_id: string; thread_id: string | null; resolvedName: string }
-  | { error: string } {
+): { channel_type: string; platform_id: string; thread_id: string | null; resolvedName: string } | { error: string } {
   if (!to) {
     // Default: reply to whatever thread/channel this session is bound to.
     const session = getSessionRouting();
@@ -83,9 +87,7 @@ function resolveRouting(
     // preserve the thread_id so replies land in the correct thread.
     const session = getSessionRouting();
     const threadId =
-      session.channel_type === dest.channelType && session.platform_id === dest.platformId
-        ? session.thread_id
-        : null;
+      session.channel_type === dest.channelType && session.platform_id === dest.platformId ? session.thread_id : null;
     return {
       channel_type: dest.channelType!,
       platform_id: dest.platformId!,
@@ -99,12 +101,14 @@ function resolveRouting(
 export const sendMessage: McpToolDefinition = {
   tool: {
     name: 'send_message',
-    description:
-      'Send a message to a named destination. If you have only one destination, you can omit `to`.',
+    description: 'Send a message to a named destination. If you have only one destination, you can omit `to`.',
     inputSchema: {
       type: 'object' as const,
       properties: {
-        to: { type: 'string', description: 'Destination name (e.g., "family", "worker-1"). Optional if you have only one destination.' },
+        to: {
+          type: 'string',
+          description: 'Destination name (e.g., "family", "worker-1"). Optional if you have only one destination.',
+        },
         text: { type: 'string', description: 'Message content' },
       },
       required: ['text'],

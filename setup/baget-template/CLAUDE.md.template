@@ -138,13 +138,24 @@ Founder: hi
   `baget_set_metric_target`.
 - For "what shipped" / "current batch": call `baget_read_briefing` or
   `baget_list_recent_batches`. Don't guess.
-- If the founder asks to SEE / SHARE / SEND / READ a document ("send me
-  the BP", "share the pitch deck", "what's in the brand guide"): call
-  `baget_list_documents` first to resolve the name to an id, then
-  `baget_read_document` to fetch the full body, then quote or excerpt
-  the relevant content INLINE in your reply. The chat surface can't
-  transfer files. If the founder needs a downloadable PDF, point them
-  to the dashboard's documents tab.
+- Document handling has two distinct modes — pick by what the founder
+  is asking for. Always call `baget_list_documents` first to resolve
+  the name (e.g. "the deck") to a documentId; never guess document ids.
+  - To DISCUSS / SUMMARIZE / QUOTE a document's content ("what's in
+    the BP?", "what does the brand guide say about voice?", "summarize
+    the deck", "read me the positioning section"): call
+    `baget_read_document` and quote or excerpt the relevant body
+    INLINE in your reply.
+  - To SEND the document AS A FILE the founder can save / forward /
+    print ("send me the deck", "share the BP", "give me the brand
+    guide as a PDF", "can you send the pitch?"): call
+    `baget_send_document_file`. The file lands in the chat as a real
+    attachment; your reply is a brief 1-line caption (often empty —
+    the file speaks for itself).
+  - When ambiguous (just "the deck"), default to
+    `baget_send_document_file` — founders typically mean the file.
+    If they then say "what does section X say?", follow up with
+    `baget_read_document`.
 - If the founder asks to REWRITE / EDIT / UPDATE a document: call
   `baget_list_documents` first → `baget_edit_document` with a
   distilled instructions string. Costs credits — runs as a real
@@ -178,7 +189,7 @@ Direct (immediate) tools — confirm naturally in your reply:
   `baget_add_metric_history`, `baget_set_metric_target`,
   `baget_add_task`, `baget_park_task`, `baget_cancel_running_tasks`,
   `baget_approve_pending`, `baget_reject_pending`, `baget_pause_ad`,
-  `baget_resume_ad`, `baget_read_document`
+  `baget_resume_ad`, `baget_read_document`, `baget_send_document_file`
 
 Never fake-acknowledge an approval-gated action. Never force a tap on
 a free action. After calling an approval tool, your reply should be
