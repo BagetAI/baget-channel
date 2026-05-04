@@ -533,7 +533,23 @@ export function createBagetAdminServer(config: BagetAdminServerConfig): BagetAdm
       const adapter = adapterLookup(chat.channel_type);
       let messageId: string | null = null;
       let failed = false;
+      // The kind:'delivery_failure' log shape is the cross-repo CONTRACT
+      // consumed by the dashboard delivery-receipt UI (see PR #4 / future
+      // apps/web/ work). Every per-chat failure mode in this loop must
+      // emit it so a "your team tried to reach you and couldn't" surface
+      // can render. Three failure modes here: no registered adapter for
+      // the channel type, deliver() returned undefined (adapter accepted
+      // but returned no id), or deliver() threw. Best-effort: a failure
+      // does NOT abort the loop — the worker's batch-complete state is
+      // already committed upstream.
       if (!adapter) {
+        log.warn('celebrate: delivery_failure', {
+          kind: 'delivery_failure',
+          channelType: chat.channel_type,
+          agentGroupId,
+          platformId: chat.platform_id,
+          reason: 'no_adapter_registered',
+        });
         failed = true;
       } else {
         const outbound: OutboundMessage = {
@@ -548,9 +564,25 @@ export function createBagetAdminServer(config: BagetAdminServerConfig): BagetAdm
         try {
           const result = await adapter.deliver(chat.platform_id, null, outbound);
           messageId = result ?? null;
-          if (!messageId) failed = true;
+          if (!messageId) {
+            log.warn('celebrate: delivery_failure', {
+              kind: 'delivery_failure',
+              channelType: chat.channel_type,
+              agentGroupId,
+              platformId: chat.platform_id,
+              reason: 'no_message_id_returned',
+            });
+            failed = true;
+          }
         } catch (err) {
-          log.error('celebrate: adapter.deliver threw', { agentGroupId, platformId: chat.platform_id, err });
+          log.warn('celebrate: delivery_failure', {
+            kind: 'delivery_failure',
+            channelType: chat.channel_type,
+            agentGroupId,
+            platformId: chat.platform_id,
+            reason: 'deliver_threw',
+            err,
+          });
           failed = true;
         }
       }
