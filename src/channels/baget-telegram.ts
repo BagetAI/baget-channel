@@ -32,26 +32,36 @@
  */
 import http from 'http';
 import { timingSafeEqual } from 'crypto';
+import path from 'path';
 
 import * as Sentry from '@sentry/node';
 
 import { registerExtraRoute } from '../baget-admin-server.js';
 import { applyPersonaPrefix } from '../baget-persona.js';
+import { GROUPS_DIR } from '../config.js';
 import { consumePairingToken } from '../db/baget-pairing-tokens.js';
 import { recordSeenUpdate, sweepOldSeenUpdates } from '../db/baget-seen-updates.js';
 import { getBagetAgentGroupById, normalizeBoundBagetTelegramFounderChannels } from '../db/baget-agent-groups.js';
 import { getMessagingGroupAgents, getMessagingGroupByPlatform } from '../db/messaging-groups.js';
 import { log } from '../log.js';
 import { OPTIONAL_ROLES, type BagetTeamMembers } from '../baget-pairing.js';
-import type { ChannelAdapter, ChannelSetup, OutboundMessage, CelebrationPayload } from './adapter.js';
+import type { ChannelAdapter, ChannelSetup, InboundAttachment, OutboundAttachment, OutboundMessage, CelebrationPayload } from './adapter.js';
 import { registerChannelAdapter } from './channel-registry.js';
 import {
   BAGET_TELEGRAM_CHANNEL_TYPE,
   bindBagetTelegramChat,
   platformIdFromChatId,
   sendBagetBotMessage,
+  sendBagetBotPhoto,
+  sendBagetBotDocument,
   sendBagetTelegramWelcome,
 } from './baget-telegram-bind.js';
+import {
+  downloadTelegramAttachment,
+  OversizedAttachmentError,
+  parseTelegramAttachments,
+  type TelegramMessage,
+} from './baget-telegram-attachments.js';
 
 // Re-export so existing importers (admin server, db helpers) keep
 // working without churn — this constant lives in -bind now to avoid
@@ -71,7 +81,7 @@ export interface BagetTelegramConfig {
   fetchImpl?: typeof fetch;
 }
 
-interface UpdateMessage {
+interface UpdateMessage extends TelegramMessage {
   message_id: number;
   from?: { id: number; first_name?: string; username?: string };
   chat: { id: number; type: string };
@@ -209,13 +219,22 @@ function buildAdapter(cfg: BagetTelegramConfig): ChannelAdapter {
     if (!fresh) return;
 
     const msg = update.message ?? update.edited_message;
-    if (!msg || !msg.text) return;
+    if (!msg) return;
 
-    // Pairing flow: /start <token>
-    const startMatch = /^\/start\s+(.+?)\s*$/.exec(msg.text.trim());
-    if (startMatch) {
-      await handleStartCommand(msg, startMatch[1]);
-      return;
+    const hasText = typeof msg.text === 'string' && msg.text.length > 0;
+    const hasCaption = typeof msg.caption === 'string' && msg.caption.length > 0;
+    const parsedAttachment = parseTelegramAttachments(msg);
+
+    // Drop updates with neither text nor media (e.g. service messages)
+    if (!hasText && !hasCaption && !parsedAttachment) return;
+
+    // Pairing flow: /start <token> — only on plain text messages
+    if (hasText) {
+      const startMatch = /^\/start\s+(.+?)\s*$/.exec(msg.text!.trim());
+      if (startMatch) {
+        await handleStartCommand(msg, startMatch[1]);
+        return;
+      }
     }
 
     // Plain DM — route through the standard adapter contract.
@@ -232,14 +251,81 @@ function buildAdapter(cfg: BagetTelegramConfig): ChannelAdapter {
       : 'unknown';
     const senderId = msg.from ? `telegram:${msg.from.id}` : `telegram:unknown`;
 
+    // Resolve attachments — download to the agent_group's inbound folder
+    let attachments: InboundAttachment[] | undefined;
+    if (parsedAttachment) {
+      // Look up the agent_group folder via messaging_group → agent wiring
+      const mg = getMessagingGroupByPlatform(BAGET_TELEGRAM_CHANNEL_TYPE, platformId);
+      if (!mg) {
+        log.warn('Baget telegram: attachment received on unpaired chat — dropping', {
+          chatId: msg.chat.id,
+          updateId: update.update_id,
+        });
+        return;
+      }
+      const wired = getMessagingGroupAgents(mg.id);
+      if (wired.length === 0) {
+        log.warn('Baget telegram: attachment received on chat with no wired agents — dropping', {
+          chatId: msg.chat.id,
+          updateId: update.update_id,
+        });
+        return;
+      }
+      const agentGroup = getBagetAgentGroupById(wired[0]!.agent_group_id);
+      if (!agentGroup) {
+        log.warn('Baget telegram: attachment agent_group not found — dropping', {
+          chatId: msg.chat.id,
+          agentGroupId: wired[0]!.agent_group_id,
+        });
+        return;
+      }
+
+      const destDir = path.resolve(GROUPS_DIR, agentGroup.folder, 'inbound');
+
+      try {
+        const { filePath, sizeBytes } = await downloadTelegramAttachment({
+          botToken: cfg.botToken,
+          fileId: parsedAttachment.fileId,
+          destDir,
+          fetchImpl: fetchFn,
+          apiBaseUrl: apiBase,
+        });
+
+        attachments = [
+          {
+            kind: parsedAttachment.kind,
+            path: filePath,
+            mimeType: parsedAttachment.mimeType,
+            originalName: parsedAttachment.originalName,
+            sizeBytes,
+            platformFileId: parsedAttachment.fileId,
+          },
+        ];
+      } catch (err) {
+        if (err instanceof OversizedAttachmentError) {
+          await sendBotMessage(
+            msg.chat.id,
+            "That file is too big for me to receive (20 MB limit). Try splitting it or sharing a link.",
+          );
+          return;
+        }
+        log.error('Baget telegram: attachment download failed', { err, updateId: update.update_id });
+        return;
+      }
+    }
+
+    // Text content: prefer msg.text, fall back to caption for media messages
+    const textContent = hasText ? msg.text! : hasCaption ? msg.caption! : '';
+
     try {
       await setup.onInbound(platformId, null, {
         id: `tg-${update.update_id}`,
         kind: 'chat',
         timestamp: new Date(msg.date * 1000).toISOString(),
-        content: { text: msg.text, sender, senderId },
-        isMention: msg.chat.type === 'private', // every DM is implicitly a mention
+        content: { text: textContent, sender, senderId },
+        isMention: msg.chat.type === 'private',
         isGroup: msg.chat.type !== 'private',
+        attachments,
       });
     } catch (err) {
       log.error('Baget telegram: onInbound threw', { err, updateId: update.update_id });
@@ -354,23 +440,12 @@ function buildAdapter(cfg: BagetTelegramConfig): ChannelAdapter {
       return sendBotMessage(chatId, celebText);
     }
 
-    const text = extractText(message);
-    if (text === null) return undefined;
-
-    // Resolve the agent_group from the messaging_group → applyPersonaPrefix.
-    // We don't currently have the agent_group_id on the OutboundMessage
-    // payload, so look it up via messaging_group's wired agents.
-    //
+    // ── Resolve agent_group for persona prefix ──────────────────────────
     // SECURITY: refuse to deliver if the chat has more than one wired
     // agent. Baget founders are 1:1 chat↔agent_group by construction.
-    // A multi-bind state would let the model in agent_group A render
-    // its reply with agent_group B's team-name prefix — a one-call
-    // cross-tenant impersonation if the schema ever permits it. We
-    // detect it here and drop loud rather than silently render under
-    // the wrong identity. Single-bind is enforced by the /start
-    // handler's UNIQUE constraint, but this is the second-line check.
     const mg = getMessagingGroupByPlatform(BAGET_TELEGRAM_CHANNEL_TYPE, platformId);
-    let prefixed = text;
+    let agentGroupId: string | undefined;
+    let team: BagetTeamMembers | null = null;
     if (mg) {
       const wired = getMessagingGroupAgents(mg.id);
       if (wired.length > 1) {
@@ -383,7 +458,7 @@ function buildAdapter(cfg: BagetTelegramConfig): ChannelAdapter {
       }
       const single = wired[0];
       if (single) {
-        const agentGroupId = single.agent_group_id;
+        agentGroupId = single.agent_group_id;
         const ag = getBagetAgentGroupById(agentGroupId);
         if (ag?.archived_at) {
           log.warn('Baget telegram: drop deliver — agent_group archived', {
@@ -392,18 +467,58 @@ function buildAdapter(cfg: BagetTelegramConfig): ChannelAdapter {
           });
           return undefined;
         }
-        const team = parseTeamMembers(ag?.baget_team_members);
-        if (team) prefixed = applyPersonaPrefix(text, team);
-        const result = await sendBagetBotMessage({
-          botToken: cfg.botToken,
-          apiBaseUrl: cfg.apiBaseUrl,
-          fetchImpl: cfg.fetchImpl,
-          chatId,
-          text: prefixed,
-          agentGroupId,
-        });
-        return result.ok ? result.messageId : undefined;
+        team = parseTeamMembers(ag?.baget_team_members);
       }
+    }
+
+    // ── Attachments (photo / document) ─────────────────────────────────
+    // Sent first (before any text follow-up). Each failure is logged and
+    // skipped; delivery continues with remaining attachments + text.
+    let lastMessageId: string | undefined;
+    if (message.attachments && message.attachments.length > 0) {
+      for (const att of message.attachments as OutboundAttachment[]) {
+        let result: { ok: boolean; messageId?: string };
+        if (att.kind === 'photo') {
+          result = await sendBagetBotPhoto({
+            botToken: cfg.botToken,
+            apiBaseUrl: cfg.apiBaseUrl,
+            fetchImpl: cfg.fetchImpl,
+            chatId,
+            filePath: att.path,
+            caption: att.caption,
+            agentGroupId,
+          });
+        } else {
+          result = await sendBagetBotDocument({
+            botToken: cfg.botToken,
+            apiBaseUrl: cfg.apiBaseUrl,
+            fetchImpl: cfg.fetchImpl,
+            chatId,
+            filePath: att.path,
+            caption: att.caption,
+            filename: att.filename,
+            agentGroupId,
+          });
+        }
+        if (result.ok && result.messageId) lastMessageId = result.messageId;
+      }
+    }
+
+    // ── Text body ──────────────────────────────────────────────────────
+    const text = extractText(message);
+    if (text === null) return lastMessageId;
+
+    const prefixed = team ? applyPersonaPrefix(text, team) : text;
+    if (agentGroupId) {
+      const result = await sendBagetBotMessage({
+        botToken: cfg.botToken,
+        apiBaseUrl: cfg.apiBaseUrl,
+        fetchImpl: cfg.fetchImpl,
+        chatId,
+        text: prefixed,
+        agentGroupId,
+      });
+      return result.ok ? result.messageId : lastMessageId;
     }
 
     return sendBotMessage(chatId, prefixed);

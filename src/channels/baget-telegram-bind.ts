@@ -20,6 +20,8 @@
  * verification here — we trust the bearer.
  */
 import { randomUUID } from 'crypto';
+import fs from 'fs';
+import path from 'path';
 
 import { log } from '../log.js';
 import {
@@ -286,4 +288,138 @@ export async function sendBagetTelegramFarewell(args: {
     text,
     agentGroupId: args.agentGroupId,
   });
+}
+
+
+/**
+ * Send a photo file via Telegram Bot API `sendPhoto` (multipart/form-data).
+ * Reads the file from disk synchronously at call time. Best-effort delivery —
+ * same failure semantics as sendBagetBotMessage.
+ */
+export async function sendBagetBotPhoto(args: {
+  botToken: string;
+  apiBaseUrl?: string;
+  fetchImpl?: typeof fetch;
+  chatId: number | string;
+  filePath: string;
+  caption?: string;
+  agentGroupId?: string;
+}): Promise<BagetTelegramSendResult> {
+  const apiBase = args.apiBaseUrl ?? 'https://api.telegram.org';
+  const fetchFn = args.fetchImpl ?? fetch;
+  const url = `${apiBase}/bot${args.botToken}/sendPhoto`;
+  try {
+    const fileData = fs.readFileSync(args.filePath);
+    const filename = path.basename(args.filePath);
+    const form = new FormData();
+    form.append('chat_id', String(args.chatId));
+    form.append('photo', new Blob([fileData]), filename);
+    if (args.caption) form.append('caption', args.caption);
+    const resp = await fetchFn(url, { method: 'POST', body: form });
+    const json = (await resp.json().catch(() => null)) as {
+      ok?: boolean;
+      result?: { message_id?: number };
+      description?: unknown;
+    } | null;
+    if (!resp.ok) {
+      const rawDescription = typeof json?.description === 'string' ? json.description : undefined;
+      const descLower = rawDescription?.toLowerCase() ?? '';
+      const founderActionRequired =
+        descLower.includes("can't initiate conversation with a user") || descLower.includes('chat not found');
+      log.warn('Baget channel delivery_failure', {
+        kind: 'delivery_failure',
+        channelType: BAGET_TELEGRAM_CHANNEL_TYPE,
+        agentGroupId: args.agentGroupId,
+        chatId: args.chatId,
+        telegramErrorCode: resp.status,
+        telegramDescription: rawDescription,
+        founderActionRequired,
+        attempt: 1,
+      });
+      return { ok: false, founderActionRequired };
+    }
+    if (json?.ok && typeof json.result?.message_id === 'number') {
+      return { ok: true, messageId: String(json.result.message_id) };
+    }
+    return { ok: false, founderActionRequired: false };
+  } catch (err) {
+    log.warn('Baget channel delivery_failure', {
+      kind: 'delivery_failure',
+      channelType: BAGET_TELEGRAM_CHANNEL_TYPE,
+      agentGroupId: args.agentGroupId,
+      chatId: args.chatId,
+      telegramErrorCode: undefined,
+      telegramDescription: err instanceof Error ? err.message : String(err),
+      founderActionRequired: false,
+      attempt: 1,
+    });
+    return { ok: false, founderActionRequired: false };
+  }
+}
+
+/**
+ * Send a document file via Telegram Bot API `sendDocument` (multipart/form-data).
+ * Reads the file from disk synchronously at call time. Best-effort delivery —
+ * same failure semantics as sendBagetBotMessage.
+ */
+export async function sendBagetBotDocument(args: {
+  botToken: string;
+  apiBaseUrl?: string;
+  fetchImpl?: typeof fetch;
+  chatId: number | string;
+  filePath: string;
+  caption?: string;
+  filename?: string;
+  agentGroupId?: string;
+}): Promise<BagetTelegramSendResult> {
+  const apiBase = args.apiBaseUrl ?? 'https://api.telegram.org';
+  const fetchFn = args.fetchImpl ?? fetch;
+  const url = `${apiBase}/bot${args.botToken}/sendDocument`;
+  try {
+    const fileData = fs.readFileSync(args.filePath);
+    const filename = args.filename ?? path.basename(args.filePath);
+    const form = new FormData();
+    form.append('chat_id', String(args.chatId));
+    form.append('document', new Blob([fileData]), filename);
+    if (args.caption) form.append('caption', args.caption);
+    const resp = await fetchFn(url, { method: 'POST', body: form });
+    const json = (await resp.json().catch(() => null)) as {
+      ok?: boolean;
+      result?: { message_id?: number };
+      description?: unknown;
+    } | null;
+    if (!resp.ok) {
+      const rawDescription = typeof json?.description === 'string' ? json.description : undefined;
+      const descLower = rawDescription?.toLowerCase() ?? '';
+      const founderActionRequired =
+        descLower.includes("can't initiate conversation with a user") || descLower.includes('chat not found');
+      log.warn('Baget channel delivery_failure', {
+        kind: 'delivery_failure',
+        channelType: BAGET_TELEGRAM_CHANNEL_TYPE,
+        agentGroupId: args.agentGroupId,
+        chatId: args.chatId,
+        telegramErrorCode: resp.status,
+        telegramDescription: rawDescription,
+        founderActionRequired,
+        attempt: 1,
+      });
+      return { ok: false, founderActionRequired };
+    }
+    if (json?.ok && typeof json.result?.message_id === 'number') {
+      return { ok: true, messageId: String(json.result.message_id) };
+    }
+    return { ok: false, founderActionRequired: false };
+  } catch (err) {
+    log.warn('Baget channel delivery_failure', {
+      kind: 'delivery_failure',
+      channelType: BAGET_TELEGRAM_CHANNEL_TYPE,
+      agentGroupId: args.agentGroupId,
+      chatId: args.chatId,
+      telegramErrorCode: undefined,
+      telegramDescription: err instanceof Error ? err.message : String(err),
+      founderActionRequired: false,
+      attempt: 1,
+    });
+    return { ok: false, founderActionRequired: false };
+  }
 }
