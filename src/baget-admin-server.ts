@@ -78,6 +78,9 @@ import {
   sendBagetTelegramWelcome,
 } from './channels/baget-telegram-bind.js';
 import { log } from './log.js';
+import { getMessagingGroupsByAgentGroup } from './db/messaging-groups.js';
+import { getChannelAdapter } from './channels/channel-registry.js';
+import type { ChannelAdapter, OutboundMessage } from './channels/adapter.js';
 
 // ── Auth ──
 
@@ -282,6 +285,35 @@ export interface BagetAdminServerConfig {
   generateAgentGroupId: () => string;
   /** Function returning current time. Wired as a parameter so tests can fix the clock. */
   now?: () => number;
+  /** Override for the channel adapter lookup — tests inject a mock adapter. */
+  getChannelAdapterFn?: (channelType: string) => ChannelAdapter | undefined;
+}
+
+// ── Celebrate types ──
+
+export interface CelebrationDeliverable {
+  label: string;
+  href?: string;
+}
+
+export interface CelebrateBody {
+  kind: 'batch-complete';
+  batchNumber: number;
+  summary: string;
+  streakDays?: number;
+  deliverables?: CelebrationDeliverable[];
+}
+
+export interface CelebrateDeliveredEntry {
+  channelType: string;
+  platformId: string;
+  messageId: string | null;
+  failed?: true;
+}
+
+export interface CelebrateResponse {
+  ok: true;
+  deliveredTo: CelebrateDeliveredEntry[];
 }
 
 /**
@@ -460,7 +492,88 @@ export function createBagetAdminServer(config: BagetAdminServerConfig): BagetAdm
       return;
     }
 
+    const celebrateMatch = /^\/baget\/agent-groups\/([^/]+)\/celebrate$/.exec(urlNoQuery);
+    if (method === 'POST' && celebrateMatch) {
+      await handleCelebrate(req, res, celebrateMatch[1]!);
+      return;
+    }
+
     sendJson(res, 404, { ok: false, error: 'not_found', message: `No route for ${method} ${url}` });
+  }
+
+  // ── Celebrate ──
+
+  async function handleCelebrate(
+    req: http.IncomingMessage,
+    res: http.ServerResponse,
+    agentGroupId: string,
+  ): Promise<void> {
+    const parsed = await readJson<CelebrateBody>(req);
+    if (!parsed.ok) {
+      sendJson(res, 400, { ok: false, error: 'invalid_body', message: parsed.error });
+      return;
+    }
+    const body = parsed.value;
+    if (!validateCelebrateBody(body)) {
+      sendJson(res, 400, { ok: false, error: 'invalid_body', message: 'Missing required fields' });
+      return;
+    }
+
+    const group = getBagetAgentGroupById(agentGroupId);
+    if (!group || group.archived_at) {
+      sendJson(res, 404, { ok: false, error: 'group_not_found', message: 'Agent group not found' });
+      return;
+    }
+
+    const chats = getMessagingGroupsByAgentGroup(agentGroupId);
+    const adapterLookup = config.getChannelAdapterFn ?? getChannelAdapter;
+    const deliveredTo: CelebrateDeliveredEntry[] = [];
+
+    for (const chat of chats) {
+      const adapter = adapterLookup(chat.channel_type);
+      let messageId: string | null = null;
+      let failed = false;
+      if (!adapter) {
+        failed = true;
+      } else {
+        const outbound: OutboundMessage = {
+          kind: 'celebration',
+          content: {
+            batchNumber: body.batchNumber,
+            summary: body.summary,
+            deliverables: body.deliverables,
+            streakDays: body.streakDays,
+          },
+        };
+        try {
+          const result = await adapter.deliver(chat.platform_id, null, outbound);
+          messageId = result ?? null;
+          if (!messageId) failed = true;
+        } catch (err) {
+          log.error('celebrate: adapter.deliver threw', { agentGroupId, platformId: chat.platform_id, err });
+          failed = true;
+        }
+      }
+      const entry: CelebrateDeliveredEntry = {
+        channelType: chat.channel_type,
+        platformId: chat.platform_id,
+        messageId,
+        ...(failed ? { failed: true as const } : {}),
+      };
+      deliveredTo.push(entry);
+    }
+
+    sendJson(res, 200, { ok: true, deliveredTo } satisfies CelebrateResponse);
+  }
+
+  function validateCelebrateBody(b: unknown): b is CelebrateBody {
+    if (!b || typeof b !== 'object') return false;
+    const o = b as Record<string, unknown>;
+    return (
+      o.kind === 'batch-complete' &&
+      typeof o.batchNumber === 'number' &&
+      typeof o.summary === 'string'
+    );
   }
 
   /**

@@ -93,6 +93,20 @@ export interface OutboundFile {
   data: Buffer;
 }
 
+/** One deliverable item in a batch-complete celebration. */
+export interface CelebrationDeliverable {
+  label: string;
+  href?: string;
+}
+
+/** Payload for OutboundMessage.kind === 'celebration'. */
+export interface CelebrationPayload {
+  batchNumber: number;
+  summary: string;
+  deliverables?: CelebrationDeliverable[];
+  streakDays?: number;
+}
+
 /** Outbound message from host to adapter. */
 export interface OutboundMessage {
   kind: string;
