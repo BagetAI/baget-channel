@@ -60,6 +60,7 @@ import {
   unbindMessagingGroupsForAgent,
   updateBagetTeamMembers,
 } from './db/baget-agent-groups.js';
+import { countAvailableBots, seedBotPoolEntry, type SeedOutcome } from './db/baget-bot-pool.js';
 import { persistChannelTokenToOneCLI } from './baget-channel-secret.js';
 import { killActiveSessionsForAgent } from './container-runner.js';
 import { wipeSessionDataForAgentGroup } from './session-manager.js';
@@ -470,6 +471,15 @@ export function createBagetAdminServer(config: BagetAdminServerConfig): BagetAdm
     // payload-drop bug it suffers from. See bind-telegram body type.
     if (method === 'POST' && urlNoQuery === '/baget/agent-groups/bind-telegram') {
       await handleBindTelegram(req, res);
+      return;
+    }
+    // Operator-only seed for the Telegram bot pool. Each (botUsername,
+    // botToken) pair is validated against Telegram's getMe before
+    // insertion so a typoed token surfaces immediately, not at the
+    // first founder bind. Re-seeding the same username rotates the
+    // token (intentional — covers BotFather token-reissue flow).
+    if (method === 'POST' && urlNoQuery === '/baget/bot-pool/seed') {
+      await handleSeedBotPool(req, res);
       return;
     }
     // Body-keyed DELETE /baget/agent-groups (with body { userId, companyId })
@@ -1210,6 +1220,164 @@ export function createBagetAdminServer(config: BagetAdminServerConfig): BagetAdm
       paired: true,
       agentGroupId: existing.id,
       ...(platformChatId ? { platformChatId } : {}),
+    });
+  }
+
+  /**
+   * POST /baget/bot-pool/seed
+   *
+   * Operator-only entry point for the Telegram bot pool. Bodies of the
+   * form `{ bots: [{ botUsername, botToken, webhookSecret? }, …] }`
+   * are validated and inserted atomically per row.
+   *
+   * Validation per row, in order:
+   *   1. Shape check — `botUsername` and `botToken` non-empty strings,
+   *      `webhookSecret` (if supplied) non-empty.
+   *   2. Telegram `getMe` round-trip with the supplied token. The
+   *      response's `result.username` MUST equal `botUsername` (case
+   *      insensitive — Telegram normalizes). Catches typo'd tokens at
+   *      seed time instead of at first-founder-bind, where the failure
+   *      mode is silent (the founder pairs against an apparently-bound
+   *      bot that 401's on every send).
+   *   3. If `webhookSecret` is omitted we mint a fresh
+   *      `randomBytes(32)` hex string. Telegram allows up to 256 bytes;
+   *      32 hex chars (16 bytes of CSPRNG entropy) is plenty.
+   *
+   * Re-seeding an existing `botUsername` rotates the token — see
+   * `seedBotPoolEntry` jsdoc for the rotation rationale (Codex P1).
+   *
+   * The endpoint emits a per-row outcome (`inserted` / `rotated` /
+   * `skipped` with reason) so a partial-failure run is observable
+   * without parsing logs. We do NOT bail on the first failure — the
+   * operator should be able to upload a batch of 5 and find out which
+   * 1 was bad in one round-trip.
+   *
+   * Bearer-token gated like all admin routes.
+   */
+  async function handleSeedBotPool(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+    const body = await readJson<{ bots?: Array<{ botUsername?: string; botToken?: string; webhookSecret?: string }> }>(
+      req,
+    );
+    if (!body.ok) {
+      sendJson(res, 400, { ok: false, error: 'invalid_body', message: body.error });
+      return;
+    }
+    const bots = body.value.bots;
+    if (!Array.isArray(bots) || bots.length === 0) {
+      sendJson(res, 400, {
+        ok: false,
+        error: 'invalid_body',
+        message: 'bots must be a non-empty array',
+      });
+      return;
+    }
+    if (bots.length > 50) {
+      sendJson(res, 400, {
+        ok: false,
+        error: 'invalid_body',
+        message: 'bots array too large (max 50 per request — split into multiple calls)',
+      });
+      return;
+    }
+
+    type RowResult =
+      | { botUsername: string; outcome: SeedOutcome }
+      | { botUsername: string; outcome: 'skipped'; reason: string };
+    const results: RowResult[] = [];
+
+    const fetchFn = config.telegramFetchImpl ?? fetch;
+    const apiBase = config.telegramApiBaseUrl ?? 'https://api.telegram.org';
+    const nowIso = new Date(now()).toISOString();
+
+    for (const entry of bots) {
+      const botUsername = (entry?.botUsername ?? '').trim();
+      const botToken = (entry?.botToken ?? '').trim();
+      const suppliedSecret = (entry?.webhookSecret ?? '').trim();
+      const safeUsername = botUsername || '<missing>';
+
+      if (!botUsername) {
+        results.push({ botUsername: safeUsername, outcome: 'skipped', reason: 'missing_botUsername' });
+        continue;
+      }
+      if (!botToken) {
+        results.push({ botUsername: safeUsername, outcome: 'skipped', reason: 'missing_botToken' });
+        continue;
+      }
+
+      // Telegram getMe round-trip — confirms the token is live AND
+      // owned by the username we're about to seed. Don't trust the
+      // operator's pasted username; trust what Telegram says about the
+      // token. We compare lower-case because Telegram's `username`
+      // field is normalized but operators paste with arbitrary case.
+      let telegramUsername: string | null = null;
+      try {
+        const resp = await fetchFn(`${apiBase}/bot${botToken}/getMe`);
+        if (!resp.ok) {
+          results.push({
+            botUsername: safeUsername,
+            outcome: 'skipped',
+            reason: `telegram_getMe_status_${resp.status}`,
+          });
+          continue;
+        }
+        const json = (await resp.json().catch(() => null)) as {
+          ok?: boolean;
+          result?: { username?: string };
+        } | null;
+        if (!json?.ok || typeof json.result?.username !== 'string') {
+          results.push({ botUsername: safeUsername, outcome: 'skipped', reason: 'telegram_getMe_invalid_response' });
+          continue;
+        }
+        telegramUsername = json.result.username;
+      } catch (err) {
+        log.warn('seed bot pool: getMe threw', { botUsername: safeUsername, err });
+        results.push({ botUsername: safeUsername, outcome: 'skipped', reason: 'telegram_getMe_threw' });
+        continue;
+      }
+
+      if (telegramUsername.toLowerCase() !== botUsername.toLowerCase()) {
+        results.push({
+          botUsername: safeUsername,
+          outcome: 'skipped',
+          reason: `telegram_username_mismatch (claimed=${botUsername}, actual=${telegramUsername})`,
+        });
+        continue;
+      }
+
+      const webhookSecret = suppliedSecret || randomBytes(16).toString('hex');
+
+      try {
+        const outcome = seedBotPoolEntry({
+          botUsername: telegramUsername, // Use Telegram's canonical casing.
+          botTokenValue: botToken,
+          webhookSecret,
+          createdAt: nowIso,
+        });
+        results.push({ botUsername: telegramUsername, outcome });
+      } catch (err) {
+        log.error('seed bot pool: DB insert failed', { botUsername: telegramUsername, err });
+        results.push({ botUsername: telegramUsername, outcome: 'skipped', reason: 'db_insert_failed' });
+      }
+    }
+
+    const inserted = results.filter((r) => r.outcome === 'inserted').length;
+    const rotated = results.filter((r) => r.outcome === 'rotated').length;
+    const skipped = results.filter((r) => r.outcome === 'skipped').length;
+    log.info('Bot pool seed: completed', {
+      requested: bots.length,
+      inserted,
+      rotated,
+      skipped,
+      poolDepth: countAvailableBots(),
+    });
+    sendJson(res, 200, {
+      ok: true,
+      requested: bots.length,
+      inserted,
+      rotated,
+      skipped,
+      poolDepth: countAvailableBots(),
+      results,
     });
   }
 
