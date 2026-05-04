@@ -1257,7 +1257,7 @@ export function createBagetAdminServer(config: BagetAdminServerConfig): BagetAdm
       ...(body.value.deliverables !== undefined ? { deliverables: body.value.deliverables } : {}),
     };
 
-    const delivered: Array<{ channelType: string; platformId: string; messageId: string | undefined }> = [];
+    const delivered: Array<{ channelType: string; platformId: string; messageId: string }> = [];
     for (const mg of groups) {
       const adapter = config.getChannelAdapterFn?.(mg.channel_type) ?? getChannelAdapter(mg.channel_type) ?? null;
       if (!adapter) {
@@ -1269,7 +1269,15 @@ export function createBagetAdminServer(config: BagetAdminServerConfig): BagetAdm
           kind: 'celebration',
           content: payload,
         });
-        delivered.push({ channelType: mg.channel_type, platformId: mg.platform_id, messageId });
+        if (messageId !== undefined) {
+          delivered.push({ channelType: mg.channel_type, platformId: mg.platform_id, messageId });
+        } else {
+          log.warn('Baget celebrate: adapter returned no messageId', {
+            channelType: mg.channel_type,
+            platformId: mg.platform_id,
+            agentGroupId,
+          });
+        }
       } catch (err) {
         log.warn('Baget celebrate: deliver threw', {
           channelType: mg.channel_type,

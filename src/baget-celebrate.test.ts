@@ -310,4 +310,35 @@ describe('POST /baget/agent-groups/:id/celebrate', () => {
       warnSpy.mockRestore();
     }
   });
+
+  it('skips gracefully when adapter.deliver returns undefined (unsupported kind)', async () => {
+    const undefinedAdapter = makeAdapter(async () => undefined);
+    const warnSpy = vi.spyOn(log, 'warn').mockImplementation(() => {});
+    const serverUndef = createBagetAdminServer({
+      port: port + 502,
+      adminToken: ADMIN_TOKEN,
+      telegramBotUsername: 'baget_test_bot',
+      generateAgentGroupId: () => 'unused',
+      getChannelAdapterFn: () => undefinedAdapter,
+    });
+    await serverUndef.listen();
+    try {
+      const resp = await fetch(`http://127.0.0.1:${port + 502}/baget/agent-groups/ag-celebrate/celebrate`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${ADMIN_TOKEN}` },
+        body: JSON.stringify({ batchNumber: 3, summary: 'Undef test.' }),
+      });
+      expect(resp.status).toBe(200);
+      const json = (await resp.json()) as { ok: boolean; delivered: unknown[] };
+      expect(json.ok).toBe(true);
+      expect(json.delivered).toHaveLength(0);
+      expect(warnSpy).toHaveBeenCalledWith(
+        'Baget celebrate: adapter returned no messageId',
+        expect.objectContaining({ channelType: 'baget-telegram' }),
+      );
+    } finally {
+      await serverUndef.close();
+      warnSpy.mockRestore();
+    }
+  });
 });
