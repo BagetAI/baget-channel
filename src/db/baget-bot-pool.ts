@@ -67,67 +67,116 @@ export interface BotPoolRow {
 }
 
 /**
- * Insert a fresh bot into the pool. Caller validates the token via
+ * Outcome of `seedBotPoolEntry`. `inserted` means a brand-new pool
+ * row landed; `rotated` means the username was already known and we
+ * UPDATEd `bot_token_value` + `webhook_secret` (the @BotFather
+ * token-rotation flow). The seed admin endpoint surfaces these as
+ * counts so the operator can tell which bots needed rotation.
+ *
+ * IMPORTANT: rotation does NOT touch `status`,
+ * `assigned_agent_group_id`, `assigned_at`, `webhook_registered_at`,
+ * or `created_at`. An assigned bot whose token rotates stays
+ * assigned to its company; the founder's chat seamlessly continues
+ * once the new token propagates.
+ */
+export type SeedOutcome = 'inserted' | 'rotated';
+
+/**
+ * Upsert a bot into the pool. Caller validates the token via
  * Telegram `getMe` before calling this — we trust the supplied
  * `botUsername` matches the token at insert time.
  *
- * Idempotent on the username PK: re-seeding the same bot is a no-op
- * (INSERT OR IGNORE) so the operator's `/baget/bot-pool/seed` stays
- * safe to retry. Returns true on a fresh insert, false on duplicate
- * — the seed endpoint surfaces that to the operator as `skipped`.
+ * Idempotent on the username PK with sane rotation semantics:
+ *
+ *   - First seed of a username → INSERT a fresh `'available'` row.
+ *     Returns `'inserted'`.
+ *
+ *   - Re-seed of an existing username → UPDATE the credentials
+ *     (`bot_token_value`, `webhook_secret`) only. `status`,
+ *     `assigned_agent_group_id`, `assigned_at`, and
+ *     `webhook_registered_at` are preserved so an in-use bot whose
+ *     @BotFather token was rotated keeps serving its founder. Returns
+ *     `'rotated'`.
+ *
+ * The original design used `INSERT OR IGNORE` and treated re-seeds
+ * as "skipped" no-ops — that broke the operator's documented
+ * rotation flow (token changes in BotFather, re-seed left stale
+ * credentials in the DB, bot 401'd silently on every webhook /
+ * outbound until manual intervention). Codex P1 catch.
  */
 export function seedBotPoolEntry(args: {
   botUsername: string;
   botTokenValue: string;
   webhookSecret: string;
   createdAt: string;
-}): boolean {
-  const result = getDb()
-    .prepare(
-      `INSERT OR IGNORE INTO baget_bot_pool
+}): SeedOutcome {
+  const db = getDb();
+  // Wrap the existence check + upsert in one transaction so the
+  // outcome flag matches the actual write (no TOCTOU window where a
+  // racing seed lands between the SELECT and the INSERT). Since
+  // better-sqlite3 transactions serialize on the same handle and
+  // /baget/bot-pool/seed is operator-only / low-frequency, the
+  // transaction overhead is negligible.
+  return db.transaction((): SeedOutcome => {
+    const existed = db
+      .prepare('SELECT 1 AS one FROM baget_bot_pool WHERE bot_username = ?')
+      .get(args.botUsername) as { one: number } | undefined;
+    db.prepare(
+      `INSERT INTO baget_bot_pool
          (bot_username, bot_token_value, webhook_secret, status,
           assigned_agent_group_id, assigned_at, webhook_registered_at, created_at)
-       VALUES (?, ?, ?, 'available', NULL, NULL, NULL, ?)`,
-    )
-    .run(args.botUsername, args.botTokenValue, args.webhookSecret, args.createdAt);
-  return result.changes === 1;
+       VALUES (?, ?, ?, 'available', NULL, NULL, NULL, ?)
+       ON CONFLICT(bot_username) DO UPDATE SET
+         bot_token_value = excluded.bot_token_value,
+         webhook_secret  = excluded.webhook_secret`,
+    ).run(args.botUsername, args.botTokenValue, args.webhookSecret, args.createdAt);
+    return existed ? 'rotated' : 'inserted';
+  })();
 }
 
 /**
- * Atomic CAS assignment. Returns the bot row that was just assigned,
- * or null if the pool has no available bots.
+ * Atomic assignment. Returns the bot row that was just assigned, or
+ * null if the pool has no available bots.
  *
  * Re-entrancy: if `agentGroupId` already has a bot assigned, this is
  * a no-op that returns the existing row. The bind handler relies on
  * that for idempotency — second bind for the same group returns the
  * same bot, never a fresh one.
  *
- * Race protection:
- *   - The FK partial UNIQUE index guarantees one bot per agent_group.
- *     If a concurrent caller also tries to assign for the same group,
- *     the UPDATE's WHERE clause filters by `status='available'` AND
- *     the candidate `bot_username`, and the FK uniqueness check fires
- *     at COMMIT time. better-sqlite3 raises SqliteError, which we
- *     convert to a re-read of the existing assignment.
- *   - Two callers picking different agent_groups against a 1-bot pool:
- *     the SELECT + UPDATE inside the transaction — only one's UPDATE
- *     finds `status='available'` for the candidate row; the loser's
- *     UPDATE returns `changes=0` and we re-attempt up to 3 times
- *     (defense; in practice contention on a 10-bot pool is essentially
- *     zero given baget.ai's request rate).
+ * Concurrency model:
+ *   The host runs as a single Node process (Railway service), and
+ *   better-sqlite3 transactions serialize synchronously on the
+ *   single DB handle, so two parallel calls into THIS function from
+ *   the same process can never overlap. The SELECT + UPDATE pair
+ *   inside the transaction is therefore race-free against in-process
+ *   concurrency.
+ *
+ *   The FK partial UNIQUE index `idx_bot_pool_assigned_agent_group`
+ *   is the second-line guarantee for two cases that fall outside the
+ *   in-process serialization:
+ *     1. A future horizontally-scaled deployment with multiple
+ *        Node processes hitting the same SQLite file (not the
+ *        current shape, but defense in depth).
+ *     2. A re-entrant call from the same process where the previous
+ *        bind's row insertion happened OUTSIDE this function (e.g.
+ *        operator manual UPDATE) — the unique-constraint violation
+ *        still makes "two bots assigned to one agent_group"
+ *        impossible.
+ *   On `SQLITE_CONSTRAINT_UNIQUE` from the UPDATE we catch and
+ *   re-read the existing assignment (the conflict is itself the
+ *   evidence that another caller already won).
  */
 export function assignNextAvailableBot(agentGroupId: string): BotPoolRow | null {
   const db = getDb();
+  const SELECT_BY_AGENT = db.prepare(
+    `SELECT bot_username, bot_token_value, webhook_secret, status,
+            assigned_agent_group_id, assigned_at, webhook_registered_at, created_at
+       FROM baget_bot_pool
+      WHERE assigned_agent_group_id = ?`,
+  );
   return db.transaction((): BotPoolRow | null => {
     // 0. If this group already has a bot, return it (idempotent).
-    const existing = db
-      .prepare(
-        `SELECT bot_username, bot_token_value, webhook_secret, status,
-                assigned_agent_group_id, assigned_at, webhook_registered_at, created_at
-           FROM baget_bot_pool
-          WHERE assigned_agent_group_id = ?`,
-      )
-      .get(agentGroupId) as BotPoolRow | undefined;
+    const existing = SELECT_BY_AGENT.get(agentGroupId) as BotPoolRow | undefined;
     if (existing) return existing;
 
     // 1. Pick the oldest available bot. The partial filtered index
@@ -143,22 +192,39 @@ export function assignNextAvailableBot(agentGroupId: string): BotPoolRow | null 
       .get() as { bot_username: string } | undefined;
     if (!candidate) return null;
 
-    // 2. CAS flip. The WHERE clause re-asserts `status='available'`
-    //    AND the username match so any concurrent assign that snuck
-    //    in fails this UPDATE (changes=0) — at which point we'd
-    //    fall through to "no rows" semantics. A retry loop above
-    //    isn't needed because better-sqlite3 transactions serialize
-    //    on the same DB handle.
+    // 2. Flip the row to 'assigned' and stamp the FK. The WHERE
+    //    clause re-asserts `status='available'` so any prior change
+    //    on this row (concurrent process winning the race) fails
+    //    this UPDATE with changes=0. The FK partial UNIQUE index
+    //    fires only if a DIFFERENT bot was already assigned to this
+    //    same agent_group — see the catch below.
     const assignedAt = new Date().toISOString();
-    const result = db
-      .prepare(
-        `UPDATE baget_bot_pool
-            SET status                  = 'assigned',
-                assigned_agent_group_id = ?,
-                assigned_at             = ?
-          WHERE bot_username = ? AND status = 'available'`,
-      )
-      .run(agentGroupId, assignedAt, candidate.bot_username);
+    let result: { changes: number };
+    try {
+      result = db
+        .prepare(
+          `UPDATE baget_bot_pool
+              SET status                  = 'assigned',
+                  assigned_agent_group_id = ?,
+                  assigned_at             = ?
+            WHERE bot_username = ? AND status = 'available'`,
+        )
+        .run(agentGroupId, assignedAt, candidate.bot_username);
+    } catch (err) {
+      // SQLITE_CONSTRAINT_UNIQUE: another caller raced and assigned
+      // a (different) bot to this same agent_group between our
+      // step-0 lookup and step-2 write. Re-read and return their
+      // assignment — preserves the function's idempotency contract
+      // from the caller's perspective. (Single-process callers
+      // can't hit this; cross-process or operator-manual writes
+      // can.)
+      const code = (err as { code?: string }).code ?? '';
+      if (code === 'SQLITE_CONSTRAINT_UNIQUE') {
+        const racedExisting = SELECT_BY_AGENT.get(agentGroupId) as BotPoolRow | undefined;
+        if (racedExisting) return racedExisting;
+      }
+      throw err;
+    }
     if (result.changes !== 1) return null;
 
     // 3. Read back the freshly-assigned row.
