@@ -87,7 +87,7 @@ RUN cd /app/container/agent-runner && bun install --production
 #
 # Add a converter here when the agent should be able to reach for it
 # without an `install_packages` round-trip + container rebuild.
-RUN cd /app/container/agent-runner && bun add --production \
+RUN cd /app/container/agent-runner && bun add --no-frozen-lockfile --production \
       marked@^15.0.0 \
       md-to-pdf@^5.2.4 \
       turndown@^7.2.0
