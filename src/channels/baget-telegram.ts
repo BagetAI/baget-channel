@@ -370,7 +370,7 @@ function buildAdapter(cfg: BagetTelegramConfig): ChannelAdapter {
         if (err instanceof OversizedAttachmentError) {
           await sendBotMessage(
             msg.chat.id,
-            "That file is too big for me to receive (20 MB limit). Try splitting it or sharing a link.",
+            'That file is too big for me to receive (20 MB limit). Try splitting it or sharing a link.',
           );
           return;
         }
@@ -763,13 +763,13 @@ function coalesceInboundMessages(messages: InboundMessage[]): InboundMessage {
       ? { ...(latestContent as Record<string, unknown>), text: joinedText }
       : joinedText;
 
-  // Future-proof attachments concat. PR #2 (inbound media) will add
-  // `attachments?: unknown[]` to InboundMessage; this read returns
-  // [] today and lights up automatically when the field exists.
-  // TODO: drop the cast when PR #2 lands and the field is on the type.
-  const allAttachments = messages.flatMap(
-    (m) => (m as InboundMessage & { attachments?: unknown[] }).attachments ?? [],
-  );
+  // PR #18 (inbound media) added `attachments?: InboundAttachment[]`
+  // to InboundMessage. Concat them in arrival order. Note: in practice
+  // attachment-bearing messages bypass the debouncer (see processUpdate
+  // routing), so this branch is rarely exercised — but if a future
+  // change lets attachments through the debouncer, the concat keeps
+  // them intact.
+  const allAttachments = messages.flatMap((m) => m.attachments ?? []);
 
   const result: InboundMessage = {
     id: latest.id,
@@ -778,10 +778,8 @@ function coalesceInboundMessages(messages: InboundMessage[]): InboundMessage {
     content: coalescedContent,
     isMention: latest.isMention,
     isGroup: latest.isGroup,
+    ...(allAttachments.length > 0 ? { attachments: allAttachments } : {}),
   };
-  if (allAttachments.length > 0) {
-    (result as InboundMessage & { attachments: unknown[] }).attachments = allAttachments;
-  }
   return result;
 }
 

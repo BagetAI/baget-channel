@@ -298,6 +298,12 @@ describe('Baget Telegram adapter — inbound attachments', () => {
       adminToken: ADMIN_TOKEN,
       apiBaseUrl: 'https://api.telegram.test',
       _testGroupsDir: tmpGroupsDir,
+      // Tight debounce so the test's 80ms post-webhook wait is enough
+      // to observe the inbound event flushed through the debouncer.
+      // Plain-text messages debounce; commands and attachment-bearing
+      // messages bypass and route immediately. The default 1500ms is
+      // fine in production but kills test latency budgets.
+      inboundDebounceMs: 30,
       fetchImpl: async (url, init) => {
         const u = String(url);
         if (u.includes('/getFile')) {
