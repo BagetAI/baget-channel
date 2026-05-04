@@ -33,6 +33,17 @@
  *   pattern `send_file` uses):
  *     - baget_send_document_file
  *
+ *   GENERATE (1) — produces fresh artifacts (images today; future:
+ *   videos, audio) and ships them via the same outbox + attachments
+ *   contract as send_document_file. Calls Gemini Image API directly
+ *   with the channel-runner's existing GOOGLE_GENERATIVE_AI_API_KEY —
+ *   intentionally bypasses baget.ai's auth/audit/credit rail because
+ *   image generation is conversational scratchwork (mockup, "what
+ *   could this look like" exploration), not a saved-asset write. If
+ *   the founder wants the image as a saved brand asset, point them at
+ *   the dashboard's image flow which goes through the worker:
+ *     - baget_generate_image
+ *
  *   WRITE — direct (free, immediate; calls /approval/execute):
  *     - baget_set_direction
  *     - baget_update_metric
@@ -72,6 +83,7 @@ import path from 'path';
 
 import { writeMessageOut } from '../db/messages-out.js';
 import { workspaceOutboxDir } from '../workspace-paths.js';
+import { generateImageBytes, type AspectRatio, type GenerateImageDeps } from './image-gen.js';
 import { generateId, resolveRouting } from './core.js';
 import { registerTools } from './server.js';
 import type { McpToolDefinition } from './types.js';
@@ -693,6 +705,138 @@ const sendDocumentFile: McpToolDefinition = {
   },
 };
 
+// ── GENERATE tools ──────────────────────────────────────────────────────────
+
+/**
+ * Test seam — production passes a freshly-built Google GenAI client at
+ * tool-call time; tests inject a stub via `_setImageGenDeps` so the real
+ * Gemini API never gets pinged from CI.
+ */
+let imageGenDeps: GenerateImageDeps = {};
+
+/** Test-only — reset between tests via `_setImageGenDeps({})`. */
+export function _setImageGenDeps(deps: GenerateImageDeps): void {
+  imageGenDeps = deps;
+}
+
+/** A simple per-image-extension → mime-type map used to derive a safe
+ *  filename. Keep in sync with what Imagen actually returns (PNG by
+ *  default in our config). */
+function extensionFromMime(mime: string): string {
+  switch (mime) {
+    case 'image/png':
+      return 'png';
+    case 'image/jpeg':
+      return 'jpg';
+    case 'image/webp':
+      return 'webp';
+    default:
+      return 'png';
+  }
+}
+
+/** Slug a free-form prompt into a filesystem-safe basename so the
+ *  founder sees `pitch-mockup-vela-{ts}.png` instead of `image-{id}.png`.
+ *  Length-bounded so the host's outbox path never exceeds the FS limit. */
+function slugFromPrompt(prompt: string): string {
+  const slug = prompt
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 60);
+  return slug || 'image';
+}
+
+const generateImage: McpToolDefinition = {
+  tool: {
+    name: 'baget_generate_image',
+    description:
+      "Generate an image from a text prompt and ship it to the founder as a real photo attachment. Use when the founder asks for a logo / mockup / illustration / 'show me what X could look like' / 'make me an image of Y'. Conversational scratchwork — does NOT save to the founder's brand library (point them at the dashboard if they want a saved asset). Caption rides with the image. Picks Imagen 3 by default; override via env. The model may refuse some prompts (people / brands / NSFW) — surface the error, suggest a reword.",
+    inputSchema: {
+      type: 'object',
+      properties: {
+        prompt: {
+          type: 'string',
+          minLength: 1,
+          maxLength: 2000,
+          description:
+            'Text prompt for the image. Be specific about style, composition, color, and subject — Imagen rewards detail.',
+        },
+        aspectRatio: {
+          type: 'string',
+          enum: ['1:1', '3:4', '4:3', '9:16', '16:9'],
+          description:
+            'Optional aspect ratio. Default 1:1 (square — safest across channels). Use 9:16 for story / portrait, 16:9 for landscape / cover, 4:3 or 3:4 for in-between.',
+        },
+        text: {
+          type: 'string',
+          maxLength: 1000,
+          description:
+            'Optional caption rendered with the image (Telegram + WhatsApp support up to ~1024 chars). Often empty — the image speaks for itself.',
+        },
+      },
+      required: ['prompt'],
+      additionalProperties: false,
+    },
+  },
+  async handler(args) {
+    const prompt = String(args.prompt ?? '').trim();
+    if (!prompt) return fail('prompt is required');
+
+    const aspectRatio = (args.aspectRatio as AspectRatio | undefined) ?? '1:1';
+
+    // Generate FIRST — if Gemini fails or refuses the prompt, we want
+    // to surface that BEFORE doing any filesystem or DB work. Avoids
+    // the "outbox dir created, then nothing landed" debugging confusion.
+    const result = await generateImageBytes({ prompt, aspectRatio }, imageGenDeps);
+    if (!result.ok) return fail(`generate_image failed: ${result.error}`);
+
+    // Resolve destination — always reply in-place, no `to` arg exposed.
+    const routing = resolveRouting(undefined);
+    if ('error' in routing) return fail(routing.error);
+
+    const id = generateId();
+    const outboxDir = path.join(workspaceOutboxDir(), id);
+    const ext = extensionFromMime(result.mimeType);
+    const filename = `${slugFromPrompt(prompt)}.${ext}`;
+    const stagedPath = path.join(outboxDir, filename);
+    try {
+      fs.mkdirSync(outboxDir, { recursive: true });
+      fs.writeFileSync(stagedPath, result.bytes);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      return fail(`generate_image failed to stage the image locally: ${msg}`);
+    }
+
+    // Path-based attachments contract — same as send_document_file.
+    // `kind: 'photo'` so the Telegram adapter routes through
+    // sendBagetBotPhoto (renders inline) instead of sendBagetBotDocument
+    // (renders as file card). Founders want the visual immediately.
+    const captionText = typeof args.text === 'string' ? args.text.trim() : '';
+    writeMessageOut({
+      id,
+      kind: 'chat',
+      platform_id: routing.platform_id,
+      channel_type: routing.channel_type,
+      thread_id: routing.thread_id,
+      content: JSON.stringify({
+        text: '',
+        attachments: [
+          {
+            kind: 'photo',
+            path: stagedPath,
+            filename,
+            ...(captionText ? { caption: captionText } : {}),
+          },
+        ],
+      }),
+    });
+
+    log(`generate_image: ${id} → ${routing.resolvedName} (${filename}, ${result.bytes.length} bytes)`);
+    return ok(`Generated and sent ${filename} (${(result.bytes.length / 1024).toFixed(0)} KB).`);
+  },
+};
+
 // ── WRITE tools (direct — no approval card needed) ────────────────────────────
 
 const setDirection: McpToolDefinition = {
@@ -1100,6 +1244,8 @@ registerTools([
   readDocument,
   // File transfer
   sendDocumentFile,
+  // Generate
+  generateImage,
   // Write — direct
   setDirection,
   updateMetric,
@@ -1120,4 +1266,6 @@ registerTools([
   sendCampaign,
 ]);
 
-log('baget MCP tools registered: 6 read + 1 file-transfer + 12 direct write + 4 approval-gated = 23 total');
+log(
+  'baget MCP tools registered: 6 read + 1 file-transfer + 1 generate + 12 direct write + 4 approval-gated = 24 total',
+);

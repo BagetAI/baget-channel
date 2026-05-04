@@ -1026,3 +1026,225 @@ describe('baget_list_recent_activity handler', () => {
     expect(fetchCalls).toHaveLength(0);
   });
 });
+
+// ── baget_generate_image ────────────────────────────────────────────────────
+
+interface ImageGenCall {
+  model: string;
+  prompt: string;
+  aspectRatio?: string;
+}
+
+function mockImageClient(opts: { bytes?: Buffer; mimeType?: string; noImages?: boolean; throwError?: Error }): {
+  client: ImageGenClient;
+  calls: ImageGenCall[];
+} {
+  const calls: ImageGenCall[] = [];
+  const client: ImageGenClient = {
+    models: {
+      async generateImages(args) {
+        calls.push({ model: args.model, prompt: args.prompt, aspectRatio: args.config?.aspectRatio });
+        if (opts.throwError) throw opts.throwError;
+        if (opts.noImages) return { generatedImages: [] };
+        return {
+          generatedImages: [
+            {
+              image: {
+                imageBytes: (opts.bytes ?? Buffer.from('fake-png')).toString('base64'),
+                mimeType: opts.mimeType ?? 'image/png',
+              },
+            },
+          ],
+        };
+      },
+    },
+  };
+  return { client, calls };
+}
+
+describe('baget_generate_image registration + description', () => {
+  it('is registered under the name the prompt now points at', () => {
+    const tool = getRegisteredToolByName('baget_generate_image');
+    expect(tool).toBeDefined();
+    expect(tool!.tool.name).toBe('baget_generate_image');
+  });
+
+  it('description leads with the founder verbs (logo / mockup / illustration)', () => {
+    // The model picks this tool by recognizing intent in the
+    // founder's phrasing. The description has to lead with the
+    // exact verbs / framings the founder will use, not with the
+    // implementation detail (Imagen / Gemini).
+    const tool = getRegisteredToolByName('baget_generate_image');
+    const description = (tool!.tool.description ?? '').toLowerCase();
+    expect(description).toContain('logo');
+    expect(description).toContain('mockup');
+    expect(description).toContain('illustration');
+    expect(description).toContain('image');
+  });
+
+  it('declares prompt required, aspectRatio enum, optional caption', () => {
+    const tool = getRegisteredToolByName('baget_generate_image');
+    const schema = tool!.tool.inputSchema as {
+      properties: Record<string, { type: string; enum?: string[]; maxLength?: number }>;
+      required?: string[];
+    };
+    expect(schema.required).toEqual(['prompt']);
+    expect(schema.properties.prompt?.type).toBe('string');
+    expect(schema.properties.aspectRatio?.enum).toEqual(['1:1', '3:4', '4:3', '9:16', '16:9']);
+    expect(schema.properties.text?.type).toBe('string');
+  });
+});
+
+describe('baget_generate_image handler — success path', () => {
+  beforeEach(() => {
+    // Reset the module-level client between tests so a stub from
+    // an earlier test doesn't leak.
+    _setImageGenDeps({});
+  });
+
+  it('calls Gemini, stages the image, and writes a photo attachment row', async () => {
+    seedSingleDestination();
+    const workspace = setupWorkspace();
+    const fakeBytes = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x01, 0x02]);
+    const { client, calls } = mockImageClient({ bytes: fakeBytes });
+    _setImageGenDeps({ client });
+
+    const tool = getRegisteredToolByName('baget_generate_image');
+    const result = await tool!.handler({
+      prompt: 'minimalist Vela logo, monochrome, vector style',
+      aspectRatio: '1:1',
+    });
+
+    expect(result.isError).toBeUndefined();
+    expect(calls).toHaveLength(1);
+    expect(calls[0].prompt).toBe('minimalist Vela logo, monochrome, vector style');
+    expect(calls[0].aspectRatio).toBe('1:1');
+    expect(calls[0].model).toBe('imagen-3.0-generate-002');
+
+    // File staged under outbox/<msgId>/<slug>.png with the actual bytes.
+    const outboxRoot = path.join(workspace, 'outbox');
+    const messageDirs = fs.readdirSync(outboxRoot);
+    expect(messageDirs).toHaveLength(1);
+    const stagedFiles = fs.readdirSync(path.join(outboxRoot, messageDirs[0]));
+    expect(stagedFiles).toHaveLength(1);
+    expect(stagedFiles[0]).toMatch(/^minimalist-vela-logo-monochrome-vector-style\.png$/);
+    expect(fs.readFileSync(path.join(outboxRoot, messageDirs[0], stagedFiles[0])).equals(fakeBytes)).toBe(true);
+
+    // messages_out row written with photo (NOT document) attachment.
+    const rows = getOutboundDb().prepare('SELECT platform_id, channel_type, content FROM messages_out').all() as Array<{
+      platform_id: string;
+      channel_type: string;
+      content: string;
+    }>;
+    expect(rows).toHaveLength(1);
+    const content = JSON.parse(rows[0].content);
+    expect(content.text).toBe('');
+    expect(content.attachments).toHaveLength(1);
+    expect(content.attachments[0].kind).toBe('photo');
+    expect(content.attachments[0].path).toContain('outbox');
+    expect(content.attachments[0].path.endsWith('.png')).toBe(true);
+  });
+
+  it('honors a non-default aspectRatio (e.g., 9:16 for story / portrait)', async () => {
+    seedSingleDestination();
+    setupWorkspace();
+    const { client, calls } = mockImageClient({});
+    _setImageGenDeps({ client });
+
+    const tool = getRegisteredToolByName('baget_generate_image');
+    await tool!.handler({ prompt: 'Vela hero portrait', aspectRatio: '9:16' });
+
+    expect(calls[0].aspectRatio).toBe('9:16');
+  });
+
+  it('rides the optional caption WITH the photo (not as a separate sendMessage)', async () => {
+    seedSingleDestination();
+    setupWorkspace();
+    const { client } = mockImageClient({});
+    _setImageGenDeps({ client });
+
+    const tool = getRegisteredToolByName('baget_generate_image');
+    await tool!.handler({
+      prompt: 'minimalist logo',
+      text: 'Quick mockup — what do you think?',
+    });
+
+    const rows = getOutboundDb().prepare('SELECT content FROM messages_out').all() as Array<{ content: string }>;
+    const content = JSON.parse(rows[0].content);
+    expect(content.text).toBe('');
+    expect(content.attachments[0].caption).toBe('Quick mockup — what do you think?');
+  });
+
+  it('omits caption when text arg is whitespace-only', async () => {
+    seedSingleDestination();
+    setupWorkspace();
+    const { client } = mockImageClient({});
+    _setImageGenDeps({ client });
+
+    const tool = getRegisteredToolByName('baget_generate_image');
+    await tool!.handler({ prompt: 'logo', text: '   ' });
+    const rows = getOutboundDb().prepare('SELECT content FROM messages_out').all() as Array<{ content: string }>;
+    const content = JSON.parse(rows[0].content);
+    expect(content.attachments[0].caption).toBeUndefined();
+  });
+
+  it('uses .jpg extension when Gemini returns image/jpeg (mimeType-driven)', async () => {
+    seedSingleDestination();
+    const workspace = setupWorkspace();
+    const { client } = mockImageClient({ mimeType: 'image/jpeg' });
+    _setImageGenDeps({ client });
+
+    const tool = getRegisteredToolByName('baget_generate_image');
+    await tool!.handler({ prompt: 'mockup' });
+    const messageDirs = fs.readdirSync(path.join(workspace, 'outbox'));
+    const filename = fs.readdirSync(path.join(workspace, 'outbox', messageDirs[0]))[0];
+    expect(filename.endsWith('.jpg')).toBe(true);
+  });
+});
+
+describe('baget_generate_image handler — failure paths', () => {
+  beforeEach(() => {
+    _setImageGenDeps({});
+  });
+
+  it('errors when prompt is missing — no Gemini call', async () => {
+    const { client, calls } = mockImageClient({});
+    _setImageGenDeps({ client });
+
+    const tool = getRegisteredToolByName('baget_generate_image');
+    const result = await tool!.handler({});
+    expect(result.isError).toBe(true);
+    expect(calls).toHaveLength(0);
+  });
+
+  it("surfaces Gemini's safety-refusal as a friendly 'try rewording' error", async () => {
+    seedSingleDestination();
+    setupWorkspace();
+    const { client } = mockImageClient({ noImages: true });
+    _setImageGenDeps({ client });
+
+    const tool = getRegisteredToolByName('baget_generate_image');
+    const result = await tool!.handler({ prompt: 'a real person' });
+    expect(result.isError).toBe(true);
+    const text = (result.content[0] as { text: string }).text;
+    expect(text).toContain('reword');
+    // No outbox file or DB row when generation refused.
+    const rows = getOutboundDb().prepare('SELECT id FROM messages_out').all();
+    expect(rows).toHaveLength(0);
+  });
+
+  it('surfaces upstream errors (e.g., quota / network) without crashing', async () => {
+    seedSingleDestination();
+    setupWorkspace();
+    const { client } = mockImageClient({ throwError: new Error('429 quota exceeded') });
+    _setImageGenDeps({ client });
+
+    const tool = getRegisteredToolByName('baget_generate_image');
+    const result = await tool!.handler({ prompt: 'logo' });
+    expect(result.isError).toBe(true);
+    expect((result.content[0] as { text: string }).text).toContain('429 quota exceeded');
+    // Generation failed BEFORE any I/O — no outbox dir created.
+    const rows = getOutboundDb().prepare('SELECT id FROM messages_out').all();
+    expect(rows).toHaveLength(0);
+  });
+});
