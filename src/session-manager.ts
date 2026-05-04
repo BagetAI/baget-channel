@@ -21,10 +21,12 @@ import { DATA_DIR } from './config.js';
 import { getMessagingGroup } from './db/messaging-groups.js';
 import {
   createSession,
+  deleteSession,
   findSession,
   findSessionByAgentGroup,
   findSessionForAgent,
   getSession,
+  getSessionsByAgentGroup,
   updateSession,
 } from './db/sessions.js';
 import {
@@ -417,4 +419,71 @@ export function markContainerIdle(sessionId: string): void {
 /** Mark a container as stopped for a session. */
 export function markContainerStopped(sessionId: string): void {
   updateSession(sessionId, { container_status: 'stopped' });
+}
+
+/**
+ * Wipe ALL session data (DBs + on-disk dirs + sessions rows) for an
+ * agent_group. Called from the un-archive flow on re-pair so the
+ * founder's reconnect produces a true fresh-start: empty conversation
+ * history, no inherited tool-call records, no Gemini context-poisoning
+ * carrying across the disconnect boundary.
+ *
+ * Why this exists:
+ *   The agent runner reconstructs its message history from messages_in
+ *   (inbound.db) on every poll-loop tick. If a prior turn surfaced a
+ *   tool 401 — say, the dashboard route was Clerk-locked when the
+ *   founder asked "show me the deck" — that 401 lives in messages_in
+ *   forever and Gemini learns "documents = unavailable" from its own
+ *   prior reply. Subsequent prompts get the canned refusal pattern
+ *   even after the route is fixed, because the model never retries
+ *   tool calls that failed in history.
+ *
+ *   Fixing the route doesn't fix the model's poisoned context. The
+ *   founder must explicitly re-pair (which is the natural "start over"
+ *   gesture), and the un-archive flow wipes session DB to make that
+ *   gesture actually clear the history.
+ *
+ * Order matters: caller MUST kill any active runners FIRST
+ * (`killActiveSessionsForAgent` from `container-runner.ts`) before
+ * calling this. A live runner with open file handles to inbound.db
+ * will keep them open through the dir delete on Linux (the file
+ * lingers as `(deleted)` in /proc/<pid>/fd until the process exits),
+ * so the wipe ostensibly succeeds but the runner keeps reading the
+ * stale page cache. Kill → wait for SIGTERM exit → wipe.
+ *
+ * Returns the number of sessions wiped (0 is fine — happens when the
+ * founder paired but never sent a message, or sessions were already
+ * cleaned up on a prior re-pair attempt).
+ */
+export function wipeSessionDataForAgentGroup(agentGroupId: string): number {
+  const sessions = getSessionsByAgentGroup(agentGroupId);
+  if (sessions.length === 0) return 0;
+
+  for (const session of sessions) {
+    const dir = sessionDir(agentGroupId, session.id);
+    try {
+      fs.rmSync(dir, { recursive: true, force: true });
+    } catch (err) {
+      // Best-effort: log and continue. The sessions row delete below
+      // is the load-bearing wipe — without the row, the next inbound
+      // creates a fresh session_id with a fresh dir. A leftover dir
+      // on disk is wasted bytes but not a correctness issue.
+      log.warn('Session dir wipe failed (non-fatal)', { agentGroupId, sessionId: session.id, err });
+    }
+    deleteSession(session.id);
+  }
+
+  // Try to remove the agent_group dir if it's now empty (no sessions
+  // left). Best-effort: race with a concurrent spawnContainer that
+  // already started recreating the dir is fine — rmdir non-empty
+  // throws which we swallow.
+  const agentDir = path.join(sessionsBaseDir(), agentGroupId);
+  try {
+    fs.rmdirSync(agentDir);
+  } catch {
+    // Dir not empty or doesn't exist — both fine.
+  }
+
+  log.info('Wiped session data on un-archive', { agentGroupId, sessionCount: sessions.length });
+  return sessions.length;
 }

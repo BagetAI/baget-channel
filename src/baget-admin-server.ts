@@ -62,6 +62,7 @@ import {
 } from './db/baget-agent-groups.js';
 import { persistChannelTokenToOneCLI } from './baget-channel-secret.js';
 import { killActiveSessionsForAgent } from './container-runner.js';
+import { wipeSessionDataForAgentGroup } from './session-manager.js';
 import { deleteChannelToken, upsertChannelToken } from './db/baget-channel-tokens.js';
 import { getDb } from './db/connection.js';
 import { insertPairingToken, sweepExpiredPairingTokens } from './db/baget-pairing-tokens.js';
@@ -626,6 +627,16 @@ export function createBagetAdminServer(config: BagetAdminServerConfig): BagetAdm
     if (existing) {
       agentGroupId = existing.id;
       if (existing.archived_at) {
+        // Re-pair = fresh start. Kill any lingering runner first
+        // (defense in depth — disconnect's killActiveSessionsForAgent
+        // should have already done this, but a runner spawned in the
+        // narrow window after disconnect would survive otherwise),
+        // then wipe session DBs so Gemini's next turn doesn't inherit
+        // tool-call history from before the disconnect (a 401 in old
+        // history poisons subsequent retries even after the underlying
+        // route is fixed).
+        killActiveSessionsForAgent(existing.id, 'baget-create:repair-wipe-prep');
+        wipeSessionDataForAgentGroup(existing.id);
         unarchiveBagetAgentGroup(existing.id);
       }
       // Always refresh team names — a re-pair after a rename should
@@ -787,6 +798,14 @@ export function createBagetAdminServer(config: BagetAdminServerConfig): BagetAdm
     if (existing) {
       agentGroupId = existing.id;
       if (existing.archived_at) {
+        // Re-pair via Login-Widget direct-bind — same fresh-start
+        // semantics as handleCreate's path. Kill any lingering runner
+        // FIRST (open file handles to inbound.db would otherwise let
+        // the Bun child read stale history through /proc/<pid>/fd
+        // even after the dir is gone), then wipe session DBs so
+        // Gemini's next turn starts with empty conversation context.
+        killActiveSessionsForAgent(existing.id, 'baget-bind:repair-wipe-prep');
+        wipeSessionDataForAgentGroup(existing.id);
         unarchiveBagetAgentGroup(existing.id);
       }
       updateBagetTeamMembers(existing.id, teamMembersJson);
