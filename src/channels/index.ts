@@ -9,3 +9,7 @@
 import './cli.js';
 // Baget telegram channel — self-registers when TELEGRAM_BOT_TOKEN is set.
 import './baget-telegram.js';
+// Baget web-chat channel — self-registers when BAGET_ADMIN_TOKEN is set.
+// Provides the dashboard's WebSocket + history endpoints sharing the
+// admin server's listener.
+import './baget-web.js';

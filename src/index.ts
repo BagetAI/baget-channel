@@ -24,6 +24,7 @@ import { startActiveDeliveryPoll, startSweepDeliveryPoll, setDeliveryAdapter, st
 import { startHostSweep, stopHostSweep } from './host-sweep.js';
 import { routeInbound } from './router.js';
 import { log } from './log.js';
+import { mirrorInbound, mirrorOutbound } from './baget-web-mirror.js';
 
 // Response + shutdown registries live in response-registry.ts to break the
 // circular import cycle: src/index.ts imports src/modules/index.js for side
@@ -88,6 +89,13 @@ async function main(): Promise<void> {
   await initChannelAdapters((adapter: ChannelAdapter): ChannelSetup => {
     return {
       onInbound(platformId, threadId, message) {
+        // Cross-channel mirror: persist + broadcast to dashboard
+        // subscribers BEFORE routing. Wrapping here (instead of in
+        // each adapter) means a future channel adapter inherits the
+        // mirror behavior automatically — the only contract is "use
+        // setup.onInbound for inbound traffic". The mirror swallows
+        // its own errors so a mirror failure never blocks routing.
+        mirrorInbound(adapter.channelType, platformId, message, new Date().toISOString());
         routeInbound({
           channelType: adapter.channelType,
           platformId,
@@ -158,7 +166,27 @@ async function main(): Promise<void> {
       // it's testable without booting the whole host. The non-trivial bit
       // is the attachments lift — see that helper's docblock for why.
       const parsedContent = JSON.parse(content);
-      return adapter.deliver(platformId, threadId, buildOutboundMessage(kind, parsedContent, files));
+      const platformMessageId = await adapter.deliver(
+        platformId,
+        threadId,
+        buildOutboundMessage(kind, parsedContent, files),
+      );
+      // Cross-channel mirror runs AFTER successful delivery so a
+      // failed send never produces a phantom "team replied" record.
+      // mirrorOutbound is no-op for system / agent-to-agent kinds and
+      // for chats that don't resolve to a wired agent_group.
+      mirrorOutbound(
+        {
+          channelType,
+          platformId,
+          kind,
+          content,
+          files,
+          platformMessageId,
+        },
+        new Date().toISOString(),
+      );
+      return platformMessageId;
     },
     async setTyping(channelType: string, platformId: string, threadId: string | null): Promise<void> {
       const adapter = getChannelAdapter(channelType);
