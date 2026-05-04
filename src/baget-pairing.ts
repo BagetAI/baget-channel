@@ -46,11 +46,19 @@ const BAGET_TEMPLATE_FILE = path.join(BAGET_TEMPLATE_DIR, 'CLAUDE.md.template');
 /**
  * Per-founder team names sent to this fork at provision time. CoS is
  * the only required member — every founder has a CoS regardless of
- * their plan (apprenti has CoS + Intern; intern is not modeled here).
- * The remaining specialists are optional and only sent when the
- * founder has actively-hired that role on baget.ai's dashboard.
+ * their plan. The remaining roles are optional and only sent when
+ * the founder has that role on baget.ai's dashboard:
  *
- * When a specialist is omitted:
+ *   - **specialists** (developer / marketing / analyst / design / ops)
+ *     have a persona tag, an emoji, and reply directly in chat.
+ *   - **intern** is a roster-only member: the LLM knows about the
+ *     founder's intern (so "what's my team?" answers correctly) but
+ *     the intern doesn't reply — the CoS speaks for them. Apprenti
+ *     founders have CoS + Intern; without sending intern here, the
+ *     LLM gaslights the founder about their own team ("Antoine is
+ *     not on your roster" when Antoine IS the founder's intern).
+ *
+ * When an optional role is omitted:
  *   - The renderer strips the role's block from CLAUDE.local.md (so
  *     the LLM doesn't think a "Clara the analyst" exists when only
  *     CoS is hired).
@@ -67,24 +75,32 @@ export type BagetTeamMembers = {
   analyst?: string;
   design?: string;
   ops?: string;
+  intern?: string;
 };
 
 /**
- * The optional specialist roles, in template order. CoS is always
- * present (handled separately in the renderer + validator). Exported
- * so `baget-admin-server.ts` and `channels/baget-telegram.ts` can
+ * The optional roles, in template order. CoS is always present
+ * (handled separately in the renderer + validator). Specialists come
+ * first, then intern (intern is roster-only — no persona tag, just
+ * listed so the LLM knows the founder's intern exists). Exported so
+ * `baget-admin-server.ts` and `channels/baget-telegram.ts` can
  * import the canonical list — keeping all role-set knowledge in one
  * file prevents drift when a new role lands.
  */
-export const OPTIONAL_ROLES = ['developer', 'marketing', 'analyst', 'design', 'ops'] as const;
+export const OPTIONAL_ROLES = [
+  'developer',
+  'marketing',
+  'analyst',
+  'design',
+  'ops',
+  'intern',
+] as const;
 export type OptionalRole = (typeof OPTIONAL_ROLES)[number];
 
 /**
  * Every role the fork knows about, in stable order. CoS first, then
- * specialists. Used by the validator to reject unknown role keys.
- * Intern is intentionally not here — the fork doesn't model an
- * intern persona; baget.ai is responsible for filtering it before
- * the wire payload arrives.
+ * specialists, then intern. Used by the validator to reject unknown
+ * role keys.
  */
 export const ALL_ROLES = ['cos', ...OPTIONAL_ROLES] as const;
 export type AllRole = (typeof ALL_ROLES)[number];

@@ -229,6 +229,58 @@ describe('renderBagetClaudeMd', () => {
       ).toThrow(/orphan role marker/);
     });
   });
+
+  describe('intern (roster-only, no persona tag)', () => {
+    it('renders intern roster line when present (apprenti shape)', () => {
+      // Sam's Platter scenario: apprenti = CoS + Intern. Without intern
+      // in the prompt, the bot would say "Antoine is not on your roster"
+      // when the founder asks about Antoine — gaslighting them about
+      // their own dashboard team.
+      const out = renderBagetClaudeMd({
+        companyName: "Sam's Platter",
+        teamMembers: { cos: 'Raphaël', intern: 'Antoine' },
+      });
+      expect(out).toContain('Raphaël');
+      expect(out).toContain('Antoine');
+      expect(out).toContain('🌱');
+      expect(out).toContain('Intern');
+      // Intern is roster-only — should NOT appear in tag-routing /
+      // examples / voice-per-role sections (which we didn't add it to).
+      expect(out).not.toContain('`intern:`');
+      expect(out).not.toMatch(/<!--\/?role:/);
+      expect(out).not.toContain('{{');
+    });
+
+    it('strips intern block when not provided', () => {
+      const out = renderBagetClaudeMd({
+        companyName: 'Acme',
+        teamMembers: { cos: 'Raphaël' },
+      });
+      expect(out).not.toContain('🌱');
+      expect(out).not.toContain('Intern');
+      expect(out).not.toContain('{{intern_name}}');
+    });
+
+    it('renders intern alongside hired specialists (artisan + intern shape)', () => {
+      // Plausible future shape: artisan founder with bonus slot keeps
+      // their intern visible too. Validate intern doesn't conflict
+      // with the specialist blocks.
+      const out = renderBagetClaudeMd({
+        companyName: 'Acme',
+        teamMembers: {
+          cos: 'Raphaël',
+          developer: 'Valentin',
+          intern: 'Antoine',
+        },
+      });
+      expect(out).toContain('Raphaël');
+      expect(out).toContain('Valentin');
+      expect(out).toContain('Antoine');
+      expect(out).toContain('💻');
+      expect(out).toContain('🌱');
+      expect(out).not.toContain('{{');
+    });
+  });
 });
 
 describe('provisionBagetGroup', () => {
