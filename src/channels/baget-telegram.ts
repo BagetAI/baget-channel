@@ -41,7 +41,7 @@ import { getBagetAgentGroupById, normalizeBoundBagetTelegramFounderChannels } fr
 import { getMessagingGroupAgents, getMessagingGroupByPlatform } from '../db/messaging-groups.js';
 import { log } from '../log.js';
 import { OPTIONAL_ROLES, type BagetTeamMembers } from '../baget-pairing.js';
-import type { ChannelAdapter, ChannelSetup, OutboundMessage } from './adapter.js';
+import type { ChannelAdapter, ChannelSetup, OutboundMessage, CelebrationPayload } from './adapter.js';
 import { registerChannelAdapter } from './channel-registry.js';
 import {
   BAGET_TELEGRAM_CHANNEL_TYPE,
@@ -343,6 +343,13 @@ function buildAdapter(cfg: BagetTelegramConfig): ChannelAdapter {
   ): Promise<string | undefined> {
     const chatId = chatIdFromPlatformId(platformId);
     if (chatId === null) return undefined;
+
+    // Celebrations bypass persona-prefix — they're from the team collectively.
+    if (message.kind === 'celebration') {
+      const celebText = renderCelebrationText(message.content as CelebrationPayload);
+      return sendBotMessage(chatId, celebText);
+    }
+
     const text = extractText(message);
     if (text === null) return undefined;
 
@@ -499,6 +506,18 @@ async function readBody(req: http.IncomingMessage, max: number): Promise<string>
   });
 }
 
+function renderCelebrationText(payload: CelebrationPayload): string {
+  const prefix = payload.streakDays ? `🎉 Day ${payload.streakDays}! ` : '🎉 ';
+  const lines: string[] = [`${prefix}Batch ${payload.batchNumber} just landed.`, '', payload.summary];
+  if (payload.deliverables && payload.deliverables.length > 0) {
+    lines.push('');
+    for (const d of payload.deliverables) {
+      lines.push(`• ${d.label}${d.href ? ` → ${d.href}` : ''}`);
+    }
+  }
+  return lines.join('\n');
+}
+
 function extractText(message: OutboundMessage): string | null {
   const content = message.content as Record<string, unknown> | string | undefined;
   if (typeof content === 'string') return content;
@@ -591,3 +610,4 @@ export function _testBuildBagetTelegramAdapter(cfg: BagetTelegramConfig): Channe
 // rejecting partial teams in production. A focused unit test here
 // guards against regressions to that specific gate.
 export const _testParseTeamMembers = parseTeamMembers;
+export const _testRenderCelebrationText = renderCelebrationText;
