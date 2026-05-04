@@ -187,9 +187,7 @@ describe('applyPersonaPrefix — intern is a silent tag (re-prefix as CoS)', () 
   const APPRENTI: BagetTeamMembers = { cos: 'Raphaël', intern: 'Antoine' };
 
   it('re-prefixes intern: as CoS (apprenti shape)', () => {
-    expect(applyPersonaPrefix('intern: just watching', APPRENTI)).toBe(
-      '🧭 Raphaël: just watching',
-    );
+    expect(applyPersonaPrefix('intern: just watching', APPRENTI)).toBe('🧭 Raphaël: just watching');
   });
 
   it('re-prefixes intern: when intern is absent too', () => {
@@ -212,14 +210,23 @@ describe('applyPersonaPrefix — intern is a silent tag (re-prefix as CoS)', () 
   });
 
   it('preserves multi-line body on intern fallback', () => {
-    expect(applyPersonaPrefix('intern: line1\nline2', APPRENTI)).toBe(
-      '🧭 Raphaël: line1\nline2',
-    );
+    expect(applyPersonaPrefix('intern: line1\nline2', APPRENTI)).toBe('🧭 Raphaël: line1\nline2');
   });
 
   it('still passes through truly unknown tags (captain:) untouched', () => {
     // Intern is a SPECIFIC silent tag — other unknown tags still
     // surface raw so QA notices.
     expect(applyPersonaPrefix('captain: ahoy', APPRENTI)).toBe('captain: ahoy');
+  });
+
+  it('strips leading whitespace before silent-tag fallback (regression)', () => {
+    // parseRoleTag preserves the ORIGINAL message (with any leading
+    // newlines/spaces) in `body` for unknown tags. Without trimming
+    // leading whitespace before the strip-the-tag regex, the strip
+    // silently no-ops and the founder sees `\nintern: hi` re-prefixed
+    // under CoS as `🧭 Raphaël: \nintern: hi` — leaking the raw tag.
+    expect(applyPersonaPrefix('\nintern: hello', APPRENTI)).toBe('🧭 Raphaël: hello');
+    expect(applyPersonaPrefix('  intern: hello', APPRENTI)).toBe('🧭 Raphaël: hello');
+    expect(applyPersonaPrefix('\n\n\tintern: hello', APPRENTI)).toBe('🧭 Raphaël: hello');
   });
 });

@@ -184,10 +184,17 @@ export function applyPersonaPrefix(message: string, team: BagetTeamMembers): str
     // Tag-shaped but not in KNOWN_ROLES. Two sub-cases:
     if (SILENT_TAGS.has(parsed.rawTag)) {
       // Roster-only role (e.g. intern) — re-prefix as CoS.
-      // parseRoleTag preserves the original `tag: body` in `body` for
-      // unknown tags, so we strip it here before re-prefixing.
+      // parseRoleTag preserves the ORIGINAL message (incl. any leading
+      // whitespace like `\nintern: hi`) in `body` for unknown tags, so
+      // we have to trim leading whitespace BEFORE the anchored regex,
+      // otherwise the strip silently no-ops and the founder sees the
+      // raw `intern:` tag re-prefixed under CoS. (Caught by Gemini +
+      // Codex on PR #9.)
       const cos = team.cos;
-      const body = parsed.body.replace(new RegExp(`^${parsed.rawTag}:\\s*`), '');
+      const body = parsed.body
+        .replace(/^[\s]+/, '')
+        .replace(new RegExp(`^${parsed.rawTag}:[ \\t]?\\n?`), '')
+        .replace(/^[\s]+/, '');
       if (typeof cos === 'string' && cos.trim().length > 0) {
         return `${ROLE_EMOJI.cos} ${cos}: ${body}`;
       }

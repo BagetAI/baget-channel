@@ -87,14 +87,7 @@ export type BagetTeamMembers = {
  * import the canonical list — keeping all role-set knowledge in one
  * file prevents drift when a new role lands.
  */
-export const OPTIONAL_ROLES = [
-  'developer',
-  'marketing',
-  'analyst',
-  'design',
-  'ops',
-  'intern',
-] as const;
+export const OPTIONAL_ROLES = ['developer', 'marketing', 'analyst', 'design', 'ops', 'intern'] as const;
 export type OptionalRole = (typeof OPTIONAL_ROLES)[number];
 
 /**
