@@ -308,7 +308,7 @@ export async function sendBagetBotPhoto(args: {
   const fetchFn = args.fetchImpl ?? fetch;
   const url = `${apiBase}/bot${args.botToken}/sendPhoto`;
   try {
-    const fileData = fs.readFileSync(args.filePath);
+    const fileData = await fs.promises.readFile(args.filePath);
     const filename = path.basename(args.filePath);
     const form = new FormData();
     form.append('chat_id', String(args.chatId));
@@ -375,7 +375,7 @@ export async function sendBagetBotDocument(args: {
   const fetchFn = args.fetchImpl ?? fetch;
   const url = `${apiBase}/bot${args.botToken}/sendDocument`;
   try {
-    const fileData = fs.readFileSync(args.filePath);
+    const fileData = await fs.promises.readFile(args.filePath);
     const filename = args.filename ?? path.basename(args.filePath);
     const form = new FormData();
     form.append('chat_id', String(args.chatId));

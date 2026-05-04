@@ -182,15 +182,15 @@ export async function downloadTelegramAttachment(
   }
 
   // Write to temp, then atomic rename
-  fs.mkdirSync(destDir, { recursive: true });
+  await fs.promises.mkdir(destDir, { recursive: true });
   const rand = randomBytes(4).toString('hex');
   const ext = path.extname(file_path!) || '';
   const finalName = `${fileId}-${rand}${ext}`;
   const tmpPath = path.join(destDir, `.tmp-${finalName}`);
   const finalPath = path.join(destDir, finalName);
 
-  fs.writeFileSync(tmpPath, buffer);
-  fs.renameSync(tmpPath, finalPath);
+  await fs.promises.writeFile(tmpPath, buffer);
+  await fs.promises.rename(tmpPath, finalPath);
 
   return { filePath: finalPath, sizeBytes: buffer.length };
 }

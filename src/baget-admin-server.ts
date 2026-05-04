@@ -1209,13 +1209,13 @@ export function createBagetAdminServer(config: BagetAdminServerConfig): BagetAdm
     if (typeof body.summary !== 'string' || body.summary.trim().length === 0) {
       return 'summary must be a non-empty string';
     }
-    if (body.streakDays !== undefined && (typeof body.streakDays !== 'number' || body.streakDays < 1)) {
+    if (body.streakDays !== undefined && (!Number.isInteger(body.streakDays) || body.streakDays < 1)) {
       return 'streakDays must be a positive number when present';
     }
     if (body.deliverables !== undefined) {
       if (!Array.isArray(body.deliverables)) return 'deliverables must be an array';
       for (const d of body.deliverables) {
-        if (typeof d.label !== 'string' || d.label.trim().length === 0) {
+        if (!d || typeof d !== 'object' || typeof d.label !== 'string' || d.label.trim().length === 0) {
           return 'each deliverable must have a non-empty label';
         }
       }
