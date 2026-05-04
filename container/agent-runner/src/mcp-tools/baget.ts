@@ -301,7 +301,7 @@ const listDocuments: McpToolDefinition = {
   tool: {
     name: 'baget_list_documents',
     description:
-      "List the founder's documents — business plan, brand guide, pitch deck, research, etc. Returns id, title, category, and createdAt for each. Call this first before referring to a specific document by name; never guess document ids. After listing, call `baget_read_document({documentId})` to fetch the full content of a specific document (e.g., when the founder asks to see, share, or send it).",
+      "List the founder's documents — business plan, brand guide, pitch deck, research, etc. Returns id, title, category, and createdAt for each. Call this first before referring to a specific document by name; never guess document ids. After listing, call `baget_read_document` with the chosen document's id to fetch its full content (e.g., when the founder asks to see, share, or send it).",
     inputSchema: { type: 'object', properties: {}, additionalProperties: false },
   },
   async handler() {
@@ -342,12 +342,21 @@ const readDocument: McpToolDefinition = {
     // encodeURIComponent on the model-supplied id — a hallucinated `..`
     // or `/` would otherwise change the request path semantics before
     // the server's UUID guard could reject it cleanly.
-    const result = await bagetFetch({
+    const result = await bagetFetch<{ document?: unknown }>({
       method: 'GET',
       path: `/api/companies/${ctx.companyId}/documents/${encodeURIComponent(documentId)}`,
     });
     if (!result.ok) return fail(`read_document failed: ${result.error}`);
-    return ok(JSON.stringify(result.data, null, 2));
+    // Unwrap the `{ document: ... }` envelope so the model gets just the
+    // document object, not the wrapper. Saves tokens in the agent's
+    // context window (Gemini medium on PR #12). Falls back to the raw
+    // payload if the upstream shape ever changes — better to surface
+    // unfamiliar JSON than to hide it under a defensive null.
+    const inner =
+      result.data && typeof result.data === 'object' && 'document' in result.data
+        ? (result.data as { document: unknown }).document
+        : result.data;
+    return ok(JSON.stringify(inner, null, 2));
   },
 };
 

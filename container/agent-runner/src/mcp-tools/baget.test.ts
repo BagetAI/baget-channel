@@ -102,11 +102,11 @@ describe('baget_list_documents description', () => {
 });
 
 describe('baget_read_document handler', () => {
-  it('GETs the per-document endpoint with bearer auth and returns the document body inline', async () => {
+  it('GETs the per-document endpoint with bearer auth and returns the unwrapped document body', async () => {
     // Production response shape from baget.ai's GET /api/companies/:id/documents/:docId
     // is `{ document: { id, title, content, category, agentRole, agentName, cycle, createdAt } }`
-    // — wrapped under `document`. The handler is a passthrough so the model can navigate
-    // the JSON; the description tells it to look for the body content inline.
+    // — wrapped under `document`. The handler unwraps so the model gets just the
+    // document object (Gemini medium on PR #12 — saves tokens in the agent's context).
     const docPayload = {
       document: {
         id: 'doc-uuid-456',
@@ -126,9 +126,28 @@ describe('baget_read_document handler', () => {
     expect(fetchCalls[0].authHeader).toBe('Bearer test-bearer-token');
     expect(result.isError).toBeUndefined();
     const text = (result.content[0] as { text: string }).text;
+    // Body of the document is included...
     expect(text).toContain('Vela');
     expect(text).toContain('Fashion designer marketplace');
     expect(text).toContain('doc-uuid-456');
+    // ...but the `document` envelope key is NOT — that's the unwrap working.
+    const parsed = JSON.parse(text);
+    expect(parsed).not.toHaveProperty('document');
+    expect(parsed.id).toBe('doc-uuid-456');
+    expect(parsed.title).toBe('Pitch Deck');
+  });
+
+  it('falls back to the raw payload when the upstream shape lacks a `document` key', async () => {
+    // Defensive — if baget.ai ever changes the response shape we'd
+    // rather surface the unfamiliar JSON than null it out.
+    const flatPayload = { id: 'doc-uuid-789', title: 'Old Shape', content: 'Body.' };
+    fetchResponse = () => new Response(JSON.stringify(flatPayload), { status: 200 });
+    const tool = getRegisteredToolByName('baget_read_document');
+    const result = await tool!.handler({ documentId: 'doc-uuid-789' });
+    expect(result.isError).toBeUndefined();
+    const text = (result.content[0] as { text: string }).text;
+    expect(text).toContain('Old Shape');
+    expect(text).toContain('doc-uuid-789');
   });
 
   it('URL-encodes the documentId so a hallucinated path traversal is neutralized', async () => {
