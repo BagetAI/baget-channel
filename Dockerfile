@@ -69,6 +69,29 @@ COPY package.json ./
 # install at /app/container/agent-runner/node_modules.
 RUN cd /app/container/agent-runner && bun install --production
 
+# Pre-install converters the agent reaches for during composition
+# workflows ("send me the deck as HTML / TXT", inline doc tweaks,
+# etc.). Pre-installing them here makes the agent's `npx -y …` calls
+# resolve from the local cache instead of fetching from the npm
+# registry on every chat — the first uncached `npx -y marked` adds
+# ~3-5s to a reply that should feel instant. Pinned versions so a
+# breaking upstream doesn't break the agent's `npx` invocation.
+#
+# Pulled in here rather than in the agent-runner package.json because:
+#   1. The agent calls them via `npx`, not `import` — they're not a
+#      compile-time dep of any TS file.
+#   2. Keeping them out of package.json means typecheck stays fast
+#      and bundle size for the host doesn't bloat.
+#   3. They live under the agent's `node_modules` so `npx -y` finds
+#      them via the local-first resolution order.
+#
+# Add a converter here when the agent should be able to reach for it
+# without an `install_packages` round-trip + container rebuild.
+RUN cd /app/container/agent-runner && bun add --production \
+      marked@^15.0.0 \
+      md-to-pdf@^5.2.4 \
+      turndown@^7.2.0
+
 # Pre-create groups/ + data/ — first request to provision a Baget
 # agent_group needs them present.
 #
