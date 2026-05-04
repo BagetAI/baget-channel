@@ -395,7 +395,15 @@ export function buildAdapter(cfg: BagetWebConfig, deps: BuildAdapterDeps = {}): 
     }
 
     const nowIso = new Date().toISOString();
-    const messageId = `bwm-${randomUUID()}`;
+    // Use the dashboard's `clientId` as the message id when supplied
+    // so retries (POST or WS replay after a reconnect) deduplicate
+    // against the same row instead of producing duplicate
+    // conversation entries and duplicate runner wakeups. We namespace
+    // it to keep message-id format predictable downstream and to
+    // prevent collision with server-minted ids.
+    const messageId = payload.clientId
+      ? `bwm-client-${payload.clientId}`
+      : `bwm-${randomUUID()}`;
     const inbound: InboundMessage = {
       id: messageId,
       kind: 'chat',

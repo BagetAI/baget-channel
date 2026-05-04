@@ -5,6 +5,7 @@ import { createBagetAgentGroup } from './baget-agent-groups.js';
 import {
   appendMessage,
   findConversationByAgentGroup,
+  findMessageBySource,
   getOrCreateConversation,
   listMessages,
 } from './baget-web-conversations.js';
@@ -215,6 +216,40 @@ describe('baget-web conversations — DB helpers', () => {
     const messages = listMessages(conv.conversation_id);
     expect(messages).toHaveLength(1);
     expect(messages[0]!.attachments).toEqual([{ kind: 'document', filename: 'spec.pdf', sizeBytes: 1234 }]);
+  });
+
+  it('listMessages with a cursor (timestamp + id) does NOT skip same-millisecond rows', () => {
+    const conv = getOrCreateConversation(AG, nowIso());
+    const sameTs = nowIso(1000);
+    appendMessage({ conversationId: conv.conversation_id, direction: 'founder', text: 'a', sourceChannel: 'x', timestamp: sameTs, id: 'bwm-aaa' }, nowIso());
+    appendMessage({ conversationId: conv.conversation_id, direction: 'founder', text: 'b', sourceChannel: 'x', timestamp: sameTs, id: 'bwm-bbb' }, nowIso());
+    appendMessage({ conversationId: conv.conversation_id, direction: 'founder', text: 'c', sourceChannel: 'x', timestamp: sameTs, id: 'bwm-ccc' }, nowIso());
+
+    // Plain string `since` is timestamp-only — it skips ALL three same-stamp rows (legacy semantic).
+    expect(listMessages(conv.conversation_id, sameTs).map((m) => m.text)).toEqual([]);
+
+    // Cursor form keeps the rest of the burst window — no skipping.
+    const afterFirst = listMessages(conv.conversation_id, { timestamp: sameTs, id: 'bwm-aaa' });
+    expect(afterFirst.map((m) => m.text)).toEqual(['b', 'c']);
+  });
+
+  it('findMessageBySource returns the row, or undefined when absent', () => {
+    const conv = getOrCreateConversation(AG, nowIso());
+    appendMessage(
+      {
+        conversationId: conv.conversation_id,
+        direction: 'founder',
+        text: 'tracked',
+        sourceChannel: 'baget-web',
+        sourceMessageId: 'bwm-client-XYZ',
+        timestamp: nowIso(),
+      },
+      nowIso(),
+    );
+    const found = findMessageBySource('baget-web', 'bwm-client-XYZ');
+    expect(found?.text).toBe('tracked');
+    expect(findMessageBySource('baget-web', 'bwm-client-NOTFOUND')).toBeUndefined();
+    expect(findMessageBySource('other-channel', 'bwm-client-XYZ')).toBeUndefined();
   });
 
   it('listMessages tolerates a malformed attachments_json row (returns empty)', () => {

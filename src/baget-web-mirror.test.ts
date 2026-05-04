@@ -95,6 +95,20 @@ describe('baget-web mirror', () => {
       expect(findConversationByAgentGroup(AG)).toBeUndefined();
     });
 
+    it('dedups by (channel, message.id) so a retry does not double-write', () => {
+      bindTelegram();
+      const inbound: InboundMessage = {
+        id: 'tg-retry-1',
+        kind: 'chat',
+        timestamp: nowIso(),
+        content: { text: 'send once' },
+      };
+      mirrorInbound(TG_CHANNEL, TG_PLATFORM, inbound, nowIso());
+      mirrorInbound(TG_CHANNEL, TG_PLATFORM, inbound, nowIso(1000));
+      const conv = findConversationByAgentGroup(AG)!;
+      expect(listMessages(conv.conversation_id)).toHaveLength(1);
+    });
+
     it('skips empty text + empty attachments', () => {
       bindTelegram();
       const inbound: InboundMessage = {

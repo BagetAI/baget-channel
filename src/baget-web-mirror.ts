@@ -33,6 +33,7 @@
 import { hasTable, getDb } from './db/connection.js';
 import {
   appendMessage,
+  findMessageBySource,
   getOrCreateConversation,
   type BagetWebMessageAttachment,
 } from './db/baget-web-conversations.js';
@@ -127,6 +128,13 @@ export function mirrorInbound(channelType: string, platformId: string, message: 
     // unbound chat that only sends service / no-op messages doesn't
     // accumulate empty `baget_web_conversations` rows.
     if (text === null && attachments.length === 0) return;
+    // Retry-dedup: if the same (channel, message_id) was already
+    // persisted, this is a replay (e.g. a dashboard reconnect re-
+    // POSTing with the same `clientId`, or a Telegram update_id that
+    // somehow reached us twice past the seen-updates dedup). Skip
+    // the second write rather than producing duplicate conversation
+    // entries and duplicate broadcasts.
+    if (findMessageBySource(channelType, message.id)) return;
     const conv = getOrCreateConversation(agentGroupId, nowIso);
     const persisted = appendMessage(
       {
@@ -156,6 +164,23 @@ export function mirrorInbound(channelType: string, platformId: string, message: 
     // failure here drops the cross-channel record but leaves the
     // founder's message routing intact.
     log.warn('baget-web mirror: inbound append failed', { err, channelType, platformId });
+  }
+}
+
+/**
+ * Parse the JSON content payload from `messages_out`. Returns `null`
+ * for empty input, the parsed object for valid JSON, and the raw
+ * string for anything else (legacy adapters that wrote plain text).
+ * Lifted out of `mirrorOutbound` to flatten the surrounding control
+ * flow — keeping the parse fallback in its own pure function lets
+ * the outer try/catch read as one error boundary.
+ */
+function parseOutboundContent(content: string): unknown {
+  if (!content || content.length === 0) return null;
+  try {
+    return JSON.parse(content);
+  } catch {
+    return content;
   }
 }
 
@@ -233,15 +258,7 @@ export function mirrorOutbound(input: MirrorOutboundInput, nowIso: string): void
   if (!agentGroupId) return;
 
   try {
-    let parsed: unknown = null;
-    if (input.content && input.content.length > 0) {
-      try {
-        parsed = JSON.parse(input.content);
-      } catch {
-        // Non-JSON content (legacy paths) — fall through with raw text.
-        parsed = input.content;
-      }
-    }
+    const parsed = parseOutboundContent(input.content);
     // Skip ask-question rendering; the persisted founder-visible record
     // is the eventual answer flow, not the prompt card.
     if (parsed && typeof parsed === 'object' && (parsed as Record<string, unknown>).type === 'ask_question') {

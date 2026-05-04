@@ -183,24 +183,93 @@ export function appendMessage(input: AppendMessageInput, nowIso: string): BagetW
 }
 
 /**
- * List messages in a conversation ordered by timestamp ascending.
- * `sinceTimestamp` is a strict `>` filter so the dashboard can poll
- * without re-receiving the boundary message; pass the latest timestamp
- * the client already has. The optional bound is folded into a single
- * prepared statement (`? IS NULL OR timestamp > ?`) so we don't burn
- * a fresh `prepare()` on every history poll.
+ * Cursor for `listMessages` incremental polls. `timestamp` alone isn't
+ * enough — multiple rows are routinely written with the same ISO
+ * millisecond stamp under burst delivery, and a client that polls with
+ * just the last timestamp would skip every same-stamp row. `(timestamp,
+ * id)` is the same lex-ordered tuple the SELECT's ORDER BY uses, so
+ * the filter and ordering stay consistent.
  */
-export function listMessages(conversationId: string, sinceTimestamp?: string): BagetWebMessage[] {
-  const since = sinceTimestamp ?? null;
-  const rows = getDb()
+export interface BagetWebMessageCursor {
+  timestamp: string;
+  id: string;
+}
+
+/**
+ * List messages in a conversation ordered by `(timestamp, id)`
+ * ascending. Three modes:
+ *
+ *   - No `since`: return the full conversation.
+ *   - String `since`: legacy timestamp-only filter (`timestamp > since`).
+ *     Backward-compatible with pre-cursor callers; subject to the
+ *     same-millisecond-skip footgun if multiple messages share the
+ *     boundary stamp.
+ *   - Cursor `since` (`{ timestamp, id }`): tuple-strict filter using
+ *     the same lex order as the SELECT's ORDER BY, so a same-stamp
+ *     burst is paginated cleanly without skipping rows.
+ *
+ * Two prepared statements rather than one with NULL juggling — the
+ * SQL stays readable and SQLite's prepared-statement cache keeps the
+ * cost of two distinct shapes the same as one.
+ */
+export function listMessages(
+  conversationId: string,
+  since?: string | BagetWebMessageCursor,
+): BagetWebMessage[] {
+  const db = getDb();
+  if (since === undefined) {
+    const rows = db
+      .prepare(
+        `SELECT * FROM baget_web_messages
+           WHERE conversation_id = ?
+        ORDER BY timestamp ASC, id ASC`,
+      )
+      .all(conversationId) as MessageRow[];
+    return rows.map(rowToMessage);
+  }
+  if (typeof since === 'string') {
+    const rows = db
+      .prepare(
+        `SELECT * FROM baget_web_messages
+           WHERE conversation_id = ? AND timestamp > ?
+        ORDER BY timestamp ASC, id ASC`,
+      )
+      .all(conversationId, since) as MessageRow[];
+    return rows.map(rowToMessage);
+  }
+  const rows = db
     .prepare(
       `SELECT * FROM baget_web_messages
          WHERE conversation_id = ?
-           AND (? IS NULL OR timestamp > ?)
+           AND (timestamp > ? OR (timestamp = ? AND id > ?))
       ORDER BY timestamp ASC, id ASC`,
     )
-    .all(conversationId, since, since) as MessageRow[];
+    .all(conversationId, since.timestamp, since.timestamp, since.id) as MessageRow[];
   return rows.map(rowToMessage);
+}
+
+/**
+ * Look up an existing message by its origin-channel coordinates.
+ * Used by the cross-channel mirror to dedup retries — if the
+ * dashboard POSTs the same `clientId` twice (network blip, reconnect)
+ * the second mirror attempt finds the prior row and bails before
+ * creating a duplicate. The (source_channel, source_message_id) pair
+ * is intentionally a soft index — no UNIQUE constraint, since we
+ * don't want a malformed payload to crash routing on the conflict;
+ * the lookup is the sole dedup gate.
+ */
+export function findMessageBySource(
+  sourceChannel: string,
+  sourceMessageId: string,
+): BagetWebMessage | undefined {
+  const row = getDb()
+    .prepare(
+      `SELECT * FROM baget_web_messages
+         WHERE source_channel = ? AND source_message_id = ?
+         LIMIT 1`,
+    )
+    .get(sourceChannel, sourceMessageId) as MessageRow | undefined;
+  return row ? rowToMessage(row) : undefined;
 }
 
 /** Read the conversation row for an agent_group, or undefined if none. */
