@@ -351,12 +351,22 @@ const listRecentActivity: McpToolDefinition = {
   async handler() {
     const ctx = requireCompanyId();
     if (!ctx.ok) return fail(ctx.error);
-    const result = await bagetFetch({
+    const result = await bagetFetch<{ activity?: unknown }>({
       method: 'GET',
       path: `/api/companies/${ctx.companyId}/recent-activity`,
     });
     if (!result.ok) return fail(`list_recent_activity failed: ${result.error}`);
-    return ok(JSON.stringify(result.data, null, 2));
+    // Unwrap the `{ activity: [...] }` envelope so the model gets just
+    // the array. Mirrors `baget_read_document`'s `{ document }` unwrap
+    // pattern. Saves tokens in the agent's context window — the
+    // envelope key is metadata the agent doesn't need. Falls back to
+    // the raw payload if the upstream shape ever changes (better to
+    // surface unfamiliar JSON than to hide it under a defensive null).
+    const inner =
+      result.data && typeof result.data === 'object' && 'activity' in result.data
+        ? (result.data as { activity: unknown }).activity
+        : result.data;
+    return ok(JSON.stringify(inner, null, 2));
   },
 };
 

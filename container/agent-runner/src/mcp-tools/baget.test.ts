@@ -950,7 +950,11 @@ describe('baget_list_recent_activity tool registration', () => {
 });
 
 describe('baget_list_recent_activity handler', () => {
-  it('GETs /recent-activity with bearer auth and returns the JSON payload', async () => {
+  it('GETs /recent-activity with bearer auth and returns the unwrapped activity array', async () => {
+    // Production response shape from baget.ai's GET /api/companies/:id/recent-activity
+    // is `{ activity: [...] }` — wrapped under `activity`. The handler unwraps so the
+    // model gets just the array, mirroring `baget_read_document`'s `{ document }`
+    // unwrap pattern. Saves tokens in the agent's context window.
     const activityPayload = {
       activity: [
         {
@@ -982,8 +986,25 @@ describe('baget_list_recent_activity handler', () => {
     expect(fetchCalls[0].authHeader).toBe('Bearer test-bearer-token');
     expect(result.isError).toBeUndefined();
     const parsed = JSON.parse((result.content[0] as { text: string }).text);
-    expect(parsed.activity).toHaveLength(2);
-    expect(parsed.activity[0].id).toBe('act-1');
+    // Unwrapped: parsed should be the activity array directly, NOT { activity: [...] }
+    expect(Array.isArray(parsed)).toBe(true);
+    expect(parsed).toHaveLength(2);
+    expect(parsed[0].id).toBe('act-1');
+    // Sanity: the `activity` envelope key is NOT in the response.
+    expect(parsed).not.toHaveProperty('activity');
+  });
+
+  it('falls back to the raw payload when the upstream shape lacks an `activity` key', async () => {
+    // Defensive parity with baget_read_document — if baget.ai ever
+    // changes the response shape we'd rather surface unfamiliar JSON
+    // than null it out.
+    const flatPayload = [{ id: 'a-1', type: 'task-completed' }];
+    setDefaultResponse(() => new Response(JSON.stringify(flatPayload), { status: 200 }));
+    const tool = getRegisteredToolByName('baget_list_recent_activity');
+    const result = await tool!.handler({});
+    expect(result.isError).toBeUndefined();
+    const parsed = JSON.parse((result.content[0] as { text: string }).text);
+    expect(parsed).toEqual(flatPayload);
   });
 
   it('surfaces upstream HTTP errors with a tool-prefixed message', async () => {
