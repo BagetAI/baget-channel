@@ -995,14 +995,6 @@ export function createBagetAdminServer(config: BagetAdminServerConfig): BagetAdm
     const teamMembersJson = JSON.stringify(teamMembers);
     const existing = getBagetAgentGroup(userId, companyId);
     let agentGroupId: string;
-    // Track whether THIS bind call created the agent_groups row vs
-    // resurrected/reused an existing one. The pool-assignment helper
-    // uses this to preserve legacy global-bot pairings under mixed
-    // deployments (see resolvePoolAssignment for the rule). A
-    // resurrected (was-archived) agent_group counts as pre-existing
-    // for this purpose — its founder paired before the disconnect
-    // and may have been on the global bot at that time.
-    let wasFreshAgentGroup = false;
     if (existing) {
       agentGroupId = existing.id;
       if (existing.archived_at) {
@@ -1029,7 +1021,6 @@ export function createBagetAdminServer(config: BagetAdminServerConfig): BagetAdm
           baget_team_members: teamMembersJson,
           created_at: new Date(now()).toISOString(),
         });
-        wasFreshAgentGroup = true;
       } catch (err) {
         const winner = getBagetAgentGroup(userId, companyId);
         if (!winner) {
@@ -1042,10 +1033,21 @@ export function createBagetAdminServer(config: BagetAdminServerConfig): BagetAdm
           return;
         }
         agentGroupId = winner.id;
-        // Race lost: another concurrent caller already created the
-        // row. Treat as pre-existing for pool-assignment purposes.
       }
     }
+
+    // Capture pre-bind chat-binding count: the legacy-preservation
+    // signal must distinguish "Vela has been paired against the
+    // global bot before, with chat-binds in the DB" from "fresh
+    // founder OR retried-fresh after a partial failure" (where the
+    // agent_group exists but no chat-bind ever landed). The
+    // `countMessagingGroupBindings` reading is taken BEFORE
+    // `bindBagetTelegramChat` below adds this call's binding, so
+    // a value > 0 means a PRIOR successful bind exists. Codex P2
+    // catch — the previous "wasFreshAgentGroup" signal misclassified
+    // partial-failure retries as legacy and starved them of pool
+    // bots forever.
+    const preBindChatCount = countMessagingGroupBindings(agentGroupId);
 
     // 2b. Persist baget.ai's per-(user, company) bearer token before
     //     we wire the Telegram chat. Order matters: if the token
@@ -1094,8 +1096,8 @@ export function createBagetAdminServer(config: BagetAdminServerConfig): BagetAdm
     //      `telegramBotToken` is configured, fall back to that
     //      (legacy single-bot path). If neither is available, return
     //      503 with `pool_exhausted` so the operator knows to seed.
-    const poolEntry = resolvePoolAssignment(agentGroupId, wasFreshAgentGroup);
-    if (poolEntry === 'pool_exhausted') {
+    const poolResult = resolvePoolAssignment(agentGroupId, preBindChatCount > 0);
+    if (poolResult === 'pool_exhausted') {
       log.error('Baget bind-telegram: pool exhausted and no global token configured', {
         userId,
         companyId,
@@ -1108,6 +1110,10 @@ export function createBagetAdminServer(config: BagetAdminServerConfig): BagetAdm
       });
       return;
     }
+    // Unpack: { row, wasFreshlyAssigned } when we have a pool entry,
+    // null on the legacy global-bot path.
+    const poolEntry = poolResult ? poolResult.row : null;
+    const poolEntryFreshlyAssigned = poolResult ? poolResult.wasFreshlyAssigned : false;
 
     // Resolve the (botToken, botUsername) pair to use for ALL
     // outbound calls below — welcome message, setWebhook, setMyName.
@@ -1162,20 +1168,27 @@ export function createBagetAdminServer(config: BagetAdminServerConfig): BagetAdm
 
       // Set the bot's display name to the company. Best-effort.
       //
-      // Gate on first-bind only: Telegram has a per-bot daily quota
-      // for `setMyName` in addition to the per-minute rate limit
-      // documented on `setBotDisplayName`. Calling it on EVERY
-      // re-bind is wasteful and, on a re-pair storm (operator
-      // script, founder debugging session), would exhaust the
-      // daily allowance and leave the display name stuck at an
-      // older value until the next day. The display name only
-      // changes when the company name changes, which we don't
-      // detect here — the cleanest gate is "first time we wrote
-      // webhook_registered_at." On subsequent binds, the name from
-      // the first bind is already correct (or the rate-limit will
-      // re-stamp it whenever it expires).
-      const isFirstBind = !poolEntry.webhook_registered_at;
-      if (isFirstBind) {
+      // Gate: only fire setMyName when this bind FRESHLY ASSIGNED a
+      // pool bot to this agent_group. Idempotent re-binds for the
+      // same (agent_group, bot) pair skip; recycled bots (released
+      // by a previous founder, freshly assigned to this one) DO
+      // fire setMyName because they're a fresh assignment for the
+      // new founder.
+      //
+      // Why not gate on `webhook_registered_at`: that flag stays
+      // set across release/reassign by design (to avoid burning a
+      // setWebhook round-trip on a recycled bot whose URL contains
+      // the immutable username). Reusing it for setMyName would
+      // leave the previous founder's company name on the bot's
+      // Telegram profile when the bot is recycled — cross-tenant
+      // identity leak in the founder's chat list. Codex P1 catch.
+      //
+      // Telegram has a per-bot daily quota for setMyName + a
+      // per-minute rate limit (returned as 429 → mapped to a
+      // separate `'telegram_rate_limited'` reason callers ignore).
+      // Gating on freshly-assigned keeps quota usage proportional
+      // to actual founder churn, not bind-call frequency.
+      if (poolEntryFreshlyAssigned) {
         const nameResult = await setBotDisplayName({
           botToken: poolEntry.bot_token_value,
           displayName: `${companyName} Team`,
@@ -1249,24 +1262,35 @@ export function createBagetAdminServer(config: BagetAdminServerConfig): BagetAdm
    * Resolve the bot pool entry for an agent_group.
    *
    *   - Existing pool assignment for this agent_group → returns the row
-   *     (idempotent re-bind).
-   *   - **Pre-existing agent_group + no pool entry + global token
+   *     with `wasFreshlyAssigned: false` (idempotent re-bind).
+   *   - **Pre-existing chat-binds + no pool entry + global token
    *     configured** → returns `null` (legacy preservation). Without
    *     this gate, re-binding a Vela-style global-bot pairing would
    *     silently re-home it to a fresh pool bot, breaking the
-   *     founder's chat. The signal "pre-existing agent_group with no
-   *     pool entry on a deployment with a global token" is the
-   *     definition of legacy.
-   *   - Fresh agent_group + pool has availability → assigns a fresh row.
-   *   - Fresh agent_group + pool empty + global token configured →
-   *     returns null (caller falls back to global; this is the
-   *     "operator hasn't migrated to pool mode yet" path).
+   *     founder's chat.
+   *
+   *     Legacy detection uses `hadExistingChatBind` (count of
+   *     `messaging_group_agents` rows for this agent_group BEFORE
+   *     this bind's chat-bind landed). That's a stronger signal
+   *     than "the agent_groups row already existed": a partial-
+   *     failure retry has the row but no chat-binds, so it
+   *     correctly gets a pool bot rather than being starved on
+   *     global. Codex P2 catch.
+   *
+   *   - Fresh agent_group (or partial-failure retry) + pool has
+   *     availability → assigns a fresh row, returns
+   *     `wasFreshlyAssigned: true`.
+   *   - Pool empty + global token configured → returns null
+   *     (caller falls back to global).
    *   - Pool empty + no global token → `'pool_exhausted'` so the
    *     caller can 503.
    *
-   * The `wasFreshAgentGroup` parameter is the bind handler's signal:
-   * `true` iff this call just created the agent_groups row (vs found
-   * one pre-existing for the (userId, companyId) tuple).
+   * The `wasFreshlyAssigned` flag in the success return is the
+   * caller's signal for "did THIS call just stamp the
+   * `assigned_agent_group_id` FK?" (true), vs reusing an existing
+   * assignment (false). The bind handler uses it to gate
+   * `setMyName` so recycled-bot reassignments DO re-set the
+   * Telegram display name (Codex P1).
    *
    * Wraps `getBotPoolEntryByAgentGroup` + `assignNextAvailableBot`
    * with the precedence logic so the bind handler isn't littered
@@ -1274,18 +1298,29 @@ export function createBagetAdminServer(config: BagetAdminServerConfig): BagetAdm
    */
   function resolvePoolAssignment(
     agentGroupId: string,
-    wasFreshAgentGroup: boolean,
-  ): BotPoolRow | null | 'pool_exhausted' {
+    hadExistingChatBind: boolean,
+  ): { row: BotPoolRow; wasFreshlyAssigned: boolean } | null | 'pool_exhausted' {
     const existing = getBotPoolEntryByAgentGroup(agentGroupId);
-    if (existing) return existing;
-    // H1 (legacy preservation): an EXISTING agent_group with no pool
-    // entry on a deployment that has a global token set is — by
-    // definition — a Vela-style legacy pairing. Don't auto-assign;
-    // keep it on the global bot. New founders (fresh agent_group)
-    // still get pool-assigned.
-    if (!wasFreshAgentGroup && config.telegramBotToken) return null;
+    if (existing) return { row: existing, wasFreshlyAssigned: false };
+    // H1 (legacy preservation): an agent_group with EXISTING chat-
+    // binds but NO pool entry, on a deployment with a global token,
+    // is a Vela-style legacy pairing. Don't auto-assign; keep it on
+    // the global bot.
+    if (hadExistingChatBind && config.telegramBotToken) return null;
+    // Fresh agent_group (no chat-binds yet) → safe to assign a pool
+    // bot. Covers both the genuine first-pair and the
+    // partial-failure-retry case.
     const assigned = assignNextAvailableBot(agentGroupId);
-    if (assigned) return assigned;
+    // Idempotency note: assignNextAvailableBot's step-0 returns an
+    // existing assignment if it sees one, but we already gated on
+    // `getBotPoolEntryByAgentGroup` above. In the single-process
+    // host this means `assigned` (when non-null) is always the
+    // fresh assignment — the intermediate transaction commits the
+    // FK stamp. Under hypothetical multi-process concurrency the
+    // step-0 path could return an assignment another process just
+    // wrote; that case is rare and benign for setMyName (the other
+    // process either set the name or will).
+    if (assigned) return { row: assigned, wasFreshlyAssigned: true };
     // Pool empty. If the global token is configured, fall through to
     // the legacy single-bot path; else exhaustion is fatal.
     return config.telegramBotToken ? null : 'pool_exhausted';

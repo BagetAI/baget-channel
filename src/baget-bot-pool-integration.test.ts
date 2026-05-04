@@ -559,10 +559,14 @@ describe('handleBindTelegram — legacy global-bot path', () => {
       createdAt: new Date().toISOString(),
     });
 
-    // Pre-existing legacy agent_group (created OUTSIDE the bind
-    // flow — simulates a Vela company that was paired before pool
-    // existed and is now in the DB without a pool entry).
+    // Pre-existing legacy agent_group + chat-bind (simulates a Vela
+    // company that completed a global-bot pairing before the pool
+    // migration). Both rows are required for the legacy detection
+    // to fire — `agent_group` row alone (without chat-binds) is
+    // the partial-failure-retry shape, which intentionally gets
+    // pool-assigned. Codex P2.
     const { createBagetAgentGroup } = await import('./db/baget-agent-groups.js');
+    const { bindBagetTelegramChat } = await import('./channels/baget-telegram-bind.js');
     createBagetAgentGroup({
       id: 'ag-vela-legacy',
       name: 'Vela',
@@ -571,6 +575,13 @@ describe('handleBindTelegram — legacy global-bot path', () => {
       company_id: VALID_BIND_BODY.companyId,
       baget_team_members: JSON.stringify({ cos: 'Louis' }),
       created_at: new Date().toISOString(),
+    });
+    // Pre-existing chat-bind to the global bot (the Vela founder
+    // already paired before the pool migration).
+    bindBagetTelegramChat({
+      chatId: VALID_BIND_BODY.telegramUserId,
+      agentGroupId: 'ag-vela-legacy',
+      firstName: VALID_BIND_BODY.telegramFirstName,
     });
 
     server = await startBindServer({
@@ -641,6 +652,58 @@ describe('handleBindTelegram — legacy global-bot path', () => {
     // publicBaseUrl; the side-effects skip).
     expect(getBotPoolEntryByAgentGroup('ag-no-url')?.bot_username).toBe('acme_bot_no_url');
     expect(getBotPoolEntryByAgentGroup('ag-no-url')?.webhook_registered_at).toBeNull();
+  });
+
+  it('partial-failure retry: pre-existing agent_group with NO chat-binds gets pool-assigned (Codex P2)', async () => {
+    // Codex P2: when the first bind creates `agent_groups` but
+    // crashes before the chat-bind landed (token persist failed,
+    // network blip, etc.), the founder retries. The retry MUST get
+    // a pool bot — the previous version of this code keyed legacy
+    // detection on "agent_group existed" and would have starved the
+    // founder on the global bot forever. The fixed signal keys on
+    // pre-existing chat-binds, which a partial-failure retry has
+    // none of.
+    seedBotPoolEntry({
+      botUsername: 'retry_bot',
+      botTokenValue: 'tok-retry',
+      webhookSecret: 'sec-retry',
+      createdAt: new Date().toISOString(),
+    });
+
+    // Simulate the partial-failure state: agent_groups row exists
+    // (committed by the failed first bind), no messaging_group_agents
+    // row (the chat-bind didn't run or rolled back).
+    const { createBagetAgentGroup } = await import('./db/baget-agent-groups.js');
+    createBagetAgentGroup({
+      id: 'ag-retry-stub',
+      name: 'Retry Co',
+      folder: 'baget-retry',
+      user_id: VALID_BIND_BODY.userId,
+      company_id: VALID_BIND_BODY.companyId,
+      baget_team_members: JSON.stringify({ cos: 'Louis' }),
+      created_at: new Date().toISOString(),
+    });
+
+    server = await startBindServer({
+      publicBaseUrl: PUBLIC_BASE_URL,
+      // Mixed deployment: global token IS set. Without the chat-bind
+      // signal, the previous logic would have picked legacy here.
+      telegramBotToken: 'tok-mixed-global',
+      telegramRoutes: [
+        { match: (u) => u.endsWith('/setWebhook'), handler: () => okResponse({ ok: true }) },
+        { match: (u) => u.endsWith('/setMyName'), handler: () => okResponse({ ok: true }) },
+        { match: (u) => u.endsWith('/sendMessage'), handler: () => okResponse({ ok: true, result: { message_id: 1 } }) },
+      ],
+      generateAgentGroupId: () => 'unused',
+    });
+
+    const { status, json } = await postBind(server.baseUrl);
+    expect(status).toBe(200);
+    expect(json.agentGroupId).toBe('ag-retry-stub');
+    // The retry succeeds and the founder gets a pool bot, NOT the
+    // legacy global fallback.
+    expect(json.botUsername).toBe('retry_bot');
+    expect(getBotPoolEntryByAgentGroup('ag-retry-stub')?.bot_username).toBe('retry_bot');
   });
 });
 
@@ -746,6 +809,81 @@ describe('disconnect releases the assigned bot back to the pool', () => {
     // Pin: legacy path returns releasedBot:null, not undefined or
     // an error.
     expect(dcJson.releasedBot).toBeNull();
+  });
+
+  it('recycled bot reassignment re-fires setMyName for the new founder (Codex P1)', async () => {
+    // Codex P1: when a bot is released back to the pool,
+    // `webhook_registered_at` intentionally stays set (so the next
+    // assignment skips the redundant setWebhook). The previous gate
+    // on `!webhook_registered_at` for setMyName ALSO would have
+    // skipped — leaving the recycled bot showing the previous
+    // founder's company name in the new founder's chat. Cross-tenant
+    // identity leak in the Telegram UI. Pin the contract that a
+    // FRESH assignment (regardless of webhook state) DOES fire
+    // setMyName.
+    seedBotPoolEntry({
+      botUsername: 'recycle_bot',
+      botTokenValue: 'tok-recycle',
+      webhookSecret: 'sec-recycle',
+      createdAt: new Date().toISOString(),
+    });
+
+    const setMyNameCalls: Array<{ name: string }> = [];
+    server = await startBindServer({
+      publicBaseUrl: PUBLIC_BASE_URL,
+      telegramRoutes: [
+        { match: (u) => u.endsWith('/setWebhook'), handler: () => okResponse({ ok: true }) },
+        {
+          match: (u) => u.endsWith('/setMyName'),
+          handler: (call) => {
+            setMyNameCalls.push({ name: (call.body as { name: string }).name });
+            return okResponse({ ok: true });
+          },
+        },
+        { match: (u) => u.endsWith('/sendMessage'), handler: () => okResponse({ ok: true, result: { message_id: 1 } }) },
+      ],
+      generateAgentGroupId: () => `ag-${setMyNameCalls.length}-${Math.random().toString(36).slice(2, 8)}`,
+    });
+
+    // Founder A pairs Acme Co.
+    const r1 = await postBind(server.baseUrl, {
+      ...VALID_BIND_BODY,
+      userId: 'u-acme',
+      companyId: 'c-acme',
+      companyName: 'Acme',
+    });
+    expect(r1.status).toBe(200);
+    expect(r1.json.botUsername).toBe('recycle_bot');
+    expect(setMyNameCalls).toEqual([{ name: 'Acme Team' }]);
+
+    // Founder A disconnects → bot returns to the pool with
+    // `webhook_registered_at` PRESERVED (intentional optimization
+    // for re-registration skipping).
+    await fetch(`${server.baseUrl}/baget/agent-groups`, {
+      method: 'DELETE',
+      headers: { Authorization: `Bearer ${ADMIN_TOKEN}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ userId: 'u-acme', companyId: 'c-acme' }),
+    });
+    const recycled = getBotPoolEntryByUsername('recycle_bot');
+    expect(recycled?.status).toBe('available');
+    expect(recycled?.webhook_registered_at).toBeTruthy(); // preserved
+
+    // Founder B pairs Bolt Co — gets the SAME (recycled) bot row.
+    const r2 = await postBind(server.baseUrl, {
+      ...VALID_BIND_BODY,
+      userId: 'u-bolt',
+      companyId: 'c-bolt',
+      companyName: 'Bolt',
+      telegramUserId: 999000111, // different chat
+    });
+    expect(r2.status).toBe(200);
+    expect(r2.json.botUsername).toBe('recycle_bot'); // same bot
+
+    // Critical: setMyName fires AGAIN for the new company. The
+    // `webhook_registered_at`-based gate would have suppressed this.
+    // The fix gates on "freshly assigned" instead, which is true
+    // here (bot was released, then this bind picked it up).
+    expect(setMyNameCalls).toEqual([{ name: 'Acme Team' }, { name: 'Bolt Team' }]);
   });
 });
 
