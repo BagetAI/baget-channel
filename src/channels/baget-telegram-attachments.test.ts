@@ -193,6 +193,47 @@ describe('downloadTelegramAttachment', () => {
       }),
     ).rejects.toThrow('Telegram getFile failed: 500');
   });
+
+  it('rejects oversized download via Content-Length header BEFORE buffering body (OOM defense)', async () => {
+    // Hostile/buggy upstream: getFile.file_size says 1 MB but the
+    // download response declares 100 MB via Content-Length. Without
+    // the pre-buffer Content-Length gate, we'd slurp 100 MB into RAM
+    // before the post-buffer check could refuse — an OOM vector.
+    // Verify the gate triggers BEFORE arrayBuffer() is called by
+    // making the download body throw if read.
+    let arrayBufferCalled = false;
+    const fakeBigDownload = new Response(new Uint8Array(0), {
+      status: 200,
+      headers: { 'Content-Length': String(100 * 1024 * 1024) },
+    });
+    Object.defineProperty(fakeBigDownload, 'arrayBuffer', {
+      value: async () => {
+        arrayBufferCalled = true;
+        throw new Error('arrayBuffer should NOT be called when Content-Length says oversized');
+      },
+    });
+
+    const fetchImpl = async (url: string | URL | Request) => {
+      const u = String(url);
+      if (u.includes('getFile')) {
+        return new Response(JSON.stringify({ ok: true, result: { file_path: 'big.bin', file_size: 1024 } }), {
+          status: 200,
+        });
+      }
+      return fakeBigDownload;
+    };
+
+    await expect(
+      downloadTelegramAttachment({
+        botToken: 'tok',
+        fileId: 'oom-attempt',
+        destDir: tmpDir,
+        fetchImpl: fetchImpl as typeof fetch,
+        apiBaseUrl: 'http://tg.test',
+      }),
+    ).rejects.toThrow(OversizedAttachmentError);
+    expect(arrayBufferCalled).toBe(false);
+  });
 });
 
 // ---------- Integration tests: processUpdate with attachments ----------

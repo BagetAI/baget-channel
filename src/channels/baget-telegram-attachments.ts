@@ -167,6 +167,22 @@ export async function downloadTelegramAttachment(
     throw new Error(`Telegram file download failed: ${downloadResp.status}`);
   }
 
+  // Belt-and-suspenders pre-flight: even if getFile.file_size said the
+  // file was small, a buggy or hostile upstream could deliver a 500 MB
+  // body. Read Content-Length BEFORE buffering the body and reject fast
+  // — otherwise `await arrayBuffer()` slurps the whole thing into RAM
+  // before we get a chance to refuse, which is an OOM vector for the
+  // worker. (Telegram's CDN sets Content-Length reliably; if it's
+  // missing we fall through to the post-buffer check below as a last
+  // line of defense.)
+  const contentLengthHeader = downloadResp.headers.get('content-length');
+  if (contentLengthHeader) {
+    const contentLength = Number(contentLengthHeader);
+    if (Number.isFinite(contentLength) && contentLength > TELEGRAM_MAX_FILE_BYTES) {
+      throw new OversizedAttachmentError(fileId, contentLength);
+    }
+  }
+
   const buffer = Buffer.from(await downloadResp.arrayBuffer());
 
   if (buffer.length > TELEGRAM_MAX_FILE_BYTES) {
