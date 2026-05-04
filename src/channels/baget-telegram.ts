@@ -838,8 +838,7 @@ function buildAdapter(cfg: BagetTelegramConfig): ChannelAdapter {
     const mg = getMessagingGroupByPlatform(BAGET_TELEGRAM_CHANNEL_TYPE, platformId);
     const wired = mg ? getMessagingGroupAgents(mg.id) : [];
     const agentGroupId = wired.length === 1 ? (wired[0]?.agent_group_id ?? null) : null;
-    const botToken =
-      (agentGroupId && getBotPoolEntryByAgentGroup(agentGroupId)?.bot_token_value) || cfg.botToken;
+    const botToken = (agentGroupId && getBotPoolEntryByAgentGroup(agentGroupId)?.bot_token_value) || cfg.botToken;
     const url = `${apiBase}/bot${botToken}/sendChatAction`;
     try {
       await fetchFn(url, {
@@ -884,8 +883,7 @@ function buildAdapter(cfg: BagetTelegramConfig): ChannelAdapter {
         (req, res) => handleGlobalWebhook(req, res),
       );
       unregisterPerBotRoute = registerExtraRoute(
-        (method, url) =>
-          method === 'POST' && /^\/api\/channels\/telegram\/bot\/[^/]+\/webhook$/.test(url),
+        (method, url) => method === 'POST' && /^\/api\/channels\/telegram\/bot\/[^/]+\/webhook$/.test(url),
         (req, res) => handlePerBotWebhook(req, res),
       );
       log.info('Baget telegram webhooks registered on shared admin listener', {

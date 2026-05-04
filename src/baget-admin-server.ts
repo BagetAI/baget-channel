@@ -76,12 +76,7 @@ import { wipeSessionDataForAgentGroup } from './session-manager.js';
 import { deleteChannelToken, upsertChannelToken } from './db/baget-channel-tokens.js';
 import { getDb } from './db/connection.js';
 import { insertPairingToken, sweepExpiredPairingTokens } from './db/baget-pairing-tokens.js';
-import {
-  ALL_ROLES,
-  OPTIONAL_ROLES,
-  provisionBagetGroup,
-  type BagetTeamMembers,
-} from './baget-pairing.js';
+import { ALL_ROLES, OPTIONAL_ROLES, provisionBagetGroup, type BagetTeamMembers } from './baget-pairing.js';
 import {
   bindBagetTelegramChat,
   buildPerBotWebhookUrl,
@@ -663,11 +658,7 @@ export function createBagetAdminServer(config: BagetAdminServerConfig): BagetAdm
   function validateCelebrateBody(b: unknown): b is CelebrateBody {
     if (!b || typeof b !== 'object') return false;
     const o = b as Record<string, unknown>;
-    return (
-      o.kind === 'batch-complete' &&
-      typeof o.batchNumber === 'number' &&
-      typeof o.summary === 'string'
-    );
+    return o.kind === 'batch-complete' && typeof o.batchNumber === 'number' && typeof o.summary === 'string';
   }
 
   /**
@@ -945,25 +936,15 @@ export function createBagetAdminServer(config: BagetAdminServerConfig): BagetAdm
    *     delivery stays 1:1 and persona-safe.
    */
   async function handleBindTelegram(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
-    // Multi-bot pool mode (gated on `publicBaseUrl`) is opt-in: the
-    // bind handler tries to assign a per-company bot from the pool
-    // first, falling back to the global `telegramBotToken` when (a)
-    // no pool is seeded, or (b) `publicBaseUrl` is unset on this
-    // deployment. The 503 below fires only when BOTH would-be
-    // sources are absent — neither global token nor pool depth.
-    // Existing single-bot deployments (no pool seeded, global token
-    // set) keep working unchanged.
-    if (!config.telegramBotToken && countAvailableBots() === 0) {
-      log.error('bind-telegram called but neither telegramBotToken nor an available pool bot is configured');
-      sendJson(res, 503, {
-        ok: false,
-        error: 'bot_token_unconfigured',
-        message:
-          'Direct-bind needs telegramBotToken on the admin server config OR seeded pool bots. Set TELEGRAM_BOT_TOKEN in env and restart, or POST /baget/bot-pool/seed.',
-      });
-      return;
-    }
-
+    // Multi-bot pool mode is opt-in: the bind handler tries to
+    // assign a per-company bot from the pool first, falling back
+    // to the global `telegramBotToken` when no pool is seeded or
+    // `publicBaseUrl` is unset. The 503 exhaustion check happens
+    // AFTER provisioning, inside `resolvePoolAssignment`, because
+    // re-binds for an already-assigned agent_group must succeed
+    // even when the pool has zero spare bots (the existing row is
+    // returned idempotently). Existing single-bot deployments (no
+    // pool seeded, global token set) keep working unchanged.
     const body = await readJson<BindTelegramBody>(req);
     if (!body.ok) {
       sendJson(res, 400, { ok: false, error: 'invalid_body', message: body.error });
@@ -1112,8 +1093,7 @@ export function createBagetAdminServer(config: BagetAdminServerConfig): BagetAdm
       sendJson(res, 503, {
         ok: false,
         error: 'pool_exhausted',
-        message:
-          'Bot pool is empty — operator must seed more bots via POST /baget/bot-pool/seed.',
+        message: 'Bot pool is empty — operator must seed more bots via POST /baget/bot-pool/seed.',
       });
       return;
     }
