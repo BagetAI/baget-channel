@@ -45,7 +45,14 @@ import { getBagetAgentGroupById, normalizeBoundBagetTelegramFounderChannels } fr
 import { getMessagingGroupAgents, getMessagingGroupByPlatform } from '../db/messaging-groups.js';
 import { log } from '../log.js';
 import { OPTIONAL_ROLES, type BagetTeamMembers } from '../baget-pairing.js';
-import type { ChannelAdapter, ChannelSetup, InboundAttachment, OutboundAttachment, OutboundMessage, CelebrationPayload } from './adapter.js';
+import type {
+  ChannelAdapter,
+  ChannelSetup,
+  InboundAttachment,
+  OutboundAttachment,
+  OutboundMessage,
+  CelebrationPayload,
+} from './adapter.js';
 import { registerChannelAdapter } from './channel-registry.js';
 import {
   BAGET_TELEGRAM_CHANNEL_TYPE,
@@ -305,7 +312,7 @@ function buildAdapter(cfg: BagetTelegramConfig): ChannelAdapter {
         if (err instanceof OversizedAttachmentError) {
           await sendBotMessage(
             msg.chat.id,
-            "That file is too big for me to receive (20 MB limit). Try splitting it or sharing a link.",
+            'That file is too big for me to receive (20 MB limit). Try splitting it or sharing a link.',
           );
           return;
         }

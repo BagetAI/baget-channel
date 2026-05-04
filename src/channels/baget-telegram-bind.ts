@@ -290,7 +290,6 @@ export async function sendBagetTelegramFarewell(args: {
   });
 }
 
-
 /**
  * Send a photo file via Telegram Bot API `sendPhoto` (multipart/form-data).
  * Reads the file from disk synchronously at call time. Best-effort delivery —
