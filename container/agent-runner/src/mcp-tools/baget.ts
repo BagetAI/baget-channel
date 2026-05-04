@@ -17,10 +17,11 @@
  *
  * Tool surface:
  *
- *   READ (4 today; full set lands once the corresponding GET routes
- *   ship on baget.ai — see the spawned follow-up):
+ *   READ (6):
  *     - baget_get_company_overview
  *     - baget_query_metrics
+ *     - baget_get_credits
+ *     - baget_list_recent_activity
  *     - baget_list_documents
  *     - baget_read_document
  *
@@ -318,6 +319,54 @@ const queryMetrics: McpToolDefinition = {
     });
     if (!result.ok) return fail(`query_metrics failed: ${result.error}`);
     return ok(JSON.stringify(result.data, null, 2));
+  },
+};
+
+const getCredits: McpToolDefinition = {
+  tool: {
+    name: 'baget_get_credits',
+    description:
+      "Read the founder's current credit balance — total + breakdown across daily, treasury, and purchased pools. Use this BEFORE answering ANY question about credits, balance, budget, spending capacity, or affordability — \"how much do I have?\", \"can I afford to launch the batch?\", \"am I running low?\", \"what's my balance?\". Also call it BEFORE proposing an action that costs credits, so you can warn the founder if they'd run dry. NEVER hallucinate the number; this tool is the only source of truth that matches what the dashboard shows.",
+    inputSchema: { type: 'object', properties: {}, additionalProperties: false },
+  },
+  async handler() {
+    const ctx = requireCompanyId();
+    if (!ctx.ok) return fail(ctx.error);
+    const result = await bagetFetch({
+      method: 'GET',
+      path: `/api/companies/${ctx.companyId}/credits`,
+    });
+    if (!result.ok) return fail(`get_credits failed: ${result.error}`);
+    return ok(JSON.stringify(result.data, null, 2));
+  },
+};
+
+const listRecentActivity: McpToolDefinition = {
+  tool: {
+    name: 'baget_list_recent_activity',
+    description:
+      "Read the founder's recent activity feed — the same rows the dashboard's activity timeline shows. Use this BEFORE answering questions about what the team has been doing — \"what did the team ship today?\", \"what happened yesterday?\", \"what has Louis been working on?\", \"any progress?\", \"what's new?\". Returns the most recent 25 founder-visible items (debug rows already filtered out, messages already sanitized for founder eyes). NEVER make up activity. If the feed is empty, say so honestly — empty is information.",
+    inputSchema: { type: 'object', properties: {}, additionalProperties: false },
+  },
+  async handler() {
+    const ctx = requireCompanyId();
+    if (!ctx.ok) return fail(ctx.error);
+    const result = await bagetFetch<{ activity?: unknown }>({
+      method: 'GET',
+      path: `/api/companies/${ctx.companyId}/recent-activity`,
+    });
+    if (!result.ok) return fail(`list_recent_activity failed: ${result.error}`);
+    // Unwrap the `{ activity: [...] }` envelope so the model gets just
+    // the array. Mirrors `baget_read_document`'s `{ document }` unwrap
+    // pattern. Saves tokens in the agent's context window — the
+    // envelope key is metadata the agent doesn't need. Falls back to
+    // the raw payload if the upstream shape ever changes (better to
+    // surface unfamiliar JSON than to hide it under a defensive null).
+    const inner =
+      result.data && typeof result.data === 'object' && 'activity' in result.data
+        ? (result.data as { activity: unknown }).activity
+        : result.data;
+    return ok(JSON.stringify(inner, null, 2));
   },
 };
 
@@ -1045,6 +1094,8 @@ registerTools([
   // Read
   getCompanyOverview,
   queryMetrics,
+  getCredits,
+  listRecentActivity,
   listDocuments,
   readDocument,
   // File transfer
@@ -1069,4 +1120,4 @@ registerTools([
   sendCampaign,
 ]);
 
-log('baget MCP tools registered: 4 read + 1 file-transfer + 12 direct write + 4 approval-gated = 21 total');
+log('baget MCP tools registered: 6 read + 1 file-transfer + 12 direct write + 4 approval-gated = 23 total');
