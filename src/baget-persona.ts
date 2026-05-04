@@ -127,6 +127,19 @@ export function parseRoleTag(message: string): ParsedRoleTag {
 }
 
 /**
+ * Tags the model might emit that don't have a persona of their own,
+ * but should be silently re-prefixed as CoS rather than passed through
+ * to the founder as raw `tag: body` text.
+ *
+ * `intern` is here because the prompt (post-PR adding intern to the
+ * roster) tells the model the intern doesn't reply directly — but a
+ * model can still misfire and emit `intern: hi`. Surfacing that raw
+ * to the founder as `intern: hi` would be ugly; folding it into CoS
+ * matches the prompt's "CoS speaks for the intern" instruction.
+ */
+const SILENT_TAGS = new Set<string>(['intern']);
+
+/**
  * Render a model output as `<emoji> <Member>: <body>`.
  *
  * - On a recognized tag whose role is on the founder's team: prefix
@@ -138,6 +151,9 @@ export function parseRoleTag(message: string): ParsedRoleTag {
  *   been stripped of off-team roles, but we belt-and-braces here too
  *   so a stale prompt or a rogue model output can't surface a ghost
  *   name like "Clara" to the founder.
+ * - On a "silent" tag (e.g. `intern:` — listed on the roster but
+ *   doesn't have a persona): drop the tag and re-prefix as CoS,
+ *   matching the prompt's "CoS speaks for them" rule.
  * - On no tag detected: fall through to the CoS persona — matches the
  *   prompt's "Default greetings use cos:" rule.
  * - On a junk tag (looked tag-shaped but isn't one we know): pass
@@ -165,7 +181,26 @@ export function applyPersonaPrefix(message: string, team: BagetTeamMembers): str
   }
 
   if (parsed.rawTag !== null) {
-    // Unknown tag — pass through untouched (see jsdoc).
+    // Tag-shaped but not in KNOWN_ROLES. Two sub-cases:
+    if (SILENT_TAGS.has(parsed.rawTag)) {
+      // Roster-only role (e.g. intern) — re-prefix as CoS.
+      // parseRoleTag preserves the ORIGINAL message (incl. any leading
+      // whitespace like `\nintern: hi`) in `body` for unknown tags, so
+      // we have to trim leading whitespace BEFORE the anchored regex,
+      // otherwise the strip silently no-ops and the founder sees the
+      // raw `intern:` tag re-prefixed under CoS. (Caught by Gemini +
+      // Codex on PR #9.)
+      const cos = team.cos;
+      const body = parsed.body
+        .replace(/^[\s]+/, '')
+        .replace(new RegExp(`^${parsed.rawTag}:[ \\t]?\\n?`), '')
+        .replace(/^[\s]+/, '');
+      if (typeof cos === 'string' && cos.trim().length > 0) {
+        return `${ROLE_EMOJI.cos} ${cos}: ${body}`;
+      }
+      return body;
+    }
+    // Truly unknown tag — pass through untouched so QA notices.
     return message;
   }
 

@@ -179,3 +179,54 @@ describe('applyPersonaPrefix — CoS fallback for off-team roles', () => {
     expect(applyPersonaPrefix('ops: vendor', ARTISAN)).toBe('🧭 Raphaël: vendor');
   });
 });
+
+describe('applyPersonaPrefix — intern is a silent tag (re-prefix as CoS)', () => {
+  // Intern is on the roster (so the LLM knows the founder's intern
+  // exists) but doesn't have a persona tag. If the model misfires and
+  // emits `intern: blah`, we fold into CoS rather than surface raw.
+  const APPRENTI: BagetTeamMembers = { cos: 'Raphaël', intern: 'Antoine' };
+
+  it('re-prefixes intern: as CoS (apprenti shape)', () => {
+    expect(applyPersonaPrefix('intern: just watching', APPRENTI)).toBe('🧭 Raphaël: just watching');
+  });
+
+  it('re-prefixes intern: when intern is absent too', () => {
+    // Cos-only team (e.g. atelier without intern slot) — the silent-tag
+    // rule fires regardless of whether the intern is on the team. The
+    // tag itself never has a persona, so model output `intern: x` always
+    // becomes CoS output.
+    const COS_ONLY: BagetTeamMembers = { cos: 'Raphaël' };
+    expect(applyPersonaPrefix('intern: hi', COS_ONLY)).toBe('🧭 Raphaël: hi');
+  });
+
+  it('handles intern: with no space before the body', () => {
+    expect(applyPersonaPrefix('intern:noted', APPRENTI)).toBe('🧭 Raphaël: noted');
+  });
+
+  it('falls through to body alone when both intern AND cos are missing', () => {
+    // Defensive — should never happen because cos is required.
+    const broken = { cos: '' } as BagetTeamMembers;
+    expect(applyPersonaPrefix('intern: hi', broken)).toBe('hi');
+  });
+
+  it('preserves multi-line body on intern fallback', () => {
+    expect(applyPersonaPrefix('intern: line1\nline2', APPRENTI)).toBe('🧭 Raphaël: line1\nline2');
+  });
+
+  it('still passes through truly unknown tags (captain:) untouched', () => {
+    // Intern is a SPECIFIC silent tag — other unknown tags still
+    // surface raw so QA notices.
+    expect(applyPersonaPrefix('captain: ahoy', APPRENTI)).toBe('captain: ahoy');
+  });
+
+  it('strips leading whitespace before silent-tag fallback (regression)', () => {
+    // parseRoleTag preserves the ORIGINAL message (with any leading
+    // newlines/spaces) in `body` for unknown tags. Without trimming
+    // leading whitespace before the strip-the-tag regex, the strip
+    // silently no-ops and the founder sees `\nintern: hi` re-prefixed
+    // under CoS as `🧭 Raphaël: \nintern: hi` — leaking the raw tag.
+    expect(applyPersonaPrefix('\nintern: hello', APPRENTI)).toBe('🧭 Raphaël: hello');
+    expect(applyPersonaPrefix('  intern: hello', APPRENTI)).toBe('🧭 Raphaël: hello');
+    expect(applyPersonaPrefix('\n\n\tintern: hello', APPRENTI)).toBe('🧭 Raphaël: hello');
+  });
+});

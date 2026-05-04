@@ -391,9 +391,11 @@ describe('performDisconnectCleanup', () => {
 
   function getArchivedAt(agentGroupId: string): string | null {
     return (
-      (getDb().prepare('SELECT archived_at FROM agent_groups WHERE id = ?').get(agentGroupId) as {
-        archived_at: string | null;
-      }).archived_at ?? null
+      (
+        getDb().prepare('SELECT archived_at FROM agent_groups WHERE id = ?').get(agentGroupId) as {
+          archived_at: string | null;
+        }
+      ).archived_at ?? null
     );
   }
 
