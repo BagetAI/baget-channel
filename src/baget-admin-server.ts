@@ -60,23 +60,30 @@ import {
   unbindMessagingGroupsForAgent,
   updateBagetTeamMembers,
 } from './db/baget-agent-groups.js';
-import { countAvailableBots, seedBotPoolEntry, type SeedOutcome } from './db/baget-bot-pool.js';
+import {
+  assignNextAvailableBot,
+  countAvailableBots,
+  getBotPoolEntryByAgentGroup,
+  markWebhookRegistered,
+  releaseBot,
+  seedBotPoolEntry,
+  type BotPoolRow,
+  type SeedOutcome,
+} from './db/baget-bot-pool.js';
 import { persistChannelTokenToOneCLI } from './baget-channel-secret.js';
 import { killActiveSessionsForAgent } from './container-runner.js';
 import { wipeSessionDataForAgentGroup } from './session-manager.js';
 import { deleteChannelToken, upsertChannelToken } from './db/baget-channel-tokens.js';
 import { getDb } from './db/connection.js';
 import { insertPairingToken, sweepExpiredPairingTokens } from './db/baget-pairing-tokens.js';
-import {
-  ALL_ROLES,
-  OPTIONAL_ROLES,
-  provisionBagetGroup,
-  type BagetTeamMembers,
-} from './baget-pairing.js';
+import { ALL_ROLES, OPTIONAL_ROLES, provisionBagetGroup, type BagetTeamMembers } from './baget-pairing.js';
 import {
   bindBagetTelegramChat,
+  buildPerBotWebhookUrl,
+  registerTelegramWebhook,
   sendBagetTelegramFarewell,
   sendBagetTelegramWelcome,
+  setBotDisplayName,
 } from './channels/baget-telegram-bind.js';
 import { log } from './log.js';
 import { getMessagingGroupsByAgentGroup } from './db/messaging-groups.js';
@@ -262,8 +269,16 @@ export interface BindTelegramResponse {
   /** When true, baget.ai should prompt the founder to open the bot chat. */
   founderActionRequired: boolean;
   /** Canonical bot-chat URL baget.ai can surface when the founder still
-   *  needs to open or re-open the shared bot. */
+   *  needs to open or re-open the bot. Built against the founder's
+   *  per-company assigned pool bot when one is assigned; falls back
+   *  to the global `cfg.telegramBotUsername` for legacy / pool-not-
+   *  configured deployments. */
   telegramOpenUrl: string;
+  /** Per-company bot username when this agent_group has a pool
+   *  assignment. Absent on legacy / fallback paths so the dashboard
+   *  can branch on its presence to render the per-company link.
+   *  Always equals the username segment in `telegramOpenUrl`. */
+  botUsername?: string;
 }
 
 // ── Server ──
@@ -291,6 +306,21 @@ export interface BagetAdminServerConfig {
    * inject this; production uses the global `fetch`.
    */
   telegramFetchImpl?: typeof fetch;
+  /**
+   * Public origin for this Railway service (e.g.
+   * `https://nanoclaw.baget.ai`). Used to build the per-bot
+   * Telegram webhook URL handed to `setWebhook` at bind time:
+   * `<publicBaseUrl>/api/channels/telegram/bot/<username>/webhook`.
+   *
+   * Optional: when unset, the bind handler skips the per-bot
+   * setWebhook call (legacy global-bot path), which keeps existing
+   * single-bot deployments working unchanged. Setting this env opts
+   * the deployment into multi-bot pool mode.
+   *
+   * Env-var resolution priority is owned by the caller in `index.ts`:
+   * `BAGET_PUBLIC_BASE_URL` → `https://${RAILWAY_PUBLIC_DOMAIN}` → unset.
+   */
+  publicBaseUrl?: string;
   /**
    * Function the route handlers use to ULID/UUID a new agent group.
    * Wired as a parameter so tests can inject a deterministic generator.
@@ -435,12 +465,29 @@ export type BagetAdminServer = {
 export function performDisconnectCleanup(
   agentGroupId: string,
   args: { wasAlreadyArchived: boolean; nowIso: string; reason: string },
-): { tokenDeleted: number; unbound: number; denied: number; killedRunners: number } {
+): {
+  tokenDeleted: number;
+  unbound: number;
+  denied: number;
+  killedRunners: number;
+  releasedBotUsername: string | null;
+} {
   const result = getDb().transaction(() => {
     const tokenDeleted = deleteChannelToken(agentGroupId);
     if (!args.wasAlreadyArchived) archiveBagetAgentGroup(agentGroupId, args.nowIso);
     const { unbound, denied } = unbindMessagingGroupsForAgent(agentGroupId, args.nowIso);
-    return { tokenDeleted, unbound, denied };
+    // Release the assigned pool bot (if any) inside the same
+    // transaction as the archive + unbind so we never leave a row
+    // half-released. `releaseBot` is a no-op for legacy / global-
+    // bot pairings (returns null when no pool assignment exists),
+    // so this is safe to call unconditionally.
+    //
+    // Webhook stays registered — the URL contains the bot's
+    // (immutable) username, so the next founder assigned to the
+    // same row reuses the existing registration without a fresh
+    // setWebhook round-trip. See `releaseBot` jsdoc.
+    const releasedBotUsername = releaseBot(agentGroupId);
+    return { tokenDeleted, unbound, denied, releasedBotUsername };
   })();
   const killedRunners = killActiveSessionsForAgent(agentGroupId, args.reason);
   return { ...result, killedRunners };
@@ -654,11 +701,7 @@ export function createBagetAdminServer(config: BagetAdminServerConfig): BagetAdm
   function validateCelebrateBody(b: unknown): b is CelebrateBody {
     if (!b || typeof b !== 'object') return false;
     const o = b as Record<string, unknown>;
-    return (
-      o.kind === 'batch-complete' &&
-      typeof o.batchNumber === 'number' &&
-      typeof o.summary === 'string'
-    );
+    return o.kind === 'batch-complete' && typeof o.batchNumber === 'number' && typeof o.summary === 'string';
   }
 
   /**
@@ -936,17 +979,15 @@ export function createBagetAdminServer(config: BagetAdminServerConfig): BagetAdm
    *     delivery stays 1:1 and persona-safe.
    */
   async function handleBindTelegram(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
-    if (!config.telegramBotToken) {
-      log.error('bind-telegram called but telegramBotToken not configured on admin server');
-      sendJson(res, 503, {
-        ok: false,
-        error: 'bot_token_unconfigured',
-        message:
-          'Direct-bind needs telegramBotToken on the admin server config. Set TELEGRAM_BOT_TOKEN in env and restart.',
-      });
-      return;
-    }
-
+    // Multi-bot pool mode is opt-in: the bind handler tries to
+    // assign a per-company bot from the pool first, falling back
+    // to the global `telegramBotToken` when no pool is seeded or
+    // `publicBaseUrl` is unset. The 503 exhaustion check happens
+    // AFTER provisioning, inside `resolvePoolAssignment`, because
+    // re-binds for an already-assigned agent_group must succeed
+    // even when the pool has zero spare bots (the existing row is
+    // returned idempotently). Existing single-bot deployments (no
+    // pool seeded, global token set) keep working unchanged.
     const body = await readJson<BindTelegramBody>(req);
     if (!body.ok) {
       sendJson(res, 400, { ok: false, error: 'invalid_body', message: body.error });
@@ -1038,7 +1079,53 @@ export function createBagetAdminServer(config: BagetAdminServerConfig): BagetAdm
       }
     }
 
-    // 2b. Persist baget.ai's per-(user, company) bearer token before
+    // Capture pre-bind chat-binding count: the legacy-preservation
+    // signal must distinguish "Vela has been paired against the
+    // global bot before, with chat-binds in the DB" from "fresh
+    // founder OR retried-fresh after a partial failure" (where the
+    // agent_group exists but no chat-bind ever landed). The
+    // `countMessagingGroupBindings` reading is taken BEFORE
+    // `bindBagetTelegramChat` below adds this call's binding, so
+    // a value > 0 means a PRIOR successful bind exists. Codex P2
+    // catch — the previous "wasFreshAgentGroup" signal misclassified
+    // partial-failure retries as legacy and starved them of pool
+    // bots forever.
+    const preBindChatCount = countMessagingGroupBindings(agentGroupId);
+
+    // 2b. Resolve pool assignment FIRST — before any state-mutating
+    //     side-effect writes (channel-token persist, chat-bind). If
+    //     the pool is exhausted and no global fallback is configured,
+    //     we return 503 immediately and the founder's chat-bind /
+    //     channel-token state stays untouched. Codex P1 (re-review):
+    //     under the previous order, a `pool_exhausted` 503 came
+    //     AFTER `bindBagetTelegramChat` had already rewired the
+    //     founder's messaging_group, leaving by-tuple in a
+    //     "paired:true but bind-failed" state.
+    //
+    //     Precedence: pool > global. If publicBaseUrl is unset we
+    //     refuse fresh pool assignment (no setWebhook URL → one-way
+    //     broken chat); resolvePoolAssignment handles that case by
+    //     falling back to global or returning pool_exhausted.
+    const poolResult = resolvePoolAssignment(agentGroupId, preBindChatCount > 0);
+    if (poolResult === 'pool_exhausted') {
+      log.error('Baget bind-telegram: pool exhausted and no global token configured', {
+        userId,
+        companyId,
+        agentGroupId,
+      });
+      sendJson(res, 503, {
+        ok: false,
+        error: 'pool_exhausted',
+        message: 'Bot pool is empty — operator must seed more bots via POST /baget/bot-pool/seed.',
+      });
+      return;
+    }
+    // Unpack: { row, wasFreshlyAssigned } when we have a pool entry,
+    // null on the legacy global-bot path.
+    const poolEntry = poolResult ? poolResult.row : null;
+    const poolEntryFreshlyAssigned = poolResult ? poolResult.wasFreshlyAssigned : false;
+
+    // 2c. Persist baget.ai's per-(user, company) bearer token before
     //     we wire the Telegram chat. Order matters: if the token
     //     persist fails, we don't want a "bound chat" without the
     //     token to back its calls — the founder would DM the bot,
@@ -1047,6 +1134,8 @@ export function createBagetAdminServer(config: BagetAdminServerConfig): BagetAdm
       // The helper already wrote the 500. The agent_groups row above
       // is committed; a retry will hit the existing row + UPSERT the
       // token (idempotent via INSERT … ON CONFLICT … DO UPDATE).
+      // Pool assignment from step 2b is also idempotent across
+      // retries (`getBotPoolEntryByAgentGroup` returns it).
       return;
     }
 
@@ -1073,13 +1162,109 @@ export function createBagetAdminServer(config: BagetAdminServerConfig): BagetAdm
       return;
     }
 
+    // Resolve the (botToken, botUsername) pair to use for ALL
+    // outbound calls below — welcome message, setWebhook, setMyName.
+    // `poolEntry === null` means we're on the legacy global-bot
+    // path: use cfg.telegramBotToken + cfg.telegramBotUsername. Pool
+    // path uses the per-company assigned values.
+    const resolvedBotToken = poolEntry ? poolEntry.bot_token_value : config.telegramBotToken!;
+    const resolvedBotUsername = poolEntry ? poolEntry.bot_username : config.telegramBotUsername;
+
+    // Register the Telegram webhook for this bot — only on the FIRST
+    // bind for a given pool row (subsequent re-binds skip per the
+    // `webhook_registered_at` gate). Best-effort: a Telegram outage
+    // doesn't fail the bind because the founder can still type, the
+    // chat is wired, and the webhook can be re-attempted on the next
+    // bind. The setMyName call is also best-effort — Telegram rate-
+    // limits to 1 change per minute per bot, so a re-bind in the
+    // same minute returns 429 (logged as warn, not propagated).
+    //
+    // Skipped entirely on the global-bot fallback path (`!poolEntry`)
+    // — that bot's webhook was set once via the curl in
+    // BAGET-DEPLOY.md and isn't per-company. Also skipped when
+    // `publicBaseUrl` is unset (pool seeded but operator hasn't
+    // opted into multi-bot mode yet — covered in tests).
+    if (poolEntry && config.publicBaseUrl) {
+      if (!poolEntry.webhook_registered_at) {
+        const webhookUrl = buildPerBotWebhookUrl({
+          publicBaseUrl: config.publicBaseUrl,
+          botUsername: poolEntry.bot_username,
+        });
+        const webhook = await registerTelegramWebhook({
+          botToken: poolEntry.bot_token_value,
+          webhookUrl,
+          webhookSecret: poolEntry.webhook_secret,
+          apiBaseUrl: config.telegramApiBaseUrl,
+          fetchImpl: config.telegramFetchImpl,
+        });
+        if (webhook.ok) {
+          markWebhookRegistered(poolEntry.bot_username, new Date(now()).toISOString());
+        } else {
+          // Best-effort: don't fail the bind. Next bind for the
+          // same agent_group will retry (webhook_registered_at
+          // stays NULL).
+          log.warn('Baget bind-telegram: setWebhook failed (will retry on next bind)', {
+            agentGroupId,
+            botUsername: poolEntry.bot_username,
+            reason: webhook.reason,
+            telegramErrorCode: webhook.telegramErrorCode,
+            telegramDescription: webhook.telegramDescription,
+          });
+        }
+      }
+
+      // Set the bot's display name to the company. Best-effort.
+      //
+      // Gate: only fire setMyName when this bind FRESHLY ASSIGNED a
+      // pool bot to this agent_group. Idempotent re-binds for the
+      // same (agent_group, bot) pair skip; recycled bots (released
+      // by a previous founder, freshly assigned to this one) DO
+      // fire setMyName because they're a fresh assignment for the
+      // new founder.
+      //
+      // Why not gate on `webhook_registered_at`: that flag stays
+      // set across release/reassign by design (to avoid burning a
+      // setWebhook round-trip on a recycled bot whose URL contains
+      // the immutable username). Reusing it for setMyName would
+      // leave the previous founder's company name on the bot's
+      // Telegram profile when the bot is recycled — cross-tenant
+      // identity leak in the founder's chat list. Codex P1 catch.
+      //
+      // Telegram has a per-bot daily quota for setMyName + a
+      // per-minute rate limit (returned as 429 → mapped to a
+      // separate `'telegram_rate_limited'` reason callers ignore).
+      // Gating on freshly-assigned keeps quota usage proportional
+      // to actual founder churn, not bind-call frequency.
+      if (poolEntryFreshlyAssigned) {
+        const nameResult = await setBotDisplayName({
+          botToken: poolEntry.bot_token_value,
+          displayName: `${companyName} Team`,
+          apiBaseUrl: config.telegramApiBaseUrl,
+          fetchImpl: config.telegramFetchImpl,
+        });
+        if (!nameResult.ok && nameResult.reason !== 'telegram_rate_limited') {
+          log.warn('Baget bind-telegram: setMyName failed (non-fatal)', {
+            agentGroupId,
+            botUsername: poolEntry.bot_username,
+            reason: nameResult.reason,
+            telegramErrorCode: nameResult.telegramErrorCode,
+            telegramDescription: nameResult.telegramDescription,
+          });
+        }
+      }
+    }
+
     // 4. Welcome the founder. Best-effort — failure here doesn't
     //    invalidate the bind (the rows above are already committed),
     //    but baget.ai needs the delivery result so it can surface an
     //    "open the bot chat" CTA instead of pretending the founder is
     //    already reachable.
+    //
+    //    Uses the resolved per-company token when assigned, otherwise
+    //    the global token. NEVER log either token — `resolvedBotToken`
+    //    is captured by the helper but doesn't escape into log fields.
     const welcome = await sendBagetTelegramWelcome({
-      botToken: config.telegramBotToken,
+      botToken: resolvedBotToken,
       apiBaseUrl: config.telegramApiBaseUrl,
       fetchImpl: config.telegramFetchImpl,
       chatId: telegramUserId,
@@ -1097,6 +1282,10 @@ export function createBagetAdminServer(config: BagetAdminServerConfig): BagetAdm
       created: bind.created,
       welcomeMessageDelivered: welcome.ok,
       founderActionRequired: welcome.ok ? false : welcome.founderActionRequired,
+      // Useful for ops triage: which bot served this founder, and
+      // whether we used the pool path. NEVER log the token.
+      botUsername: resolvedBotUsername,
+      poolAssigned: !!poolEntry,
     });
 
     const response: BindTelegramResponse = {
@@ -1106,9 +1295,95 @@ export function createBagetAdminServer(config: BagetAdminServerConfig): BagetAdm
       messagingGroupCreated: bind.created,
       welcomeMessageDelivered: welcome.ok,
       founderActionRequired: welcome.ok ? false : welcome.founderActionRequired,
-      telegramOpenUrl: `https://t.me/${config.telegramBotUsername}`,
+      telegramOpenUrl: `https://t.me/${resolvedBotUsername}`,
+      // Surface botUsername to the dashboard ONLY on the pool path.
+      // Legacy / global-bot deployments omit this field so the
+      // dashboard can branch on its presence to decide whether to
+      // render a per-company CTA vs the shared deeplink.
+      ...(poolEntry ? { botUsername: poolEntry.bot_username } : {}),
     };
     sendJson(res, 200, response);
+  }
+
+  /**
+   * Resolve the bot pool entry for an agent_group.
+   *
+   *   - Existing pool assignment for this agent_group → returns the row
+   *     with `wasFreshlyAssigned: false` (idempotent re-bind).
+   *   - **Pre-existing chat-binds + no pool entry + global token
+   *     configured** → returns `null` (legacy preservation). Without
+   *     this gate, re-binding a Vela-style global-bot pairing would
+   *     silently re-home it to a fresh pool bot, breaking the
+   *     founder's chat.
+   *
+   *     Legacy detection uses `hadExistingChatBind` (count of
+   *     `messaging_group_agents` rows for this agent_group BEFORE
+   *     this bind's chat-bind landed). That's a stronger signal
+   *     than "the agent_groups row already existed": a partial-
+   *     failure retry has the row but no chat-binds, so it
+   *     correctly gets a pool bot rather than being starved on
+   *     global. Codex P2 catch.
+   *
+   *   - Fresh agent_group (or partial-failure retry) + pool has
+   *     availability → assigns a fresh row, returns
+   *     `wasFreshlyAssigned: true`.
+   *   - Pool empty + global token configured → returns null
+   *     (caller falls back to global).
+   *   - Pool empty + no global token → `'pool_exhausted'` so the
+   *     caller can 503.
+   *
+   * The `wasFreshlyAssigned` flag in the success return is the
+   * caller's signal for "did THIS call just stamp the
+   * `assigned_agent_group_id` FK?" (true), vs reusing an existing
+   * assignment (false). The bind handler uses it to gate
+   * `setMyName` so recycled-bot reassignments DO re-set the
+   * Telegram display name (Codex P1).
+   *
+   * Wraps `getBotPoolEntryByAgentGroup` + `assignNextAvailableBot`
+   * with the precedence logic so the bind handler isn't littered
+   * with branches; future channel adapters reuse the same helper.
+   */
+  function resolvePoolAssignment(
+    agentGroupId: string,
+    hadExistingChatBind: boolean,
+  ): { row: BotPoolRow; wasFreshlyAssigned: boolean } | null | 'pool_exhausted' {
+    const existing = getBotPoolEntryByAgentGroup(agentGroupId);
+    if (existing) return { row: existing, wasFreshlyAssigned: false };
+    // H1 (legacy preservation): an agent_group with EXISTING chat-
+    // binds but NO pool entry, on a deployment with a global token,
+    // is a Vela-style legacy pairing. Don't auto-assign; keep it on
+    // the global bot.
+    if (hadExistingChatBind && config.telegramBotToken) return null;
+    // Codex P1 (re-review of ec1c742): never assign a fresh pool
+    // bot when `publicBaseUrl` is unset. Without a webhook URL we
+    // cannot register the per-bot inbound route, which means the
+    // founder's chat would be one-way broken — outbound works
+    // (we'd return the pool token), but Telegram updates land
+    // nowhere because nothing is bound on the per-bot route. The
+    // bind would *appear* successful while the chat is silently
+    // half-dead. Fall back to the global bot if available, else
+    // surface `pool_exhausted` so the operator sees the
+    // misconfiguration immediately.
+    if (!config.publicBaseUrl) {
+      return config.telegramBotToken ? null : 'pool_exhausted';
+    }
+    // Fresh agent_group (no chat-binds yet) + publicBaseUrl set →
+    // safe to assign a pool bot. Covers both the genuine first-pair
+    // and the partial-failure-retry case.
+    const assigned = assignNextAvailableBot(agentGroupId);
+    // Idempotency note: assignNextAvailableBot's step-0 returns an
+    // existing assignment if it sees one, but we already gated on
+    // `getBotPoolEntryByAgentGroup` above. In the single-process
+    // host this means `assigned` (when non-null) is always the
+    // fresh assignment — the intermediate transaction commits the
+    // FK stamp. Under hypothetical multi-process concurrency the
+    // step-0 path could return an assignment another process just
+    // wrote; that case is rare and benign for setMyName (the other
+    // process either set the name or will).
+    if (assigned) return { row: assigned, wasFreshlyAssigned: true };
+    // Pool empty. If the global token is configured, fall through to
+    // the legacy single-bot path; else exhaustion is fatal.
+    return config.telegramBotToken ? null : 'pool_exhausted';
   }
 
   async function handleRefresh(req: http.IncomingMessage, res: http.ServerResponse, groupId: string): Promise<void> {
@@ -1188,17 +1463,19 @@ export function createBagetAdminServer(config: BagetAdminServerConfig): BagetAdm
     // microseconds before the transaction landed.
     const nowIso = new Date(now()).toISOString();
     const wasAlreadyArchived = Boolean(existing.archived_at);
-    // Capture the bound Telegram chat id BEFORE running the cleanup
-    // — performDisconnectCleanup drops the messaging_group_agents
-    // row that firstBoundChatId joins through, so reading it after
-    // would always return null.
+    // Capture the bound Telegram chat id AND the assigned-bot pool
+    // entry BEFORE running the cleanup — performDisconnectCleanup
+    // drops the messaging_group_agents row that firstBoundChatId
+    // joins through AND clears the agent_group's pool assignment,
+    // so reading either afterwards would always return null/undefined.
     const farewellChatId = firstBoundChatId(groupId);
+    const farewellPoolEntry = getBotPoolEntryByAgentGroup(groupId);
     const result = performDisconnectCleanup(groupId, {
       wasAlreadyArchived,
       nowIso,
       reason: 'founder disconnected via admin DELETE',
     });
-    const farewellDelivered = await maybeSendFarewell(farewellChatId, groupId);
+    const farewellDelivered = await maybeSendFarewell(farewellChatId, groupId, farewellPoolEntry);
     sendJson(res, 200, {
       ok: true,
       agentGroupId: groupId,
@@ -1208,6 +1485,10 @@ export function createBagetAdminServer(config: BagetAdminServerConfig): BagetAdm
       killedRunners: result.killedRunners,
       channelTokenDeleted: result.tokenDeleted > 0,
       farewellDelivered,
+      // `releasedBot` is the username of a pool bot that just got
+      // returned to `'available'`. Null on legacy / global-bot
+      // pairings — those have no pool assignment to release.
+      releasedBot: result.releasedBotUsername,
     });
   }
 
@@ -1259,11 +1540,17 @@ export function createBagetAdminServer(config: BagetAdminServerConfig): BagetAdm
       return;
     }
     const platformChatId = firstBoundChatId(existing.id);
+    // Surface botUsername when this agent_group has a per-company
+    // pool assignment so the dashboard can render the per-company
+    // deeplink without a separate roundtrip. Absent on legacy /
+    // global-bot pairings.
+    const poolEntry = getBotPoolEntryByAgentGroup(existing.id);
     sendJson(res, 200, {
       ok: true,
       paired: true,
       agentGroupId: existing.id,
       ...(platformChatId ? { platformChatId } : {}),
+      ...(poolEntry ? { botUsername: poolEntry.bot_username } : {}),
     });
   }
 
@@ -1470,16 +1757,17 @@ export function createBagetAdminServer(config: BagetAdminServerConfig): BagetAdm
     // permissions).
     const nowIso = new Date(now()).toISOString();
     const wasAlreadyArchived = Boolean(existing.archived_at);
-    // Capture the bound Telegram chat id BEFORE the cleanup tears
-    // down messaging_group_agents — see the matching comment in
-    // handleDelete.
+    // Capture the bound Telegram chat id AND assigned-bot pool entry
+    // BEFORE the cleanup tears them down — see the matching comment
+    // in handleDelete.
     const farewellChatId = firstBoundChatId(existing.id);
+    const farewellPoolEntry = getBotPoolEntryByAgentGroup(existing.id);
     const result = performDisconnectCleanup(existing.id, {
       wasAlreadyArchived,
       nowIso,
       reason: 'founder disconnected via tuple DELETE',
     });
-    const farewellDelivered = await maybeSendFarewell(farewellChatId, existing.id);
+    const farewellDelivered = await maybeSendFarewell(farewellChatId, existing.id, farewellPoolEntry);
     sendJson(res, 200, {
       ok: true,
       agentGroupId: existing.id,
@@ -1495,6 +1783,7 @@ export function createBagetAdminServer(config: BagetAdminServerConfig): BagetAdm
       killedRunners: result.killedRunners,
       channelTokenDeleted: result.tokenDeleted > 0,
       farewellDelivered,
+      releasedBot: result.releasedBotUsername,
     });
   }
 
@@ -1515,11 +1804,29 @@ export function createBagetAdminServer(config: BagetAdminServerConfig): BagetAdm
    *     cosmetic — never roll back, never throw.
    *   - Returns `true` only when Telegram acknowledges delivery.
    */
-  async function maybeSendFarewell(chatId: string | null, agentGroupId: string): Promise<boolean | null> {
-    if (!chatId || !config.telegramBotToken) return null;
+  async function maybeSendFarewell(
+    chatId: string | null,
+    agentGroupId: string,
+    /**
+     * The pool assignment as it existed BEFORE
+     * `performDisconnectCleanup` ran. The cleanup releases the bot
+     * back to the pool (`assigned_agent_group_id` cleared), so
+     * looking up the pool entry inside this function would always
+     * miss. The caller captures it pre-cleanup and passes it in.
+     *
+     * Pass `undefined` (legacy / global-bot pairings) to use
+     * `cfg.telegramBotToken` instead.
+     */
+    poolEntryAtTimeOfCleanup: BotPoolRow | undefined,
+  ): Promise<boolean | null> {
+    // Resolve the bot token: pool-assigned bot's token if there
+    // was one, else the global. Both fall through to `null` (no
+    // farewell) if neither is configured.
+    const botToken = poolEntryAtTimeOfCleanup ? poolEntryAtTimeOfCleanup.bot_token_value : config.telegramBotToken;
+    if (!chatId || !botToken) return null;
     try {
       const result = await sendBagetTelegramFarewell({
-        botToken: config.telegramBotToken,
+        botToken,
         apiBaseUrl: config.telegramApiBaseUrl,
         fetchImpl: config.telegramFetchImpl,
         chatId,

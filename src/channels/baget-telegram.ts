@@ -39,6 +39,7 @@ import * as Sentry from '@sentry/node';
 import { registerExtraRoute } from '../baget-admin-server.js';
 import { applyPersonaPrefix } from '../baget-persona.js';
 import { GROUPS_DIR } from '../config.js';
+import { getBotPoolEntryByAgentGroup, getBotPoolEntryByUsername } from '../db/baget-bot-pool.js';
 import { consumePairingToken } from '../db/baget-pairing-tokens.js';
 import { recordSeenUpdate, sweepOldSeenUpdates } from '../db/baget-seen-updates.js';
 import { getBagetAgentGroupById, normalizeBoundBagetTelegramFounderChannels } from '../db/baget-agent-groups.js';
@@ -140,6 +141,7 @@ function buildAdapter(cfg: BagetTelegramConfig): ChannelAdapter {
   const groupsDir = cfg._testGroupsDir ?? GROUPS_DIR;
   const inboundDebounceMs = cfg.inboundDebounceMs ?? 1500;
   let unregisterRoute: (() => void) | null = null;
+  let unregisterPerBotRoute: (() => void) | null = null;
   let setup: ChannelSetup | null = null;
 
   // Per-chat debounce coalesces rapid-fire DMs into a single inbound
@@ -214,13 +216,30 @@ function buildAdapter(cfg: BagetTelegramConfig): ChannelAdapter {
 
   // ── Webhook handler ──
 
-  async function handleWebhook(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
-    if (req.method !== 'POST' || req.url !== '/api/channels/telegram/webhook') {
+  /**
+   * Shared inbound dispatcher used by both routes:
+   *   - `/api/channels/telegram/webhook` (global / shared bot)
+   *   - `/api/channels/telegram/bot/:botUsername/webhook` (per-bot
+   *     pool route; secret resolved from `baget_bot_pool.webhook_secret`)
+   *
+   * `expectedSecret` is the Telegram secret the route layer expects
+   * for THIS request — the global route passes `cfg.webhookSecret`,
+   * the per-bot route passes the row's `webhook_secret`. Constant-
+   * time comparison happens here so the two routes share both the
+   * comparison primitive and the body-parse / dedup / ACK pipeline.
+   */
+  async function dispatchTelegramWebhook(
+    req: http.IncomingMessage,
+    res: http.ServerResponse,
+    expectedSecret: string,
+    routeSource: 'global' | 'per-bot',
+  ): Promise<void> {
+    if (req.method !== 'POST') {
       res.writeHead(404).end();
       return;
     }
-    if (!checkSecretToken(req.headers, cfg.webhookSecret)) {
-      log.warn('Baget telegram: rejected webhook with bad secret token');
+    if (!checkSecretToken(req.headers, expectedSecret)) {
+      log.warn('Baget telegram: rejected webhook with bad secret token', { routeSource });
       res.writeHead(401).end();
       return;
     }
@@ -229,7 +248,7 @@ function buildAdapter(cfg: BagetTelegramConfig): ChannelAdapter {
     try {
       bodyText = await readBody(req, 1024 * 1024);
     } catch (err) {
-      log.warn('Baget telegram: failed to read webhook body', { err });
+      log.warn('Baget telegram: failed to read webhook body', { err, routeSource });
       res.writeHead(400).end();
       return;
     }
@@ -238,7 +257,7 @@ function buildAdapter(cfg: BagetTelegramConfig): ChannelAdapter {
     try {
       update = JSON.parse(bodyText) as TelegramUpdate;
     } catch (err) {
-      log.warn("Baget telegram: webhook body wasn't valid JSON", { err });
+      log.warn("Baget telegram: webhook body wasn't valid JSON", { err, routeSource });
       res.writeHead(400).end();
       return;
     }
@@ -254,13 +273,94 @@ function buildAdapter(cfg: BagetTelegramConfig): ChannelAdapter {
         // error here is fully detached from the request thread — only
         // the structured log + Sentry capture surface it. Sentry is a
         // no-op when SENTRY_DSN is unset (local dev).
-        log.error('Baget telegram: update processing threw', { err, updateId: update.update_id });
+        log.error('Baget telegram: update processing threw', {
+          err,
+          updateId: update.update_id,
+          routeSource,
+        });
         Sentry.captureException(err, {
-          tags: { source: 'baget-telegram-webhook' },
+          tags: { source: 'baget-telegram-webhook', routeSource },
           extra: { updateId: update.update_id },
         });
       });
     });
+  }
+
+  /**
+   * Global / shared-bot webhook — the legacy route. Constant-time
+   * checks against `cfg.webhookSecret` (env: TELEGRAM_WEBHOOK_SECRET).
+   * Stays for back-compat with deployments where the global bot is
+   * still bound to founders (Vela today). Future deployments use the
+   * per-bot route below.
+   */
+  async function handleGlobalWebhook(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+    if (req.url !== '/api/channels/telegram/webhook') {
+      res.writeHead(404).end();
+      return;
+    }
+    return dispatchTelegramWebhook(req, res, cfg.webhookSecret, 'global');
+  }
+
+  /**
+   * Per-bot webhook route. Telegram delivers updates to:
+   *   POST /api/channels/telegram/bot/:botUsername/webhook
+   * with the row's stored `webhook_secret` echoed in the
+   * `X-Telegram-Bot-Api-Secret-Token` header.
+   *
+   * We look the username up in `baget_bot_pool`, pull the secret,
+   * and verify it constant-time. An unknown username returns 401
+   * (NOT 404) — that distinction would let an attacker probe which
+   * usernames are in our pool. Same response for unknown-username
+   * AND wrong-secret keeps the pool membership opaque.
+   *
+   * On success the update flows through the same `processUpdate`
+   * pipeline as the global route — the per-bot routing concern ends
+   * once we've validated the secret. The agent_group resolution
+   * happens later via `getMessagingGroupByPlatform` keyed on the
+   * Telegram chat_id, which is the same path the global route uses.
+   *
+   * Future: when the global bot is fully retired, this function
+   * becomes the only inbound entry point and `handleGlobalWebhook`
+   * can be deleted.
+   */
+  async function handlePerBotWebhook(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+    const url = req.url ?? '';
+    const m = /^\/api\/channels\/telegram\/bot\/([^/]+)\/webhook$/.exec(url);
+    if (!m) {
+      res.writeHead(404).end();
+      return;
+    }
+    // Codex P2 (re-review of ec1c742): `decodeURIComponent` throws
+    // `URIError` on malformed `%` sequences. An attacker (or buggy
+    // probe) that hits `/api/channels/telegram/bot/%XX/webhook`
+    // would otherwise get a 500 + a noisy stack-trace in logs, vs
+    // the intended opaque 401 every other unauthenticated path
+    // returns. Catch and treat as "unknown username" — same
+    // pool-membership-opaque 401 as the unknown-bot path below.
+    let botUsername: string;
+    try {
+      botUsername = decodeURIComponent(m[1]!);
+    } catch {
+      log.warn('Baget telegram: per-bot webhook with malformed username encoding', {
+        rawSegment: m[1]!.slice(0, 80),
+        routeSource: 'per-bot',
+      });
+      res.writeHead(401).end();
+      return;
+    }
+    const entry = getBotPoolEntryByUsername(botUsername);
+    if (!entry) {
+      // Don't leak pool membership: same 401 as a wrong-secret
+      // request. An operator running the wrong webhook URL gets a
+      // matching log line below for triage.
+      log.warn('Baget telegram: per-bot webhook for unknown username', {
+        botUsername,
+        routeSource: 'per-bot',
+      });
+      res.writeHead(401).end();
+      return;
+    }
+    return dispatchTelegramWebhook(req, res, entry.webhook_secret, 'per-bot');
   }
 
   async function processUpdate(update: TelegramUpdate): Promise<void> {
@@ -367,9 +467,17 @@ function buildAdapter(cfg: BagetTelegramConfig): ChannelAdapter {
 
       const destDir = path.resolve(groupsDir, agentGroup.folder, 'inbound');
 
+      // Download MUST use the same bot token that received the
+      // upload — Telegram `file_id`s are per-bot-scoped. Pool-paired
+      // founders' uploads land on their per-company bot's webhook,
+      // so the file_id only resolves under that token. Falling
+      // through to `cfg.botToken` for legacy / Vela pairings is
+      // correct (those agent_groups have no pool entry).
+      const inboundBotToken = getBotPoolEntryByAgentGroup(agentGroup.id)?.bot_token_value ?? cfg.botToken;
+
       try {
         const { filePath, sizeBytes } = await downloadTelegramAttachment({
-          botToken: cfg.botToken,
+          botToken: inboundBotToken,
           fileId: parsedAttachment.fileId,
           destDir,
           fetchImpl: fetchFn,
@@ -392,6 +500,11 @@ function buildAdapter(cfg: BagetTelegramConfig): ChannelAdapter {
             msg.chat.id,
             'That file is too big for me to receive (20 MB limit). Try splitting it or sharing a link.',
             agentGroup.id,
+            // Reply on the SAME bot the founder uploaded to — pool-
+            // assigned bot if present, else global. Without this, a
+            // pool-paired founder would never see this error message
+            // because cfg.botToken can't reach their per-company chat.
+            inboundBotToken,
           );
           return;
         }
@@ -538,10 +651,17 @@ function buildAdapter(cfg: BagetTelegramConfig): ChannelAdapter {
     //    so reading `agentGroup.name` here is the canonical way to
     //    surface the founder's company in the chat — important when a
     //    founder runs multiple Baget companies through the shared bot.
+    //
+    //    Token resolution: pool > global. If this agent_group has a
+    //    pool assignment (e.g. a founder previously paired via Login
+    //    Widget then re-paired via deep-link), the welcome MUST ride
+    //    the per-company bot — `cfg.botToken` would land in the wrong
+    //    chat or a chat the founder hasn't opened.
+    const startWelcomeBotToken = getBotPoolEntryByAgentGroup(row.agent_group_id)?.bot_token_value ?? cfg.botToken;
     const team = parseTeamMembers(agentGroup.baget_team_members);
     if (team) {
       await sendBagetTelegramWelcome({
-        botToken: cfg.botToken,
+        botToken: startWelcomeBotToken,
         apiBaseUrl: cfg.apiBaseUrl,
         fetchImpl: cfg.fetchImpl,
         chatId,
@@ -562,6 +682,7 @@ function buildAdapter(cfg: BagetTelegramConfig): ChannelAdapter {
         chatId,
         `🧭 your CoS: All wired up — your ${agentGroup.name} team is ready. What's on your mind?`,
         row.agent_group_id,
+        startWelcomeBotToken,
       );
     }
     log.info('Baget telegram: paired chat to agent_group', {
@@ -590,6 +711,14 @@ function buildAdapter(cfg: BagetTelegramConfig): ChannelAdapter {
     const mg = getMessagingGroupByPlatform(BAGET_TELEGRAM_CHANNEL_TYPE, platformId);
     const wired = mg ? getMessagingGroupAgents(mg.id) : [];
     const agentGroupId = wired.length === 1 ? (wired[0]?.agent_group_id ?? null) : null;
+    // Pick the bot token: per-company assigned bot from the pool when
+    // this agent_group has been migrated, else the global `cfg.botToken`
+    // (legacy / Vela path). Pool assignment is opt-in per founder, so
+    // both paths must keep working in the same process — old companies
+    // bound before #16 stay on the global bot, new companies post-#21
+    // get their own. NEVER log the resolved token; it's a secret.
+    const resolvedBotToken =
+      (agentGroupId && getBotPoolEntryByAgentGroup(agentGroupId)?.bot_token_value) || cfg.botToken;
 
     // Celebrations BYPASS the multi-bind / archived security checks below
     // by design. The `/celebrate` admin endpoint (#19) has already
@@ -601,7 +730,7 @@ function buildAdapter(cfg: BagetTelegramConfig): ChannelAdapter {
     // delivery_failure log still has it.
     if (message.kind === 'celebration') {
       const celebText = renderCelebrationText(message.content as CelebrationPayload);
-      return sendBotMessage(chatId, celebText, agentGroupId);
+      return sendBotMessage(chatId, celebText, agentGroupId, resolvedBotToken);
     }
 
     const rawText = extractText(message);
@@ -666,7 +795,7 @@ function buildAdapter(cfg: BagetTelegramConfig): ChannelAdapter {
       let result;
       if (attachment.kind === 'photo') {
         result = await sendBagetBotPhoto({
-          botToken: cfg.botToken,
+          botToken: resolvedBotToken,
           apiBaseUrl: apiBase,
           fetchImpl: fetchFn,
           chatId,
@@ -676,7 +805,7 @@ function buildAdapter(cfg: BagetTelegramConfig): ChannelAdapter {
         });
       } else if (attachment.kind === 'document') {
         result = await sendBagetBotDocument({
-          botToken: cfg.botToken,
+          botToken: resolvedBotToken,
           apiBaseUrl: apiBase,
           fetchImpl: fetchFn,
           chatId,
@@ -701,7 +830,7 @@ function buildAdapter(cfg: BagetTelegramConfig): ChannelAdapter {
     }
 
     if (text !== null) {
-      const messageId = await sendBotMessage(chatId, prefixed!, agentGroupId);
+      const messageId = await sendBotMessage(chatId, prefixed!, agentGroupId, resolvedBotToken);
       if (messageId !== undefined) lastMessageId = messageId;
     }
 
@@ -715,13 +844,19 @@ function buildAdapter(cfg: BagetTelegramConfig): ChannelAdapter {
   // expect. agentGroupId is `null` for pre-pair traffic (token-shape /
   // consume failure paths in handleStartCommand) and a real id everywhere
   // else.
+  //
+  // `botToken` is optional for callsites that predate the pool (the
+  // `/start <token>` flow uses the global `cfg.botToken` for its
+  // pre-pair token-shape failure replies). Routine deliver() callsites
+  // pass the resolved token explicitly.
   async function sendBotMessage(
     chatId: number | string,
     text: string,
     agentGroupId: string | null,
+    botToken: string = cfg.botToken,
   ): Promise<string | undefined> {
     const result = await sendBagetBotMessage({
-      botToken: cfg.botToken,
+      botToken,
       apiBaseUrl: apiBase,
       fetchImpl: fetchFn,
       chatId,
@@ -734,7 +869,15 @@ function buildAdapter(cfg: BagetTelegramConfig): ChannelAdapter {
   async function setTyping(platformId: string, _threadId: string | null): Promise<void> {
     const chatId = chatIdFromPlatformId(platformId);
     if (chatId === null) return;
-    const url = `${apiBase}/bot${cfg.botToken}/sendChatAction`;
+    // Same pool > global token resolution as deliver(): the founder
+    // sees the typing indicator on whichever bot they paired against.
+    // Cheap lookup (single SELECT, returns undefined for legacy /
+    // global-bot pairings).
+    const mg = getMessagingGroupByPlatform(BAGET_TELEGRAM_CHANNEL_TYPE, platformId);
+    const wired = mg ? getMessagingGroupAgents(mg.id) : [];
+    const agentGroupId = wired.length === 1 ? (wired[0]?.agent_group_id ?? null) : null;
+    const botToken = (agentGroupId && getBotPoolEntryByAgentGroup(agentGroupId)?.bot_token_value) || cfg.botToken;
+    const url = `${apiBase}/bot${botToken}/sendChatAction`;
     try {
       await fetchFn(url, {
         method: 'POST',
@@ -766,11 +909,24 @@ function buildAdapter(cfg: BagetTelegramConfig): ChannelAdapter {
       // Share the admin server's HTTP listener instead of binding our
       // own port. Railway exposes exactly one public port per service,
       // so the webhook + admin routes must land on the same listener.
+      //
+      // We register TWO routes:
+      //   1. Global / shared-bot route — back-compat for legacy
+      //      pairings (Vela today). Auth: cfg.webhookSecret.
+      //   2. Per-bot pool route — auth: per-row webhook_secret from
+      //      baget_bot_pool. Each pool bot's setWebhook points at this
+      //      URL with the row's username.
       unregisterRoute = registerExtraRoute(
         (method, url) => method === 'POST' && url === '/api/channels/telegram/webhook',
-        (req, res) => handleWebhook(req, res),
+        (req, res) => handleGlobalWebhook(req, res),
       );
-      log.info('Baget telegram webhook registered on shared admin listener');
+      unregisterPerBotRoute = registerExtraRoute(
+        (method, url) => method === 'POST' && /^\/api\/channels\/telegram\/bot\/[^/]+\/webhook$/.test(url),
+        (req, res) => handlePerBotWebhook(req, res),
+      );
+      log.info('Baget telegram webhooks registered on shared admin listener', {
+        routes: ['global', 'per-bot'],
+      });
       startSweep();
     },
 
@@ -785,6 +941,10 @@ function buildAdapter(cfg: BagetTelegramConfig): ChannelAdapter {
       if (unregisterRoute) {
         unregisterRoute();
         unregisterRoute = null;
+      }
+      if (unregisterPerBotRoute) {
+        unregisterPerBotRoute();
+        unregisterPerBotRoute = null;
       }
       setup = null;
     },
