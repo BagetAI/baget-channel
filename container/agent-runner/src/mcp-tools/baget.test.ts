@@ -208,7 +208,10 @@ describe('baget_read_document handler', () => {
     // Defensive — if baget.ai ever changes the response shape we'd
     // rather surface the unfamiliar JSON than null it out.
     const flatPayload = { id: 'doc-uuid-789', title: 'Old Shape', content: 'Body.' };
-    fetchResponse = () => new Response(JSON.stringify(flatPayload), { status: 200 });
+    // Pre-existing typo fix (was `fetchResponse = …`, an undefined symbol
+    // that crashed the test before it could assert). Use the helper the
+    // rest of the file uses.
+    setDefaultResponse(() => new Response(JSON.stringify(flatPayload), { status: 200 }));
     const tool = getRegisteredToolByName('baget_read_document');
     const result = await tool!.handler({ documentId: 'doc-uuid-789' });
     expect(result.isError).toBeUndefined();
@@ -810,5 +813,195 @@ describe('baget_send_document_file handler — SSRF + filename hardening', () =>
     const text = (result.content[0] as { text: string }).text;
     expect(text).toContain('empty or non-JSON');
     expect(fetchCalls).toHaveLength(1);
+  });
+});
+
+// ── baget_get_credits ────────────────────────────────────────────────────────
+
+describe('baget_get_credits tool registration', () => {
+  it('is registered under the exact name the prompt references', () => {
+    // The chat agent's prompt instructs it to call this tool BEFORE
+    // answering any credits question, so the name has to match exactly.
+    // Drift here = silent regression to the hallucination behavior the
+    // tool was added to fix ("you have unlimited credits, Samuel").
+    const tool = getRegisteredToolByName('baget_get_credits');
+    expect(tool).toBeDefined();
+    expect(tool!.tool.name).toBe('baget_get_credits');
+  });
+
+  it("description steers the model to use it for any credit/balance question", () => {
+    // The whole point of this tool is to short-circuit the model's
+    // tendency to fabricate or deflect on credit questions. The
+    // description has to make the use case unambiguous so the model
+    // picks it over the (much-shorter, much-tempting) "I don't know"
+    // fallback.
+    //
+    // We assert the SPECIFIC phrasings that route the model — not just
+    // single keywords — because a copy edit that softens "NEVER
+    // hallucinate" → "do not invent" or strips an example phrase
+    // would silently regress the anti-hallucination intent. Per the
+    // QA reviewer's "brittle prompt-string test" finding, anchoring
+    // on example phrases is more meaningful than single words.
+    const tool = getRegisteredToolByName('baget_get_credits');
+    const description = tool!.tool.description ?? '';
+    expect(description.toLowerCase()).toContain('credit');
+    expect(description.toLowerCase()).toContain('balance');
+    // Anti-hallucination imperative — keep this exact phrase strong.
+    expect(description.toLowerCase()).toContain('never hallucinate');
+    // High-signal example phrases the model uses to route here.
+    expect(description.toLowerCase()).toContain('how much do i have');
+  });
+
+  it('takes no arguments (the company is implicit from BAGET_COMPANY_ID)', () => {
+    const tool = getRegisteredToolByName('baget_get_credits');
+    const schema = tool!.tool.inputSchema as {
+      properties: Record<string, unknown>;
+      required?: string[];
+      additionalProperties?: boolean;
+    };
+    expect(schema.properties).toEqual({});
+    expect(schema.required ?? []).toEqual([]);
+    expect(schema.additionalProperties).toBe(false);
+  });
+});
+
+describe('baget_get_credits handler', () => {
+  it('GETs /credits with bearer auth and returns the JSON-stringified payload', async () => {
+    const creditsPayload = {
+      totalCredits: 6_740,
+      breakdown: {
+        dailyCredits: 40,
+        treasuryCredits: 5_500,
+        purchasedCredits: 1_200,
+      },
+      planTier: 'atelier',
+    };
+    setDefaultResponse(() => new Response(JSON.stringify(creditsPayload), { status: 200 }));
+
+    const tool = getRegisteredToolByName('baget_get_credits');
+    const result = await tool!.handler({});
+
+    expect(fetchCalls).toHaveLength(1);
+    expect(fetchCalls[0].url).toBe('https://stg-app.baget.ai/api/companies/company-uuid-123/credits');
+    expect(fetchCalls[0].method).toBe('GET');
+    expect(fetchCalls[0].authHeader).toBe('Bearer test-bearer-token');
+    expect(result.isError).toBeUndefined();
+    const text = (result.content[0] as { text: string }).text;
+    const parsed = JSON.parse(text);
+    expect(parsed.totalCredits).toBe(6_740);
+    expect(parsed.planTier).toBe('atelier');
+    expect(parsed.breakdown.dailyCredits).toBe(40);
+  });
+
+  it('surfaces upstream HTTP errors with a tool-prefixed message', async () => {
+    setDefaultResponse(
+      () => new Response(JSON.stringify({ error: 'unauthorized' }), { status: 401 }),
+    );
+    const tool = getRegisteredToolByName('baget_get_credits');
+    const result = await tool!.handler({});
+    expect(result.isError).toBe(true);
+    expect((result.content[0] as { text: string }).text).toContain('get_credits failed');
+  });
+
+  it('errors cleanly when BAGET_COMPANY_ID is missing (no fetch fired)', async () => {
+    delete process.env.BAGET_COMPANY_ID;
+    const tool = getRegisteredToolByName('baget_get_credits');
+    const result = await tool!.handler({});
+    expect(result.isError).toBe(true);
+    expect((result.content[0] as { text: string }).text).toContain('BAGET_COMPANY_ID');
+    expect(fetchCalls).toHaveLength(0);
+  });
+});
+
+// ── baget_list_recent_activity ───────────────────────────────────────────────
+
+describe('baget_list_recent_activity tool registration', () => {
+  it('is registered under the exact name the prompt references', () => {
+    const tool = getRegisteredToolByName('baget_list_recent_activity');
+    expect(tool).toBeDefined();
+    expect(tool!.tool.name).toBe('baget_list_recent_activity');
+  });
+
+  it('description steers the model toward "what did the team do" questions', () => {
+    // Same brittle-substring concern as baget_get_credits — anchor on
+    // example phrases plus the imperative anti-hallucination phrasing
+    // so a copy edit can't quietly weaken either signal.
+    const tool = getRegisteredToolByName('baget_list_recent_activity');
+    const description = tool!.tool.description ?? '';
+    expect(description.toLowerCase()).toContain('activity');
+    // Anti-hallucination imperative — keep the exact phrase that tells
+    // the model not to invent activity when the feed is empty.
+    expect(description.toLowerCase()).toContain('never make up');
+    // High-signal example phrases used to route here.
+    expect(description.toLowerCase()).toContain('what did the team ship');
+  });
+
+  it('takes no arguments', () => {
+    const tool = getRegisteredToolByName('baget_list_recent_activity');
+    const schema = tool!.tool.inputSchema as {
+      properties: Record<string, unknown>;
+      required?: string[];
+      additionalProperties?: boolean;
+    };
+    expect(schema.properties).toEqual({});
+    expect(schema.required ?? []).toEqual([]);
+    expect(schema.additionalProperties).toBe(false);
+  });
+});
+
+describe('baget_list_recent_activity handler', () => {
+  it('GETs /recent-activity with bearer auth and returns the JSON payload', async () => {
+    const activityPayload = {
+      activity: [
+        {
+          id: 'act-1',
+          type: 'task-completed',
+          message: 'Drafted hero copy',
+          agentRole: 'marketing',
+          createdAt: '2026-05-04T12:00:00.000Z',
+        },
+        {
+          id: 'act-2',
+          type: 'milestone-hit',
+          message: 'First 100 signups',
+          agentRole: null,
+          createdAt: '2026-05-04T08:00:00.000Z',
+        },
+      ],
+    };
+    setDefaultResponse(() => new Response(JSON.stringify(activityPayload), { status: 200 }));
+
+    const tool = getRegisteredToolByName('baget_list_recent_activity');
+    const result = await tool!.handler({});
+
+    expect(fetchCalls).toHaveLength(1);
+    expect(fetchCalls[0].url).toBe(
+      'https://stg-app.baget.ai/api/companies/company-uuid-123/recent-activity',
+    );
+    expect(fetchCalls[0].method).toBe('GET');
+    expect(fetchCalls[0].authHeader).toBe('Bearer test-bearer-token');
+    expect(result.isError).toBeUndefined();
+    const parsed = JSON.parse((result.content[0] as { text: string }).text);
+    expect(parsed.activity).toHaveLength(2);
+    expect(parsed.activity[0].id).toBe('act-1');
+  });
+
+  it('surfaces upstream HTTP errors with a tool-prefixed message', async () => {
+    setDefaultResponse(
+      () => new Response(JSON.stringify({ error: 'company-mismatch' }), { status: 403 }),
+    );
+    const tool = getRegisteredToolByName('baget_list_recent_activity');
+    const result = await tool!.handler({});
+    expect(result.isError).toBe(true);
+    expect((result.content[0] as { text: string }).text).toContain('list_recent_activity failed');
+  });
+
+  it('errors cleanly when BAGET_COMPANY_ID is missing (no fetch fired)', async () => {
+    delete process.env.BAGET_COMPANY_ID;
+    const tool = getRegisteredToolByName('baget_list_recent_activity');
+    const result = await tool!.handler({});
+    expect(result.isError).toBe(true);
+    expect((result.content[0] as { text: string }).text).toContain('BAGET_COMPANY_ID');
+    expect(fetchCalls).toHaveLength(0);
   });
 });
