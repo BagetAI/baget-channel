@@ -257,6 +257,16 @@ function buildAdapter(cfg: BagetTelegramConfig): ChannelAdapter {
    */
   async function handleStartCommand(msg: UpdateMessage, rawToken: string): Promise<void> {
     const chatId = msg.chat.id;
+    // Pairing tokens are for private DMs only. A group admin could otherwise send
+    // /start <token> in a group chat, binding the whole group to the founder's agent
+    // and leaking replies to all group members.
+    if (msg.chat.type !== 'private') {
+      log.warn('Baget telegram: /start received in non-private chat — ignoring', {
+        chatId,
+        chatType: msg.chat.type,
+      });
+      return;
+    }
     const FAILURE_MSG = "That pairing link isn't valid or has expired. Generate a fresh one from the dashboard.";
 
     // Single-use consume. The token format is now 32 hex chars
@@ -430,6 +440,12 @@ function buildAdapter(cfg: BagetTelegramConfig): ChannelAdapter {
     name: 'baget-telegram',
     channelType: BAGET_TELEGRAM_CHANNEL_TYPE,
     supportsThreads: false,
+    mediaSupport: {
+      photo: true,
+      document: true,
+      // Telegram Bot API hard limit for multipart file uploads.
+      maxBytesPerAttachment: 50 * 1024 * 1024,
+    },
 
     async setup(s: ChannelSetup): Promise<void> {
       setup = s;
