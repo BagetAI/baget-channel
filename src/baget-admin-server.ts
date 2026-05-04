@@ -86,29 +86,41 @@ import type { ChannelAdapter, OutboundMessage } from './channels/adapter.js';
 // ── Auth ──
 
 /**
- * Constant-time bearer-token check. Returns false on any malformed
- * header — we never log the supplied token (even truncated) because a
- * partial leak narrows brute-force time.
+ * Constant-time string comparison. The two implementations of admin
+ * bearer auth (header-style for HTTP routes, raw-string for WebSocket
+ * upgrades) must use the SAME compare to avoid drift in the security
+ * primitive. Pads both inputs to the longer length with zeros so a
+ * length mismatch doesn't short-circuit; explicit length-equality
+ * check rules out zero-padded collisions ("a" vs "a\0").
+ *
+ * Treats either side missing / undefined as a mismatch — callers
+ * don't need to pre-validate.
  */
-export function verifyAdminBearer(headerValue: string | string[] | undefined, expectedToken: string): boolean {
-  if (typeof headerValue !== 'string') return false;
-  const m = /^Bearer\s+(.+)$/i.exec(headerValue.trim());
-  if (!m) return false;
-  const supplied = m[1];
-  // timingSafeEqual requires equal-length buffers — pad both to the
-  // longer of the two with constant zeros so we don't leak the expected
-  // token's length on a length mismatch.
+export function compareTokensConstantTime(supplied: string | undefined, expected: string | undefined): boolean {
+  if (typeof supplied !== 'string' || supplied.length === 0) return false;
+  if (typeof expected !== 'string' || expected.length === 0) return false;
   const a = Buffer.from(supplied, 'utf8');
-  const b = Buffer.from(expectedToken, 'utf8');
+  const b = Buffer.from(expected, 'utf8');
   const max = Math.max(a.length, b.length);
   const ap = Buffer.alloc(max);
   const bp = Buffer.alloc(max);
   a.copy(ap);
   b.copy(bp);
-  // If lengths differ, force a mismatch even when padded bytes happen
-  // to align (zero-padded buffers can collide).
   const sameLen = a.length === b.length ? 1 : 0;
   return timingSafeEqual(ap, bp) && sameLen === 1;
+}
+
+/**
+ * Constant-time bearer-token check from an HTTP Authorization header.
+ * Returns false on any malformed header — we never log the supplied
+ * token (even truncated) because a partial leak narrows brute-force
+ * time.
+ */
+export function verifyAdminBearer(headerValue: string | string[] | undefined, expectedToken: string): boolean {
+  if (typeof headerValue !== 'string') return false;
+  const m = /^Bearer\s+(.+)$/i.exec(headerValue.trim());
+  if (!m) return false;
+  return compareTokensConstantTime(m[1], expectedToken);
 }
 
 // ── Pairing token mint ──
@@ -345,6 +357,37 @@ export function registerExtraRoute(matcher: ExtraRouteMatcher, handler: ExtraRou
   return () => {
     const i = extraRoutes.indexOf(entry);
     if (i >= 0) extraRoutes.splice(i, 1);
+  };
+}
+
+/**
+ * Upgrade-route variants — same shape as `registerExtraRoute`, but the
+ * handler receives the raw socket (`http.IncomingMessage` + duplex socket +
+ * head Buffer) instead of a ServerResponse. Used by the baget-web channel
+ * adapter to attach a WebSocket endpoint to the shared admin listener
+ * (Railway exposes one public port per service, so all channel transports
+ * must share this server's `'upgrade'` event).
+ *
+ * The handler MUST consume the connection — either complete the WebSocket
+ * handshake or destroy the socket on rejection. A handler that throws is
+ * logged and the socket is destroyed; an unmatched upgrade falls through to
+ * `socket.destroy()` so dangling connections don't accumulate.
+ */
+export type ExtraUpgradeMatcher = (url: string) => boolean;
+export type ExtraUpgradeHandler = (
+  req: http.IncomingMessage,
+  socket: import('stream').Duplex,
+  head: Buffer,
+) => Promise<void> | void;
+
+const extraUpgradeRoutes: Array<{ matcher: ExtraUpgradeMatcher; handler: ExtraUpgradeHandler }> = [];
+
+export function registerExtraUpgradeRoute(matcher: ExtraUpgradeMatcher, handler: ExtraUpgradeHandler): () => void {
+  const entry = { matcher, handler };
+  extraUpgradeRoutes.push(entry);
+  return () => {
+    const i = extraUpgradeRoutes.indexOf(entry);
+    if (i >= 0) extraUpgradeRoutes.splice(i, 1);
   };
 }
 
@@ -1513,6 +1556,33 @@ export function createBagetAdminServer(config: BagetAdminServerConfig): BagetAdm
             }
           }
         });
+      });
+      // Dispatch HTTP-Upgrade requests (e.g. WebSocket handshakes) to
+      // any registered upgrade route. Unmatched upgrades close the
+      // socket so a dangling connection can't sit forever — clients
+      // see a clean abort.
+      server.on('upgrade', (req, socket, head) => {
+        const url = req.url || '';
+        for (const { matcher, handler } of extraUpgradeRoutes) {
+          if (matcher(url)) {
+            Promise.resolve()
+              .then(() => handler(req, socket, head))
+              .catch((err) => {
+                log.error('Baget admin upgrade handler threw', { err, url });
+                try {
+                  socket.destroy();
+                } catch {
+                  // socket already gone
+                }
+              });
+            return;
+          }
+        }
+        try {
+          socket.destroy();
+        } catch {
+          // socket already gone
+        }
       });
       await new Promise<void>((resolve, reject) => {
         const onError = (err: Error) => reject(err);

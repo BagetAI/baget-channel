@@ -14,6 +14,7 @@ import { migration014 } from './014-baget-pairing.js';
 import { migration015 } from './015-baget-channel-tokens.js';
 import { migration016 } from './016-baget-bot-pool.js';
 import { migration017 } from './017-baget-bot-pool-orphan-trigger.js';
+import { migration018 } from './018-baget-web-conversations.js';
 import { moduleApprovalsPendingApprovals } from './module-approvals-pending-approvals.js';
 import { moduleApprovalsTitleOptions } from './module-approvals-title-options.js';
 
@@ -39,6 +40,7 @@ const migrations: Migration[] = [
   migration015,
   migration016,
   migration017,
+  migration018,
 ];
 
 export function runMigrations(db: Database.Database): void {
