@@ -354,6 +354,16 @@ function buildAdapter(cfg: BagetTelegramConfig): ChannelAdapter {
    */
   async function handleStartCommand(msg: UpdateMessage, rawToken: string): Promise<void> {
     const chatId = msg.chat.id;
+    // Pairing tokens are for private DMs only. A group admin could otherwise send
+    // /start <token> in a group chat, binding the whole group to the founder's agent
+    // and leaking replies to all group members.
+    if (msg.chat.type !== 'private') {
+      log.warn('Baget telegram: /start received in non-private chat — ignoring', {
+        chatId,
+        chatType: msg.chat.type,
+      });
+      return;
+    }
     const dashboardBase = process.env.BAGET_DASHBOARD_URL ?? 'https://app.baget.ai';
     const FAILURE_MSG = `That pairing link isn't valid or has expired. Tap here to get a fresh one: ${dashboardBase}/team?regenerate=1`;
 
