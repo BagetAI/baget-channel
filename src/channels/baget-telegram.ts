@@ -41,7 +41,7 @@ import { getBagetAgentGroupById, normalizeBoundBagetTelegramFounderChannels } fr
 import { getMessagingGroupAgents, getMessagingGroupByPlatform } from '../db/messaging-groups.js';
 import { log } from '../log.js';
 import { OPTIONAL_ROLES, type BagetTeamMembers } from '../baget-pairing.js';
-import type { ChannelAdapter, ChannelSetup, InboundMessage, OutboundMessage } from './adapter.js';
+import type { ChannelAdapter, ChannelSetup, InboundMessage, OutboundMessage, CelebrationPayload } from './adapter.js';
 import { registerChannelAdapter } from './channel-registry.js';
 import { createInboundDebouncer, type InboundDebouncer } from './inbound-debouncer.js';
 import {
@@ -442,6 +442,13 @@ function buildAdapter(cfg: BagetTelegramConfig): ChannelAdapter {
   ): Promise<string | undefined> {
     const chatId = chatIdFromPlatformId(platformId);
     if (chatId === null) return undefined;
+
+    // Celebrations bypass persona-prefix — they're from the team collectively.
+    if (message.kind === 'celebration') {
+      const celebText = renderCelebrationText(message.content as CelebrationPayload);
+      return sendBotMessage(chatId, celebText);
+    }
+
     const text = extractText(message);
     if (text === null) return undefined;
 
@@ -672,6 +679,23 @@ function coalesceInboundMessages(messages: InboundMessage[]): InboundMessage {
   return result;
 }
 
+/**
+ * Render a celebration payload as plain Telegram text. No persona
+ * prefix — the celebration is from "your team" collectively, not from
+ * any specific role. The 🎉 emoji is the celebration signal.
+ */
+function renderCelebrationText(payload: CelebrationPayload): string {
+  const prefix = payload.streakDays ? `🎉 Day ${payload.streakDays}! ` : '🎉 ';
+  const lines: string[] = [`${prefix}Batch ${payload.batchNumber} just landed.`, '', payload.summary];
+  if (payload.deliverables && payload.deliverables.length > 0) {
+    lines.push('');
+    for (const d of payload.deliverables) {
+      lines.push(`• ${d.label}${d.href ? ` → ${d.href}` : ''}`);
+    }
+  }
+  return lines.join('\n');
+}
+
 function extractText(message: OutboundMessage): string | null {
   const content = message.content as Record<string, unknown> | string | undefined;
   if (typeof content === 'string') return content;
@@ -769,3 +793,7 @@ export const _testParseTeamMembers = parseTeamMembers;
 // validates the text-join + carry-from-latest behavior without
 // spinning up the full webhook → router round trip.
 export const _testCoalesceInboundMessages = coalesceInboundMessages;
+
+// Exported for direct unit testing of the celebration template —
+// independent from the admin-server orchestration.
+export const _testRenderCelebrationText = renderCelebrationText;
