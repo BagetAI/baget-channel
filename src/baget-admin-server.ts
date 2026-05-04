@@ -66,17 +66,15 @@ import { wipeSessionDataForAgentGroup } from './session-manager.js';
 import { deleteChannelToken, upsertChannelToken } from './db/baget-channel-tokens.js';
 import { getDb } from './db/connection.js';
 import { insertPairingToken, sweepExpiredPairingTokens } from './db/baget-pairing-tokens.js';
-import {
-  ALL_ROLES,
-  OPTIONAL_ROLES,
-  provisionBagetGroup,
-  type BagetTeamMembers,
-} from './baget-pairing.js';
+import { ALL_ROLES, OPTIONAL_ROLES, provisionBagetGroup, type BagetTeamMembers } from './baget-pairing.js';
 import {
   bindBagetTelegramChat,
   sendBagetTelegramFarewell,
   sendBagetTelegramWelcome,
 } from './channels/baget-telegram-bind.js';
+import { getChannelAdapter } from './channels/channel-registry.js';
+import type { ChannelAdapter, CelebrationPayload } from './channels/adapter.js';
+import { getMessagingGroupsByAgentGroup } from './db/messaging-groups.js';
 import { log } from './log.js';
 
 // ── Auth ──
@@ -282,6 +280,11 @@ export interface BagetAdminServerConfig {
   generateAgentGroupId: () => string;
   /** Function returning current time. Wired as a parameter so tests can fix the clock. */
   now?: () => number;
+  /**
+   * Override for the channel adapter lookup — tests inject a mock adapter.
+   * Production falls through to getChannelAdapter() from the channel registry.
+   */
+  getChannelAdapterFn?: (channelType: string) => ChannelAdapter | null;
 }
 
 /**
@@ -457,6 +460,12 @@ export function createBagetAdminServer(config: BagetAdminServerConfig): BagetAdm
     const deleteMatch = /^\/baget\/agent-groups\/([^/]+)$/.exec(urlNoQuery);
     if (method === 'DELETE' && deleteMatch) {
       await handleDelete(res, deleteMatch[1]);
+      return;
+    }
+
+    const celebrateMatch = /^\/baget\/agent-groups\/([^/]+)\/celebrate$/.exec(urlNoQuery);
+    if (method === 'POST' && celebrateMatch) {
+      await handleCelebrate(req, res, celebrateMatch[1]!);
       return;
     }
 
@@ -1181,6 +1190,84 @@ export function createBagetAdminServer(config: BagetAdminServerConfig): BagetAdm
       log.warn('Disconnect farewell threw', { agentGroupId, chatId, err });
       return false;
     }
+  }
+
+  // ── Celebrate ──
+
+  /** Body for POST /baget/agent-groups/:id/celebrate */
+  interface CelebrateBody {
+    batchNumber: number;
+    summary: string;
+    streakDays?: number;
+    deliverables?: Array<{ label: string; href?: string }>;
+  }
+
+  function validateCelebrateBody(body: CelebrateBody): string | null {
+    if (typeof body.batchNumber !== 'number' || !Number.isInteger(body.batchNumber) || body.batchNumber < 1) {
+      return 'batchNumber must be a positive integer';
+    }
+    if (typeof body.summary !== 'string' || body.summary.trim().length === 0) {
+      return 'summary must be a non-empty string';
+    }
+    if (body.streakDays !== undefined && (typeof body.streakDays !== 'number' || body.streakDays < 1)) {
+      return 'streakDays must be a positive number when present';
+    }
+    if (body.deliverables !== undefined) {
+      if (!Array.isArray(body.deliverables)) return 'deliverables must be an array';
+      for (const d of body.deliverables) {
+        if (typeof d.label !== 'string' || d.label.trim().length === 0) {
+          return 'each deliverable must have a non-empty label';
+        }
+      }
+    }
+    return null;
+  }
+
+  async function handleCelebrate(req: http.IncomingMessage, res: http.ServerResponse, agentGroupId: string): Promise<void> {
+    const body = await readJson<CelebrateBody>(req);
+    if (!body.ok) {
+      sendJson(res, 400, { ok: false, error: 'invalid_body', message: body.error });
+      return;
+    }
+    const validation = validateCelebrateBody(body.value);
+    if (validation) {
+      sendJson(res, 400, { ok: false, error: 'invalid_body', message: validation });
+      return;
+    }
+
+    const ag = getBagetAgentGroupById(agentGroupId);
+    if (!ag || !ag.user_id || ag.archived_at) {
+      sendJson(res, 404, { ok: false, error: 'group_not_found', message: `No active Baget agent_group with id ${agentGroupId}` });
+      return;
+    }
+
+    const groups = getMessagingGroupsByAgentGroup(agentGroupId);
+    const payload: CelebrationPayload = {
+      batchNumber: body.value.batchNumber,
+      summary: body.value.summary,
+      ...(body.value.streakDays !== undefined ? { streakDays: body.value.streakDays } : {}),
+      ...(body.value.deliverables !== undefined ? { deliverables: body.value.deliverables } : {}),
+    };
+
+    const delivered: Array<{ channelType: string; platformId: string; messageId: string | undefined }> = [];
+    for (const mg of groups) {
+      const adapter = config.getChannelAdapterFn?.(mg.channel_type) ?? getChannelAdapter(mg.channel_type) ?? null;
+      if (!adapter) {
+        log.warn('Baget celebrate: no adapter for channel_type', { channelType: mg.channel_type, agentGroupId });
+        continue;
+      }
+      try {
+        const messageId = await adapter.deliver(mg.platform_id, null, {
+          kind: 'celebration',
+          content: payload,
+        });
+        delivered.push({ channelType: mg.channel_type, platformId: mg.platform_id, messageId });
+      } catch (err) {
+        log.warn('Baget celebrate: deliver threw', { channelType: mg.channel_type, platformId: mg.platform_id, agentGroupId, err });
+      }
+    }
+
+    sendJson(res, 200, { ok: true, delivered });
   }
 
   return {

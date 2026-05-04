@@ -13,14 +13,14 @@ import { describe, expect, it, vi } from 'vitest';
 import { sendBagetTelegramFarewell } from './baget-telegram-bind.js';
 
 function fakeFetchOk(messageId = 12345): typeof fetch {
-  return vi.fn(async () =>
-    new Response(JSON.stringify({ ok: true, result: { message_id: messageId } }), { status: 200 }),
+  return vi.fn(
+    async () => new Response(JSON.stringify({ ok: true, result: { message_id: messageId } }), { status: 200 }),
   ) as unknown as typeof fetch;
 }
 
 function fakeFetchTelegramError(status: number, description: string): typeof fetch {
-  return vi.fn(async () =>
-    new Response(JSON.stringify({ ok: false, description }), { status }),
+  return vi.fn(
+    async () => new Response(JSON.stringify({ ok: false, description }), { status }),
   ) as unknown as typeof fetch;
 }
 
@@ -63,10 +63,7 @@ describe('sendBagetTelegramFarewell', () => {
     // "the bot can't reach you — open the chat once" — same shape as
     // the welcome path uses, so the dashboard already knows how to
     // render it.
-    const fetchImpl = fakeFetchTelegramError(
-      403,
-      "Forbidden: bot can't initiate conversation with a user",
-    );
+    const fetchImpl = fakeFetchTelegramError(403, "Forbidden: bot can't initiate conversation with a user");
     const result = await sendBagetTelegramFarewell({
       botToken: 'bot-token-stub',
       chatId: 424242,

@@ -277,7 +277,7 @@ export async function sendBagetTelegramFarewell(args: {
   agentGroupId?: string;
 }): Promise<BagetTelegramSendResult> {
   const text =
-    "🔌 Channel disconnected from the dashboard. The team is offline — reconnect any time from app.baget.ai → Settings → Telegram.";
+    '🔌 Channel disconnected from the dashboard. The team is offline — reconnect any time from app.baget.ai → Settings → Telegram.';
   return sendBagetBotMessage({
     botToken: args.botToken,
     apiBaseUrl: args.apiBaseUrl,
