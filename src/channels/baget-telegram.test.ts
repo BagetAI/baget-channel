@@ -702,6 +702,53 @@ describe('coalesceInboundMessages (debouncer hook)', () => {
     expect(text.length).toBeLessThanOrEqual(16000);
     expect(text).toMatch(/\[truncated by debouncer\]$/);
   });
+
+  it('does not split a UTF-16 surrogate pair when truncating (emoji-safe)', () => {
+    // 🔥 (U+1F525, FIRE) is a non-BMP codepoint encoded as a surrogate
+    // pair `🔥` (2 code units). A naive slice that lands
+    // between the two units orphans the high surrogate, producing a
+    // lone `\uD83D` that crashes JSON consumers downstream or renders
+    // as `�`. Feed a 3-message buffer where the cut would otherwise
+    // land mid-emoji; assert the truncated text contains no orphan
+    // high-surrogate code units.
+    //
+    // Build a single message that, after joining, would force the cut
+    // to land at exactly the high-surrogate boundary of an emoji.
+    // Cut position = 16000 - SUFFIX_LEN. We size the prefix so the cut
+    // falls on a high surrogate (the FIRST code unit of an emoji).
+    const SUFFIX = '\n…[truncated by debouncer]';
+    const cutAt = 16000 - SUFFIX.length;
+    // Place the emoji starting exactly at index `cutAt - 1` so that
+    // index `cutAt` would be the LOW half of the pair — the naive
+    // slice would keep the high half and orphan it.
+    const padding = 'a'.repeat(cutAt - 1);
+    const trailingFill = '🔥'.repeat(200); // plenty of trailing material
+    const items = [
+      {
+        id: 'tg-1',
+        kind: 'chat' as const,
+        timestamp: '2026-05-04T10:00:00.000Z',
+        content: { text: padding + trailingFill, sender: 'Sam', senderId: 'telegram:9001' },
+      },
+    ];
+    const merged = _testCoalesceInboundMessages(items);
+    const text = (merged.content as { text: string }).text;
+    // No orphan high surrogate (0xD800..0xDBFF) without a paired low
+    // surrogate (0xDC00..0xDFFF) immediately after it.
+    for (let i = 0; i < text.length; i++) {
+      const code = text.charCodeAt(i);
+      if (code >= 0xd800 && code <= 0xdbff) {
+        const next = text.charCodeAt(i + 1);
+        expect(next).toBeGreaterThanOrEqual(0xdc00);
+        expect(next).toBeLessThanOrEqual(0xdfff);
+        i++; // skip the low surrogate
+      } else {
+        // Conversely, no orphan low surrogate either.
+        expect(code < 0xdc00 || code > 0xdfff).toBe(true);
+      }
+    }
+    expect(text).toMatch(/\[truncated by debouncer\]$/);
+  });
 });
 
 // `parseTeamMembers` is the JSON-roundtrip gate between the

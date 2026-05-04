@@ -79,6 +79,25 @@ export interface BagetTelegramConfig {
 const COALESCED_TEXT_CAP = 16000;
 const COALESCED_TRUNCATION_SUFFIX = '\n…[truncated by debouncer]';
 
+/**
+ * Truncate a JS string to at most `len` UTF-16 code units WITHOUT splitting
+ * a surrogate pair. JavaScript strings index by code units; emoji and other
+ * non-BMP characters take two code units (a high+low surrogate pair). A
+ * naive `s.slice(0, len)` that lands between the two halves orphans the
+ * high surrogate, producing a `\uD800-\uDBFF` codepoint that crashes
+ * downstream JSON consumers or renders as `�`. If the cut would leave a
+ * high surrogate as the last character, back up one position so the pair
+ * stays intact (or both halves are dropped together).
+ */
+function safeSliceUtf16(s: string, len: number): string {
+  if (s.length <= len) return s;
+  // 0xD800..0xDBFF == high surrogate. Mask 0xFC00 isolates the top 6 bits.
+  if (len > 0 && (s.charCodeAt(len - 1) & 0xfc00) === 0xd800) {
+    return s.slice(0, len - 1);
+  }
+  return s.slice(0, len);
+}
+
 interface UpdateMessage {
   message_id: number;
   from?: { id: number; first_name?: string; username?: string };
@@ -610,7 +629,8 @@ function coalesceInboundMessages(messages: InboundMessage[]): InboundMessage {
   const joinedText =
     rawJoined.length <= COALESCED_TEXT_CAP
       ? rawJoined
-      : rawJoined.slice(0, COALESCED_TEXT_CAP - COALESCED_TRUNCATION_SUFFIX.length) + COALESCED_TRUNCATION_SUFFIX;
+      : safeSliceUtf16(rawJoined, COALESCED_TEXT_CAP - COALESCED_TRUNCATION_SUFFIX.length) +
+        COALESCED_TRUNCATION_SUFFIX;
 
   // Carry sender/senderId from the latest content if it's an object
   // shape. String content fallback (rare) just becomes the joined text.
