@@ -83,7 +83,6 @@ import {
   registerTelegramWebhook,
   sendBagetTelegramFarewell,
   sendBagetTelegramWelcome,
-  setBotDisplayName,
 } from './channels/baget-telegram-bind.js';
 import { log } from './log.js';
 import { getMessagingGroupsByAgentGroup } from './db/messaging-groups.js';
@@ -1163,7 +1162,7 @@ export function createBagetAdminServer(config: BagetAdminServerConfig): BagetAdm
     }
 
     // Resolve the (botToken, botUsername) pair to use for ALL
-    // outbound calls below — welcome message, setWebhook, setMyName.
+    // outbound calls below — welcome message + setWebhook.
     // `poolEntry === null` means we're on the legacy global-bot
     // path: use cfg.telegramBotToken + cfg.telegramBotUsername. Pool
     // path uses the per-company assigned values.
@@ -1175,9 +1174,7 @@ export function createBagetAdminServer(config: BagetAdminServerConfig): BagetAdm
     // `webhook_registered_at` gate). Best-effort: a Telegram outage
     // doesn't fail the bind because the founder can still type, the
     // chat is wired, and the webhook can be re-attempted on the next
-    // bind. The setMyName call is also best-effort — Telegram rate-
-    // limits to 1 change per minute per bot, so a re-bind in the
-    // same minute returns 429 (logged as warn, not propagated).
+    // bind.
     //
     // Skipped entirely on the global-bot fallback path (`!poolEntry`)
     // — that bot's webhook was set once via the curl in
@@ -1213,45 +1210,37 @@ export function createBagetAdminServer(config: BagetAdminServerConfig): BagetAdm
         }
       }
 
-      // Set the bot's display name to the company. Best-effort.
+      // Bot display-name: NOT touched at bind time.
       //
-      // Gate: only fire setMyName when this bind FRESHLY ASSIGNED a
-      // pool bot to this agent_group. Idempotent re-binds for the
-      // same (agent_group, bot) pair skip; recycled bots (released
-      // by a previous founder, freshly assigned to this one) DO
-      // fire setMyName because they're a fresh assignment for the
-      // new founder.
+      // Earlier design (deleted 2026-05-05): on fresh assignment we
+      // called setMyName with `${companyName} Team`. That broke the
+      // operator's BotFather-set names. The bind would FRESHLY assign
+      // a pool bot pre-named "Pied Piper - by Baget" via BotFather,
+      // then immediately rename it to "Platter Team" — losing the
+      // intentional generic name set by the operator and exposing the
+      // company name to the next founder recycled onto the same bot.
       //
-      // Why not gate on `webhook_registered_at`: that flag stays
-      // set across release/reassign by design (to avoid burning a
-      // setWebhook round-trip on a recycled bot whose URL contains
-      // the immutable username). Reusing it for setMyName would
-      // leave the previous founder's company name on the bot's
-      // Telegram profile when the bot is recycled — cross-tenant
-      // identity leak in the founder's chat list. Codex P1 catch.
+      // New posture: bot display-name + avatar are BOTH operator-owned.
+      // They get set ONCE via BotFather at seed time and stay there.
+      // The chat title in the founder's Telegram chat list is whatever
+      // the operator chose for that pool slot ("Pied Piper - by Baget",
+      // "Dunder Mifflin - by Baget", …) — not per-company.
       //
-      // Telegram has a per-bot daily quota for setMyName + a
-      // per-minute rate limit (returned as 429 → mapped to a
-      // separate `'telegram_rate_limited'` reason callers ignore).
-      // Gating on freshly-assigned keeps quota usage proportional
-      // to actual founder churn, not bind-call frequency.
-      if (poolEntryFreshlyAssigned) {
-        const nameResult = await setBotDisplayName({
-          botToken: poolEntry.bot_token_value,
-          displayName: `${companyName} Team`,
-          apiBaseUrl: config.telegramApiBaseUrl,
-          fetchImpl: config.telegramFetchImpl,
-        });
-        if (!nameResult.ok && nameResult.reason !== 'telegram_rate_limited') {
-          log.warn('Baget bind-telegram: setMyName failed (non-fatal)', {
-            agentGroupId,
-            botUsername: poolEntry.bot_username,
-            reason: nameResult.reason,
-            telegramErrorCode: nameResult.telegramErrorCode,
-            telegramDescription: nameResult.telegramDescription,
-          });
-        }
-      }
+      // The trade-off: founders with multiple companies see the same
+      // generic name across the bots they were assigned (e.g. "Pied
+      // Piper - by Baget" and "Dunder Mifflin - by Baget"), instead
+      // of a per-company "Platter Team" / "Wonder Team" split. This
+      // is a deliberate choice — the per-company rename only worked
+      // on a single-bot deployment where the bot truly served one
+      // founder. Once the pool is shared across founders, per-bind
+      // setMyName is a cross-tenant identity leak waiting to happen.
+      //
+      // The `companyName` is still surfaced to the founder via:
+      //   - The first welcome message ("Your <Company> team is ready")
+      //   - Every reply's persona prefix (e.g. "🧭 Raphaël (Platter):")
+      //   - The agent's `baget_get_company_overview` tool call
+      // — so the founder always knows which company they're talking to,
+      // just not via the chat title.
     }
 
     // 4. Welcome the founder. Best-effort — failure here doesn't
@@ -1335,9 +1324,13 @@ export function createBagetAdminServer(config: BagetAdminServerConfig): BagetAdm
    * The `wasFreshlyAssigned` flag in the success return is the
    * caller's signal for "did THIS call just stamp the
    * `assigned_agent_group_id` FK?" (true), vs reusing an existing
-   * assignment (false). The bind handler uses it to gate
-   * `setMyName` so recycled-bot reassignments DO re-set the
-   * Telegram display name (Codex P1).
+   * assignment (false). It used to gate a per-assignment setMyName
+   * call; that was removed (see the bind-handler comment block
+   * "Bot display-name: NOT touched at bind time") because the
+   * generic operator-set names are intentional. The flag is kept
+   * as part of the resolver's contract for future per-fresh-assign
+   * side-effects (e.g. logging, telemetry) and is read by the
+   * bind handler's setWebhook gate.
    *
    * Wraps `getBotPoolEntryByAgentGroup` + `assignNextAvailableBot`
    * with the precedence logic so the bind handler isn't littered
