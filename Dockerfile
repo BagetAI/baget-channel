@@ -87,7 +87,19 @@ RUN cd /app/container/agent-runner && bun install --production
 #
 # Add a converter here when the agent should be able to reach for it
 # without an `install_packages` round-trip + container rebuild.
-RUN cd /app/container/agent-runner && bun add --no-frozen-lockfile --production \
+# Note: do NOT pass --production to `bun add`. Bun's CLI silently
+# escalates `--production` to frozen-lockfile mode (intended for
+# `bun install` to enforce CI reproducibility), which directly
+# contradicts the inherent semantics of `bun add` (mutate the
+# lockfile to record the new dep). The explicit `--no-frozen-lockfile`
+# flag does NOT override this — bun resolves `--production` first,
+# locks the lockfile, then fails when it tries to record the new
+# entries. Build error was:
+#   "error: lockfile had changes, but lockfile is frozen"
+# The default `bun add` behavior already saves to `dependencies`
+# (vs `--save-dev`), so dropping `--production` is the correct
+# semantic anyway.
+RUN cd /app/container/agent-runner && bun add --no-frozen-lockfile \
       marked@^15.0.0 \
       md-to-pdf@^5.2.4 \
       turndown@^7.2.0
