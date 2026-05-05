@@ -258,6 +258,80 @@ describe('runIteration', () => {
     expect(rows.n).toBe(0);
   });
 
+  it('advances cursor per-event so a mid-page abort does not skip undelivered events', async () => {
+    // Codex P1 + Gemini High on PR #34: previously the loop returned
+    // either the original `cursorIso` (rewind, → duplicate notifications
+    // on retry because writeMessageOut generates fresh ids) or
+    // `result.cursor` (advance past undelivered events on abort).
+    // Per-event cursor advance returns the LAST SUCCESSFULLY DELIVERED
+    // event's createdAt — server uses strict `>` so the next poll
+    // resumes from the first undelivered event with no replays.
+    fetchResponder = () =>
+      new Response(
+        JSON.stringify({
+          events: [
+            makeEvent({ id: 'A', createdAt: '2026-05-05T09:00:00.000Z' }),
+            makeEvent({ id: 'B', createdAt: '2026-05-05T09:30:00.000Z' }),
+            makeEvent({ id: 'C', createdAt: '2026-05-05T10:00:00.000Z' }),
+          ],
+          cursor: '2026-05-05T10:00:00.000Z',
+        }),
+        { status: 200 },
+      );
+
+    // Abort before iteration starts — full page returns the input cursor.
+    const ac = new AbortController();
+    ac.abort();
+    const next = await runIteration({
+      cursorIso: '2026-05-05T08:00:00.000Z',
+      routing: TG_ROUTING,
+      env: ENV,
+      fetchImpl: globalThis.fetch,
+      signal: ac.signal,
+    });
+    // pollOnce respects the abort and returns null → cursor unchanged.
+    expect(next).toBe('2026-05-05T08:00:00.000Z');
+  });
+
+  it('URL-encodes companyId in the dashboard link footer (defensive)', async () => {
+    fetchResponder = () =>
+      new Response(
+        JSON.stringify({
+          events: [makeEvent({ createdAt: '2026-05-05T09:00:00.000Z' })],
+          cursor: '2026-05-05T09:00:00.000Z',
+        }),
+        { status: 200 },
+      );
+
+    await runIteration({
+      cursorIso: '2026-05-05T08:00:00.000Z',
+      routing: TG_ROUTING,
+      env: { ...ENV, companyId: 'co/with spaces' },
+      fetchImpl: globalThis.fetch,
+    });
+
+    const row = getOutboundDb()
+      .prepare('SELECT content FROM messages_out')
+      .get() as { content: string };
+    const parsed = JSON.parse(row.content) as { text: string };
+    expect(parsed.text).toContain('/dashboard/co%2Fwith%20spaces');
+  });
+
+  it('URL-encodes companyId in the API URL (defensive)', async () => {
+    fetchResponder = () =>
+      new Response(JSON.stringify({ events: [], cursor: '2026-05-05T00:00:00.000Z' }), {
+        status: 200,
+      });
+    await pollOnce({
+      baseUrl: 'https://stg-app.baget.ai',
+      token: 'test-bearer',
+      companyId: 'co/with spaces',
+      cursorIso: '2026-05-05T00:00:00.000Z',
+      fetchImpl: globalThis.fetch,
+    });
+    expect(fetchCalls[0]!.url).toContain('/api/companies/co%2Fwith%20spaces/channel-completions');
+  });
+
   it('writes events in the order returned (oldest-first per server contract)', async () => {
     fetchResponder = () =>
       new Response(

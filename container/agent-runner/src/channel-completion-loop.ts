@@ -100,7 +100,10 @@ function generateMessageId(): string {
 
 function dashboardLinkFor(appUrl: string, companyId: string): string {
   const trimmed = appUrl.endsWith('/') ? appUrl.slice(0, -1) : appUrl;
-  return `${trimmed}/dashboard/${companyId}`;
+  // companyId is a UUID in practice (no special chars), but defensive
+  // encoding here keeps the link well-formed if the provisioning ever
+  // produces an ID that needs escaping. Per Gemini Medium on PR #34.
+  return `${trimmed}/dashboard/${encodeURIComponent(companyId)}`;
 }
 
 /**
@@ -151,7 +154,7 @@ export async function pollOnce(args: {
 }): Promise<CompletionsResponse | null> {
   const { baseUrl, token, companyId, cursorIso, fetchImpl, signal } = args;
   const trimmed = baseUrl.endsWith('/') ? baseUrl.slice(0, -1) : baseUrl;
-  const url = `${trimmed}/api/companies/${companyId}/channel-completions?since=${encodeURIComponent(cursorIso)}&limit=${PAGE_LIMIT}`;
+  const url = `${trimmed}/api/companies/${encodeURIComponent(companyId)}/channel-completions?since=${encodeURIComponent(cursorIso)}&limit=${PAGE_LIMIT}`;
 
   let res: Response;
   try {
@@ -246,8 +249,34 @@ export async function runIteration(args: {
 
   const dashboardUrl = dashboardLinkFor(env.appUrl, env.companyId);
 
+  // Per-event cursor advance. Closes two review findings on PR #34:
+  //
+  //   - Gemini High: if writeMessageOut fails mid-page and we rewind
+  //     to `cursorIso`, the next iteration re-fetches the same page
+  //     and re-writes events that DID land — `generateMessageId()`
+  //     produces a fresh id every time, so the founder gets duplicate
+  //     Telegram pings. By advancing the cursor to the LAST
+  //     successful event, the next poll re-fetches starting from the
+  //     first event that didn't land — no replays of delivered ones.
+  //
+  //   - Codex P1: same logic for the abort path. If the parent signal
+  //     fires mid-page, the previous all-or-nothing return jumped
+  //     straight to `result.cursor` (advancing past undelivered
+  //     events); now we return the cursor at the last successful
+  //     event so the unwritten tail gets retried on restart.
+  //
+  // Server-side `>` comparison on `since` keeps duplicate delivery
+  // safe — re-polling at the last-successful timestamp returns events
+  // STRICTLY AFTER it.
+  let lastDeliveredCursor = cursorIso;
+
   for (const event of result.events) {
-    if (signal?.aborted) break;
+    if (signal?.aborted) {
+      // Abort mid-page: return the cursor we've actually delivered up
+      // to. Unwritten events sit ahead of this cursor and will be
+      // picked up on the next iteration after the loop restarts.
+      return lastDeliveredCursor;
+    }
     const text = composeCompletionText(event, dashboardUrl);
     try {
       writeMessageOut({
@@ -258,18 +287,21 @@ export async function runIteration(args: {
         thread_id: routing.thread_id,
         content: JSON.stringify({ text }),
       });
+      lastDeliveredCursor = event.createdAt;
     } catch (err) {
-      // A single SQLite hiccup must not poison the rest of the page.
-      // Log and continue; on the next poll we re-fetch from the same
-      // cursor and retry the failed event(s).
+      // A single SQLite hiccup shouldn't poison the rest of the page.
+      // Log and stop — cursor stays at the last successfully written
+      // event so the next poll re-fetches the failed event (and any
+      // tail behind it) without re-delivering already-delivered ones.
       log(`writeMessageOut failed: ${err instanceof Error ? err.message : String(err)}`);
-      // Stop processing this page so we don't advance past a missed
-      // event. Cursor stays at its previous value; the page will be
-      // re-fetched.
-      return cursorIso;
+      return lastDeliveredCursor;
     }
   }
 
+  // Whole page delivered. The server's `cursor` (latest event in the
+  // page) and our `lastDeliveredCursor` should agree at this point —
+  // prefer the server's value for forward-compat (e.g. server-side
+  // cursor includes a sub-second tiebreaker we don't track here).
   return result.cursor;
 }
 
