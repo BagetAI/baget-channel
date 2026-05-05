@@ -872,7 +872,7 @@ const setDirection: McpToolDefinition = {
       action: 'set-direction',
       payload: { direction },
       confirmed: args.confirmed === true,
-      summary: `Set the founder direction to: "${direction.slice(0, 120)}${direction.length > 120 ? '…' : ''}"`,
+      summary: `Set the founder direction to: "${direction.slice(0, 80)}${direction.length > 80 ? '…' : ''}"`,
     });
   },
 };
