@@ -31,6 +31,7 @@ import { buildSystemPromptAddendum } from './destinations.js';
 // Provider skills append imports to providers/index.ts.
 import './providers/index.js';
 import { createProvider, type ProviderName } from './providers/factory.js';
+import { runChannelCompletionLoop } from './channel-completion-loop.js';
 import { runPollLoop } from './poll-loop.js';
 import { buildProviderSystemInstructions } from './system-prompt.js';
 import { workspaceAgentDir, workspaceExtraDir } from './workspace-paths.js';
@@ -96,12 +97,21 @@ async function main(): Promise<void> {
     additionalDirectories: additionalDirectories.length > 0 ? additionalDirectories : undefined,
   });
 
-  await runPollLoop({
-    provider,
-    providerName,
-    cwd: workspaceAgentDir(),
-    systemContext: { instructions },
-  });
+  // Run the agent's message-processing loop alongside the
+  // channel-completion polling loop. The completion loop is a thin
+  // background poller that pings baget.ai and writes outbound
+  // notification messages — its failure modes are isolated (per-iteration
+  // try/catch inside the loop), so Promise.all here just gives us a
+  // single await with both lifecycles tied to the same process.
+  await Promise.all([
+    runPollLoop({
+      provider,
+      providerName,
+      cwd: workspaceAgentDir(),
+      systemContext: { instructions },
+    }),
+    runChannelCompletionLoop(),
+  ]);
 }
 
 main().catch((err) => {
