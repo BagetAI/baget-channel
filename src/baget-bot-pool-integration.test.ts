@@ -329,7 +329,14 @@ describe('handleBindTelegram — pool path', () => {
     server = null;
   });
 
-  it('assigns a pool bot, registers per-bot webhook + setMyName, sends welcome from the per-company token, and returns botUsername', async () => {
+  it('assigns a pool bot, registers per-bot webhook, sends welcome from the per-company token, returns botUsername — and does NOT call setMyName', async () => {
+    // 2026-05-05: removed bind-time `setMyName({name: "${company} Team"})`.
+    // The bot's display name is now operator-set via BotFather at
+    // seed time and stays put. See the bind handler comment block
+    // "Bot display-name: NOT touched at bind time" for the rationale.
+    // Test asserts the rename is NOT fired even when the route is
+    // reachable, so a future revert silently re-introducing the call
+    // breaks this test instead of breaking real founders' chat lists.
     seedBotPoolEntry({
       botUsername: 'acme_bot',
       botTokenValue: 'tok-acme-001',
@@ -337,6 +344,7 @@ describe('handleBindTelegram — pool path', () => {
       createdAt: new Date().toISOString(),
     });
 
+    let setMyNameCalls = 0;
     server = await startBindServer({
       publicBaseUrl: PUBLIC_BASE_URL,
       // Intentionally NO global token — this confirms pool > global
@@ -349,7 +357,10 @@ describe('handleBindTelegram — pool path', () => {
         },
         {
           match: (u) => u.endsWith('/setMyName'),
-          handler: () => okResponse({ ok: true, result: true }),
+          handler: () => {
+            setMyNameCalls++;
+            return okResponse({ ok: true, result: true });
+          },
         },
         {
           match: (u) => u.endsWith('/sendMessage'),
@@ -371,18 +382,21 @@ describe('handleBindTelegram — pool path', () => {
       botUsername: 'acme_bot',
     });
 
+    // Regression guard: the rename endpoint is wired in this fake
+    // Telegram, but the bind path must NOT have hit it.
+    expect(setMyNameCalls).toBe(0);
+
     const calls = server.fetchCalls();
-    // Order: setWebhook → setMyName → sendMessage. All routed through
+    // Order: setWebhook → sendMessage (welcome). All routed through
     // the per-company token (tok-acme-001), NOT the (absent) global.
     const tokens = calls.map((c) => /\/bot([^/]+)\//.exec(c.url)?.[1]);
-    expect(tokens).toEqual(['tok-acme-001', 'tok-acme-001', 'tok-acme-001']);
+    expect(tokens).toEqual(['tok-acme-001', 'tok-acme-001']);
     expect(calls[0]!.url).toContain('/setWebhook');
     expect((calls[0]!.body as Record<string, unknown>).url).toBe(
       `${PUBLIC_BASE_URL}/api/channels/telegram/bot/acme_bot/webhook`,
     );
     expect((calls[0]!.body as Record<string, unknown>).secret_token).toBe('sec-acme-001');
-    expect(calls[1]!.url).toContain('/setMyName');
-    expect((calls[1]!.body as Record<string, unknown>).name).toBe('Acme Team');
+    expect(calls[1]!.url).toContain('/sendMessage');
 
     // DB state: assignment landed, webhook_registered_at stamped.
     const entry = getBotPoolEntryByAgentGroup('ag-pool-bind');
@@ -467,12 +481,12 @@ describe('handleBindTelegram — pool path', () => {
     const r2 = await postBind(server.baseUrl);
     expect(r2.json.botUsername).toBe('acme_bot_re');
     // Second bind: webhook_registered_at is now set, so setWebhook
-    // is skipped. setMyName is ALSO skipped — we gate it on the
-    // first-bind flag (webhook_registered_at being null) to avoid
-    // burning Telegram's per-bot daily quota for setMyName on a
-    // re-pair storm. sendMessage fires every bind (welcome).
+    // is skipped. setMyName is NEVER called from the bind path
+    // (removed 2026-05-05 — operator-set names via BotFather are
+    // now permanent), so this counter stays 0 across both binds.
+    // sendMessage fires every bind (welcome).
     expect(setWebhookCalls).toBe(1);
-    expect(setMyNameCalls).toBe(1);
+    expect(setMyNameCalls).toBe(0);
     expect(sendMessageCalls).toBe(2);
 
     // The same bot still serves the same agent_group.
@@ -920,16 +934,24 @@ describe('disconnect releases the assigned bot back to the pool', () => {
     expect(dcJson.releasedBot).toBeNull();
   });
 
-  it('recycled bot reassignment re-fires setMyName for the new founder (Codex P1)', async () => {
-    // Codex P1: when a bot is released back to the pool,
-    // `webhook_registered_at` intentionally stays set (so the next
-    // assignment skips the redundant setWebhook). The previous gate
-    // on `!webhook_registered_at` for setMyName ALSO would have
-    // skipped — leaving the recycled bot showing the previous
-    // founder's company name in the new founder's chat. Cross-tenant
-    // identity leak in the Telegram UI. Pin the contract that a
-    // FRESH assignment (regardless of webhook state) DOES fire
-    // setMyName.
+  it('recycled bot reassignment does NOT call setMyName — operator-set name persists across founders', async () => {
+    // Original Codex P1 test (kept here for diff history): pinned
+    // that a recycled bot RE-fires setMyName so the previous founder's
+    // company name doesn't leak into the new founder's chat list.
+    //
+    // 2026-05-05 inversion: bind-time setMyName was removed entirely.
+    // The new posture is that bot display names are operator-owned
+    // (set once via BotFather at seed time, e.g. "Pied Piper - by
+    // Baget") and stay put across all assignments. That eliminates
+    // the cross-tenant identity-leak vector by construction — a
+    // recycled bot CANNOT show a previous founder's company name
+    // because it never had one to begin with. The chat title shows
+    // the same generic operator-set name to every founder who is
+    // ever assigned the bot.
+    //
+    // This test is the regression guard: assert setMyName is NEVER
+    // called, even across a recycle event where the OLD code would
+    // have called it for a fresh assignment.
     seedBotPoolEntry({
       botUsername: 'recycle_bot',
       botTokenValue: 'tok-recycle',
@@ -957,7 +979,7 @@ describe('disconnect releases the assigned bot back to the pool', () => {
       generateAgentGroupId: () => `ag-${setMyNameCalls.length}-${Math.random().toString(36).slice(2, 8)}`,
     });
 
-    // Founder A pairs Acme Co.
+    // Founder A pairs Acme Co — fresh assignment.
     const r1 = await postBind(server.baseUrl, {
       ...VALID_BIND_BODY,
       userId: 'u-acme',
@@ -966,11 +988,12 @@ describe('disconnect releases the assigned bot back to the pool', () => {
     });
     expect(r1.status).toBe(200);
     expect(r1.json.botUsername).toBe('recycle_bot');
-    expect(setMyNameCalls).toEqual([{ name: 'Acme Team' }]);
+    expect(setMyNameCalls).toEqual([]);
 
     // Founder A disconnects → bot returns to the pool with
     // `webhook_registered_at` PRESERVED (intentional optimization
-    // for re-registration skipping).
+    // for re-registration skipping). Same as before — the disconnect
+    // path is unchanged.
     await fetch(`${server.baseUrl}/baget/agent-groups`, {
       method: 'DELETE',
       headers: { Authorization: `Bearer ${ADMIN_TOKEN}`, 'Content-Type': 'application/json' },
@@ -978,7 +1001,7 @@ describe('disconnect releases the assigned bot back to the pool', () => {
     });
     const recycled = getBotPoolEntryByUsername('recycle_bot');
     expect(recycled?.status).toBe('available');
-    expect(recycled?.webhook_registered_at).toBeTruthy(); // preserved
+    expect(recycled?.webhook_registered_at).toBeTruthy();
 
     // Founder B pairs Bolt Co — gets the SAME (recycled) bot row.
     const r2 = await postBind(server.baseUrl, {
@@ -986,16 +1009,17 @@ describe('disconnect releases the assigned bot back to the pool', () => {
       userId: 'u-bolt',
       companyId: 'c-bolt',
       companyName: 'Bolt',
-      telegramUserId: 999000111, // different chat
+      telegramUserId: 999000111,
     });
     expect(r2.status).toBe(200);
-    expect(r2.json.botUsername).toBe('recycle_bot'); // same bot
+    expect(r2.json.botUsername).toBe('recycle_bot');
 
-    // Critical: setMyName fires AGAIN for the new company. The
-    // `webhook_registered_at`-based gate would have suppressed this.
-    // The fix gates on "freshly assigned" instead, which is true
-    // here (bot was released, then this bind picked it up).
-    expect(setMyNameCalls).toEqual([{ name: 'Acme Team' }, { name: 'Bolt Team' }]);
+    // Critical regression guard: setMyName MUST stay at zero calls.
+    // Both the fresh assignment for Acme AND the recycle assignment
+    // for Bolt skip the rename. A future revert that re-introduces
+    // bind-time setMyName breaks this test instead of breaking real
+    // founders' chat lists.
+    expect(setMyNameCalls).toEqual([]);
   });
 });
 
