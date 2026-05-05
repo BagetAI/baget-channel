@@ -279,7 +279,14 @@ async function dispatchApproval(args: {
           remaining: cost.remaining,
           tasksRemaining: cost.tasksRemaining,
         },
-        note: 'Tell the founder the summary + cost in PLAIN TEXT. Ask them to confirm by REPLYING WITH A WORD — "yes" / "go" / "approve" — or "no" / "cancel". DO NOT say "tap", "press", "click", "✅", or any phrasing that implies a button — there is no button on this surface, the founder confirms by typing a word. On their confirmation, call this same tool with `confirmed: true` and the IDENTICAL payload.',
+        note: [
+          'Tell the founder the summary + cost in PLAIN TEXT.',
+          'Ask them to confirm by REPLYING WITH A WORD — "yes" / "go" / "approve" — or "no" / "cancel".',
+          'DO NOT say "tap", "press", "click", "✅", or any phrasing that implies a button — there is no button on this surface, the founder confirms by typing a word.',
+          'You may set `confirmed: true` ONLY when the founder\'s NEXT message is a clear standalone confirmation word (yes / yeah / yep / go / ok / okay / approve / approved / confirmed / sure / do it). A REPEAT of the original action request (e.g. "launch the next batch" sent twice, "set direction to X" sent twice) is NOT a confirmation — treat it as the founder asking again, not approving the prior pending card. If you are unsure, ask explicitly: "To confirm, reply \'yes\' or \'go\'." Never auto-confirm on a duplicate or paraphrase of the original request.',
+          'Cost shape semantics — `amount` is the credits this single action will deduct; `remaining` is the founder\'s total credit balance; `tasksRemaining` is HOW MANY TASKS OF THIS COST THE BALANCE CAN AFFORD (a budget headroom number), NOT the count of tasks this action will run. Do NOT say "this includes N tasks" or "queues N tasks" — that misreads `tasksRemaining`. Phrase it as "you have headroom for ~N more tasks of this size" or just omit it.',
+          'On their confirmation, call this same tool with `confirmed: true` and the IDENTICAL payload.',
+        ].join(' '),
       }),
     );
   }
@@ -843,11 +850,16 @@ const setDirection: McpToolDefinition = {
   tool: {
     name: 'baget_set_direction',
     description:
-      'Save the founder\'s direction for the next batch. Use when the founder says "set direction to focus on X", "I want us to prioritize Y", "pivot toward Z". Direction-save does NOT plan a new batch by itself; the founder will say "launch the batch" separately. RUNS IMMEDIATELY (free). Distill founder intent into 1-2 clear sentences; don\'t echo verbatim.',
+      'Save the founder\'s direction for the next batch. Use when the founder says "set direction to focus on X", "I want us to prioritize Y", "pivot toward Z". Direction-save does NOT plan a new batch by itself; the founder will say "launch the batch" separately. APPROVAL-GATED — the channel surface confirms direction-set with the founder before persisting (no credit cost, but the direction shapes every subsequent batch and the founder should see what they\'re committing to). On first call set `confirmed: false` to surface the preview; on the founder\'s explicit confirmation word, call again with `confirmed: true` and the IDENTICAL payload. Distill founder intent into 1-2 clear sentences; don\'t echo verbatim.',
     inputSchema: {
       type: 'object',
       properties: {
         direction: { type: 'string', minLength: 1, maxLength: 2000 },
+        confirmed: {
+          type: 'boolean',
+          description:
+            'Default false (preview). Set true ONLY after the founder explicitly confirms with a word like "yes" / "go" / "approve". Repeating the original "set direction to X" message is NOT a confirmation.',
+        },
       },
       required: ['direction'],
       additionalProperties: false,
@@ -856,10 +868,11 @@ const setDirection: McpToolDefinition = {
   async handler(args) {
     const direction = String(args.direction ?? '').trim();
     if (!direction || direction.length > 2000) return fail('direction must be 1–2000 chars');
-    return dispatchDirect({
+    return dispatchApproval({
       action: 'set-direction',
       payload: { direction },
-      fallbackMessage: `Direction saved: ${direction.slice(0, 80)}.`,
+      confirmed: args.confirmed === true,
+      summary: `Set the founder direction to: "${direction.slice(0, 80)}${direction.length > 80 ? '…' : ''}"`,
     });
   },
 };
