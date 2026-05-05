@@ -237,6 +237,12 @@ export interface CreateAgentGroupResponse {
   folder: string;
   telegramDeepLink: string;
   pairingTokenExpiresAt: string;
+  /** Per-company bot username when this agent_group has a pool
+   *  assignment. Absent on legacy / global-fallback pairings. The
+   *  username segment in `telegramDeepLink` is always equal to this
+   *  when present. baget.ai surfaces it in the settings panel so the
+   *  founder sees their team's actual bot pre-pair. */
+  botUsername?: string;
 }
 
 /**
@@ -948,12 +954,83 @@ export function createBagetAdminServer(config: BagetAdminServerConfig): BagetAdm
     // 4. Opportunistic cleanup of expired tokens (fire and forget).
     sweepExpiredPairingTokens(new Date(now()).toISOString());
 
+    // 5. Resolve a pool bot for the deep link. The bind-telegram path
+    //    has done this since #21; the deep-link path was on the legacy
+    //    "global bot only" track until 2026-05-05 when Sam asked for
+    //    pool assignment here too. resolvePoolAssignment is idempotent
+    //    on the agent_group: re-creates after disconnect/re-pair stick
+    //    to the same pool slot, so the founder always sees the same
+    //    `@baget_team_xxx_bot_NNN` username.
+    //
+    //    `hadExistingChatBind` mirrors handleBindTelegram: the legacy
+    //    preservation branch in resolvePoolAssignment keeps a Vela-
+    //    style legacy pairing (existing chats, no pool entry, global
+    //    token configured) on the global bot. A re-create on Vela
+    //    would otherwise switch the founder to a fresh pool bot and
+    //    abandon their existing chat history. Per Gemini medium on
+    //    PR #37: read the actual bind count instead of hardcoding
+    //    false.
+    const preBindChatCount = countMessagingGroupBindings(agentGroupId);
+    const poolResult = resolvePoolAssignment(agentGroupId, preBindChatCount > 0);
+    if (poolResult === 'pool_exhausted') {
+      sendJson(res, 503, {
+        ok: false,
+        error: 'pool_exhausted',
+        message:
+          'No pool bot available and no global fallback configured. Seed more bots into the pool or set a global telegramBotToken.',
+      });
+      return;
+    }
+
+    // Register the per-bot webhook on a fresh assignment. Mirrors the
+    // handleBindTelegram block (see line ~1180) — Codex P1 on PR #37:
+    // without this, /start <token> arrives at a webhook that was
+    // never registered for the pool bot, so the deep-link path never
+    // completes the pairing. Best-effort: a Telegram outage doesn't
+    // fail the whole create call (the founder can retry; the next
+    // call will see `webhook_registered_at` still null and re-attempt).
+    if (poolResult && config.publicBaseUrl) {
+      const poolEntry = poolResult.row;
+      if (!poolEntry.webhook_registered_at) {
+        const webhookUrl = buildPerBotWebhookUrl({
+          publicBaseUrl: config.publicBaseUrl,
+          botUsername: poolEntry.bot_username,
+        });
+        const webhook = await registerTelegramWebhook({
+          botToken: poolEntry.bot_token_value,
+          webhookUrl,
+          webhookSecret: poolEntry.webhook_secret,
+          apiBaseUrl: config.telegramApiBaseUrl,
+          fetchImpl: config.telegramFetchImpl,
+        });
+        if (webhook.ok) {
+          markWebhookRegistered(poolEntry.bot_username, new Date(now()).toISOString());
+        } else {
+          // Same posture as bind-telegram: log and continue. A retry
+          // (founder asks again, dashboard refreshes) will re-attempt
+          // because `webhook_registered_at` stays NULL.
+          log.warn('Baget create-agent-group: setWebhook failed (will retry on next pair)', {
+            agentGroupId,
+            botUsername: poolEntry.bot_username,
+            reason: webhook.reason,
+            telegramErrorCode: webhook.telegramErrorCode,
+            telegramDescription: webhook.telegramDescription,
+          });
+        }
+      }
+    }
+
+    const deepLinkBotUsername = poolResult
+      ? poolResult.row.bot_username
+      : config.telegramBotUsername;
+
     const response: CreateAgentGroupResponse = {
       ok: true,
       agentGroupId,
       folder: provisioned.folder,
-      telegramDeepLink: `https://t.me/${config.telegramBotUsername}?start=${minted.rawToken}`,
+      telegramDeepLink: `https://t.me/${deepLinkBotUsername}?start=${minted.rawToken}`,
       pairingTokenExpiresAt: minted.expiresAt,
+      ...(poolResult ? { botUsername: poolResult.row.bot_username } : {}),
     };
     sendJson(res, 200, response);
   }
