@@ -229,6 +229,40 @@ function requireCompanyId(): { ok: true; companyId: string } | { ok: false; erro
   return { ok: true, companyId };
 }
 
+/**
+ * Build a `?key=value&key2=value2` query string from `args`, including
+ * only the keys that are defined and casting values to strings via
+ * `String(...)`.
+ *
+ * Why this helper exists: the Tier 2 read tools each had the same
+ * 5-line pattern — `new URLSearchParams()`, `if (args.x !== undefined)
+ * sp.set('x', String(args.x))` ×N, then `sp.toString()` — repeated
+ * across listContacts / exportContacts / listProspectSearches /
+ * getProspectSearchLeads / readAdMetrics. Gemini medium on PR #51
+ * flagged the dup. Centralizing here also gives us one place to add
+ * future query-string concerns (e.g., URL-length capping, key
+ * canonicalization) if they come up.
+ *
+ * Returns `'?key=value&...'` when at least one key is set, else `''`.
+ * The empty-string branch is important so callers can do
+ * `path: \`/api/.../foo${q}\`` without a trailing `?`.
+ *
+ * `defaults` are always-set pairs (e.g., `format: 'json'` for
+ * exportContacts). They go in first so `args` overrides them.
+ */
+function buildQueryString(
+  args: Record<string, unknown>,
+  keys: readonly string[],
+  defaults?: Record<string, string>,
+): string {
+  const sp = new URLSearchParams(defaults ?? {});
+  for (const key of keys) {
+    if (args[key] !== undefined) sp.set(key, String(args[key]));
+  }
+  const q = sp.toString();
+  return q ? `?${q}` : '';
+}
+
 // ── Action dispatch helpers ──────────────────────────────────────────────────
 
 /**
@@ -722,14 +756,10 @@ const listContacts: McpToolDefinition = {
   async handler(args) {
     const ctx = requireCompanyId();
     if (!ctx.ok) return fail(ctx.error);
-    const sp = new URLSearchParams();
-    if (args.cursor !== undefined) sp.set('cursor', String(args.cursor));
-    if (args.limit !== undefined) sp.set('limit', String(args.limit));
-    if (args.source !== undefined) sp.set('source', String(args.source));
-    const q = sp.toString();
+    const q = buildQueryString(args, ['cursor', 'limit', 'source']);
     const result = await bagetFetch({
       method: 'GET',
-      path: `/api/companies/${ctx.companyId}/contacts/list${q ? `?${q}` : ''}`,
+      path: `/api/companies/${ctx.companyId}/contacts/list${q}`,
     });
     if (!result.ok) return fail(`list_contacts failed: ${result.error}`);
     return ok(JSON.stringify(result.data, null, 2));
@@ -752,11 +782,10 @@ const exportContacts: McpToolDefinition = {
   async handler(args) {
     const ctx = requireCompanyId();
     if (!ctx.ok) return fail(ctx.error);
-    const sp = new URLSearchParams({ format: 'json' });
-    if (args.source !== undefined) sp.set('source', String(args.source));
+    const q = buildQueryString(args, ['source'], { format: 'json' });
     const result = await bagetFetch({
       method: 'GET',
-      path: `/api/companies/${ctx.companyId}/contacts/export?${sp.toString()}`,
+      path: `/api/companies/${ctx.companyId}/contacts/export${q}`,
     });
     if (!result.ok) return fail(`export_contacts failed: ${result.error}`);
     return ok(JSON.stringify(result.data, null, 2));
@@ -780,13 +809,10 @@ const listProspectSearches: McpToolDefinition = {
   async handler(args) {
     const ctx = requireCompanyId();
     if (!ctx.ok) return fail(ctx.error);
-    const sp = new URLSearchParams();
-    if (args.limit !== undefined) sp.set('limit', String(args.limit));
-    if (args.status !== undefined) sp.set('status', String(args.status));
-    const q = sp.toString();
+    const q = buildQueryString(args, ['limit', 'status']);
     const result = await bagetFetch({
       method: 'GET',
-      path: `/api/companies/${ctx.companyId}/prospect-searches${q ? `?${q}` : ''}`,
+      path: `/api/companies/${ctx.companyId}/prospect-searches${q}`,
     });
     if (!result.ok) return fail(`list_prospect_searches failed: ${result.error}`);
     return ok(JSON.stringify(result.data, null, 2));
@@ -815,14 +841,10 @@ const getProspectSearchLeads: McpToolDefinition = {
     if (!ctx.ok) return fail(ctx.error);
     const searchId = String(args.searchId ?? '').trim();
     if (!searchId) return fail('searchId is required');
-    const sp = new URLSearchParams();
-    if (args.cursor !== undefined) sp.set('cursor', String(args.cursor));
-    if (args.limit !== undefined) sp.set('limit', String(args.limit));
-    if (args.status !== undefined) sp.set('status', String(args.status));
-    const q = sp.toString();
+    const q = buildQueryString(args, ['cursor', 'limit', 'status']);
     const result = await bagetFetch({
       method: 'GET',
-      path: `/api/companies/${ctx.companyId}/prospect-searches/${encodeURIComponent(searchId)}/leads${q ? `?${q}` : ''}`,
+      path: `/api/companies/${ctx.companyId}/prospect-searches/${encodeURIComponent(searchId)}/leads${q}`,
     });
     if (!result.ok) return fail(`get_prospect_search_leads failed: ${result.error}`);
     return ok(JSON.stringify(result.data, null, 2));
@@ -865,13 +887,10 @@ const readAdMetrics: McpToolDefinition = {
   async handler(args) {
     const ctx = requireCompanyId();
     if (!ctx.ok) return fail(ctx.error);
-    const sp = new URLSearchParams();
-    if (args.since !== undefined) sp.set('since', String(args.since));
-    if (args.campaignId !== undefined) sp.set('campaignId', String(args.campaignId));
-    const q = sp.toString();
+    const q = buildQueryString(args, ['since', 'campaignId']);
     const result = await bagetFetch({
       method: 'GET',
-      path: `/api/companies/${ctx.companyId}/ad-metrics${q ? `?${q}` : ''}`,
+      path: `/api/companies/${ctx.companyId}/ad-metrics${q}`,
     });
     if (!result.ok) return fail(`read_ad_metrics failed: ${result.error}`);
     return ok(JSON.stringify(result.data, null, 2));
@@ -1749,14 +1768,15 @@ const updateRoadmapItem: McpToolDefinition = {
     },
   },
   async handler(args) {
-    const payload: Record<string, unknown> = { itemId: String(args.itemId) };
-    if (args.title !== undefined) payload.title = String(args.title);
-    if (args.description !== undefined) payload.description = String(args.description);
-    if (args.horizon !== undefined) payload.horizon = String(args.horizon);
-    if (args.targetMetric !== undefined) payload.targetMetric = args.targetMetric;
     return dispatchDirect({
       action: 'update-roadmap-item',
-      payload,
+      payload: {
+        itemId: String(args.itemId),
+        ...(args.title !== undefined ? { title: String(args.title) } : {}),
+        ...(args.description !== undefined ? { description: String(args.description) } : {}),
+        ...(args.horizon !== undefined ? { horizon: String(args.horizon) } : {}),
+        ...(args.targetMetric !== undefined ? { targetMetric: args.targetMetric } : {}),
+      },
       fallbackMessage: `Roadmap item updated.`,
     });
   },
