@@ -291,11 +291,18 @@ async function dispatchApproval(args: {
     // the callback_query just synthesizes a text "yes"/"cancel" the
     // model already knows how to interpret.
     const routing = resolveRouting(undefined);
-    if (
+    // Codex P1 on PR #40: the Baget Telegram adapter registers as
+    // `baget-telegram` (`BAGET_TELEGRAM_CHANNEL_TYPE` in
+    // src/channels/baget-telegram-bind.ts), so the host's
+    // session_routing carries `channel_type: 'baget-telegram'`. A
+    // bare `=== 'telegram'` guard never matches, so the direct-write
+    // branch never ran, so approval-card buttons never reached the
+    // founder. Accept both: 'telegram' (generic / non-Baget nanoclaw
+    // deployments) AND 'baget-telegram' (every Baget founder pairing).
+    const isTelegramChannel =
       'channel_type' in routing &&
-      routing.channel_type === 'telegram' &&
-      routing.platform_id
-    ) {
+      (routing.channel_type === 'telegram' || routing.channel_type === 'baget-telegram');
+    if (isTelegramChannel && routing.platform_id) {
       const costLine =
         cost.amount > 0
           ? `Cost: ${cost.amount} credits. You have ${cost.remaining} remaining.`

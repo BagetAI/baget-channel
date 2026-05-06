@@ -972,6 +972,23 @@ function buildAdapter(cfg: BagetTelegramConfig): ChannelAdapter {
     const platformId = platformIdFor(chatId);
     const mg = getMessagingGroupByPlatform(BAGET_TELEGRAM_CHANNEL_TYPE, platformId);
     const wired = mg ? getMessagingGroupAgents(mg.id) : [];
+
+    // SECURITY: refuse to act on a callback when the chat is in a
+    // multi-bind state. Same check as `deliver()` at line 787 — a chat
+    // with > 1 wired agent_group could let a tap on agent_group A's
+    // approval card synthesize a "yes" inbound for agent_group B's
+    // session, executing whatever pending action B had pending.
+    // Single-bind is enforced by the /start handler's UNIQUE constraint;
+    // this is the second-line check. Per Gemini Security HIGH on PR #40.
+    if (wired.length > 1) {
+      log.error('Baget telegram: refusing callback — chat has >1 wired agent_group', {
+        platformId,
+        mgId: mg?.id,
+        count: wired.length,
+        callbackQueryId: cb.id,
+      });
+      return;
+    }
     const agentGroupId = wired.length === 1 ? (wired[0]?.agent_group_id ?? null) : null;
     const resolvedBotToken =
       (agentGroupId && getBotPoolEntryByAgentGroup(agentGroupId)?.bot_token_value) || cfg.botToken;

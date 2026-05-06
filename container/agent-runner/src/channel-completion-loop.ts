@@ -233,7 +233,16 @@ export async function runIteration(args: {
   // hasn't published a routing row yet, or the session is bound to
   // something else, skip the poll entirely — no point fetching events
   // we can't deliver. Cursor stays put.
-  if (routing.channel_type !== 'telegram' || !routing.platform_id) {
+  //
+  // 2026-05-06 Bug #4 root cause: the Baget Telegram adapter registers
+  // under `channel_type: 'baget-telegram'` (BAGET_TELEGRAM_CHANNEL_TYPE
+  // in src/channels/baget-telegram-bind.ts), NOT plain `'telegram'`.
+  // The original guard `!== 'telegram'` ALWAYS skipped — which is why
+  // the completion ping never fired even after the worker redeploy
+  // landed. Accept both values.
+  const isTelegramChannel =
+    routing.channel_type === 'telegram' || routing.channel_type === 'baget-telegram';
+  if (!isTelegramChannel || !routing.platform_id) {
     return cursorIso;
   }
 
