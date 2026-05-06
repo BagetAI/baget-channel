@@ -697,6 +697,187 @@ const readDocument: McpToolDefinition = {
   },
 };
 
+// ── Tier 2 READ tools ───────────────────────────────────────────────────────
+//
+// Six new bearer-GET tools added by Tier 2 (apps/web PRs #471, #473,
+// #474). Each fronts a baget.ai bearer route that returns a chat-
+// budgeted projection — paginated/filterable for explore use, capped
+// for token-budget safety.
+
+const listContacts: McpToolDefinition = {
+  tool: {
+    name: 'baget_list_contacts',
+    description:
+      "Read the founder's contact list (people emailable for campaigns). Returns id, email, name, title, company, source, and createdAt for the most-recent contacts plus a totalCount. Default page 25, max 50 per call. Use BEFORE answering questions about contacts — \"how many people are on my list?\", \"who's on the contact list?\", \"is Jane Doe on it?\". Filter by `source` (\"manual\" / \"import\" / \"website_lead\" / \"prospect\") to narrow, e.g. \"only the manually-added contacts\". Pass `cursor` (the previous page's `nextCursor`) for older pages. NEVER hallucinate counts — call this first.",
+    inputSchema: {
+      type: 'object',
+      properties: {
+        cursor: { type: 'string', description: 'ISO 8601 createdAt of the previous page\'s OLDEST item; pass back the `pagination.nextCursor` from a prior response.' },
+        limit: { type: 'integer', minimum: 1, maximum: 50 },
+        source: { type: 'string', enum: ['manual', 'import', 'website_lead', 'prospect'] },
+      },
+      additionalProperties: false,
+    },
+  },
+  async handler(args) {
+    const ctx = requireCompanyId();
+    if (!ctx.ok) return fail(ctx.error);
+    const sp = new URLSearchParams();
+    if (args.cursor !== undefined) sp.set('cursor', String(args.cursor));
+    if (args.limit !== undefined) sp.set('limit', String(args.limit));
+    if (args.source !== undefined) sp.set('source', String(args.source));
+    const q = sp.toString();
+    const result = await bagetFetch({
+      method: 'GET',
+      path: `/api/companies/${ctx.companyId}/contacts/list${q ? `?${q}` : ''}`,
+    });
+    if (!result.ok) return fail(`list_contacts failed: ${result.error}`);
+    return ok(JSON.stringify(result.data, null, 2));
+  },
+};
+
+const exportContacts: McpToolDefinition = {
+  tool: {
+    name: 'baget_export_contacts',
+    description:
+      "Export the founder's full contact list (up to 5,000 rows) for downstream use — campaign target list, CRM import, manual review. Use when the founder says \"export my contacts\", \"give me the full list\", \"send me a CSV\". Returns JSON by default with a `cap` flag if the 5,000 limit was hit (warning: the response can be large). For chat exploration prefer `baget_list_contacts` (paginated, smaller). RUNS IMMEDIATELY (free). The dashboard's \"Export\" button uses the same endpoint.",
+    inputSchema: {
+      type: 'object',
+      properties: {
+        source: { type: 'string', enum: ['manual', 'import', 'website_lead', 'prospect'], description: 'Filter to a single source (optional).' },
+      },
+      additionalProperties: false,
+    },
+  },
+  async handler(args) {
+    const ctx = requireCompanyId();
+    if (!ctx.ok) return fail(ctx.error);
+    const sp = new URLSearchParams({ format: 'json' });
+    if (args.source !== undefined) sp.set('source', String(args.source));
+    const result = await bagetFetch({
+      method: 'GET',
+      path: `/api/companies/${ctx.companyId}/contacts/export?${sp.toString()}`,
+    });
+    if (!result.ok) return fail(`export_contacts failed: ${result.error}`);
+    return ok(JSON.stringify(result.data, null, 2));
+  },
+};
+
+const listProspectSearches: McpToolDefinition = {
+  tool: {
+    name: 'baget_list_prospect_searches',
+    description:
+      "Read the founder's prospect-search history — searches the marketing agent ran (or the founder kicked off via baget_create_prospect_search). Returns id, name, query, status, discoveredCount, importedCount, creditsUsed, and timestamps. Use BEFORE proposing a NEW search if the founder might already have a recent one for the same intent (\"didn't we already look at Series A founders in NYC last week?\"). Default 20 most recent; cap 50. Filter by `status` (\"pending\" / \"running\" / \"completed\" / \"failed\") to narrow.",
+    inputSchema: {
+      type: 'object',
+      properties: {
+        limit: { type: 'integer', minimum: 1, maximum: 50 },
+        status: { type: 'string', enum: ['pending', 'running', 'completed', 'failed'] },
+      },
+      additionalProperties: false,
+    },
+  },
+  async handler(args) {
+    const ctx = requireCompanyId();
+    if (!ctx.ok) return fail(ctx.error);
+    const sp = new URLSearchParams();
+    if (args.limit !== undefined) sp.set('limit', String(args.limit));
+    if (args.status !== undefined) sp.set('status', String(args.status));
+    const q = sp.toString();
+    const result = await bagetFetch({
+      method: 'GET',
+      path: `/api/companies/${ctx.companyId}/prospect-searches${q ? `?${q}` : ''}`,
+    });
+    if (!result.ok) return fail(`list_prospect_searches failed: ${result.error}`);
+    return ok(JSON.stringify(result.data, null, 2));
+  },
+};
+
+const getProspectSearchLeads: McpToolDefinition = {
+  tool: {
+    name: 'baget_get_prospect_search_leads',
+    description:
+      'Read the leads from a SPECIFIC prospect search — names, titles, companies, locations, LinkedIn URLs, and (where revealed) emails. Use AFTER `baget_list_prospect_searches` when the founder asks "show me a few from that search" / "who did we find?" / "what kind of people are on the list?". Page 25, cap 50. UNREVEALED leads have `email: null` — use `baget_reveal_prospect` (approval-gated, 1 credit each) to fetch emails. Filter by `status` ("discovered" / "revealing" / "revealed" / "failed") to narrow.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        searchId: { type: 'string', format: 'uuid', description: 'UUID from baget_list_prospect_searches.' },
+        cursor: { type: 'string', description: 'ISO 8601 createdAt of the previous page\'s OLDEST lead.' },
+        limit: { type: 'integer', minimum: 1, maximum: 50 },
+        status: { type: 'string', enum: ['discovered', 'revealing', 'revealed', 'failed'] },
+      },
+      required: ['searchId'],
+      additionalProperties: false,
+    },
+  },
+  async handler(args) {
+    const ctx = requireCompanyId();
+    if (!ctx.ok) return fail(ctx.error);
+    const searchId = String(args.searchId ?? '').trim();
+    if (!searchId) return fail('searchId is required');
+    const sp = new URLSearchParams();
+    if (args.cursor !== undefined) sp.set('cursor', String(args.cursor));
+    if (args.limit !== undefined) sp.set('limit', String(args.limit));
+    if (args.status !== undefined) sp.set('status', String(args.status));
+    const q = sp.toString();
+    const result = await bagetFetch({
+      method: 'GET',
+      path: `/api/companies/${ctx.companyId}/prospect-searches/${encodeURIComponent(searchId)}/leads${q ? `?${q}` : ''}`,
+    });
+    if (!result.ok) return fail(`get_prospect_search_leads failed: ${result.error}`);
+    return ok(JSON.stringify(result.data, null, 2));
+  },
+};
+
+const readRoadmap: McpToolDefinition = {
+  tool: {
+    name: 'baget_read_roadmap',
+    description:
+      "Read the founder's strategic roadmap — short_term / mid_term / long_term goals with titles, target metrics, and current progress. Use BEFORE answering strategic questions — \"what's our plan?\", \"what are we focused on?\", \"how are we tracking against the goals?\", \"what's the long-term vision?\". Returns the active (non-archived) items only. If the company has no roadmap yet, `roadmap` will be `null` and all horizon arrays will be empty — say so honestly and offer to help generate one (the worker handles roadmap generation today, so direct the founder to the dashboard's roadmap modal).",
+    inputSchema: { type: 'object', properties: {}, additionalProperties: false },
+  },
+  async handler() {
+    const ctx = requireCompanyId();
+    if (!ctx.ok) return fail(ctx.error);
+    const result = await bagetFetch({
+      method: 'GET',
+      path: `/api/companies/${ctx.companyId}/roadmap-summary`,
+    });
+    if (!result.ok) return fail(`read_roadmap failed: ${result.error}`);
+    return ok(JSON.stringify(result.data, null, 2));
+  },
+};
+
+const readAdMetrics: McpToolDefinition = {
+  tool: {
+    name: 'baget_read_ad_metrics',
+    description:
+      "Read Meta-ad campaign performance — total spend, impressions, clicks, conversions, CTR, CPC across the founder's launched campaigns. Use BEFORE answering ad questions — \"how are my ads doing?\", \"how much have I spent?\", \"is the launch ad converting?\", \"what's the CTR?\". Returns a cross-campaign `summary` plus per-campaign `totals` + per-day `daily` breakdown. Default lookback: last 30 days, cap 90 days (Apollo API quota). Pass `campaignId` to drill into one campaign. If `campaigns` is empty, the founder hasn't launched ads yet — say so honestly. NEVER hallucinate spend numbers.",
+    inputSchema: {
+      type: 'object',
+      properties: {
+        since: { type: 'string', description: 'ISO 8601 lookback start; defaults to 30 days ago, capped at 90 days back.' },
+        campaignId: { type: 'string', format: 'uuid', description: 'Optional UUID to scope to a single campaign.' },
+      },
+      additionalProperties: false,
+    },
+  },
+  async handler(args) {
+    const ctx = requireCompanyId();
+    if (!ctx.ok) return fail(ctx.error);
+    const sp = new URLSearchParams();
+    if (args.since !== undefined) sp.set('since', String(args.since));
+    if (args.campaignId !== undefined) sp.set('campaignId', String(args.campaignId));
+    const q = sp.toString();
+    const result = await bagetFetch({
+      method: 'GET',
+      path: `/api/companies/${ctx.companyId}/ad-metrics${q ? `?${q}` : ''}`,
+    });
+    if (!result.ok) return fail(`read_ad_metrics failed: ${result.error}`);
+    return ok(JSON.stringify(result.data, null, 2));
+  },
+};
+
 // ── FILE TRANSFER tool ──────────────────────────────────────────────────────
 
 /**
@@ -1380,6 +1561,250 @@ const resumeAd: McpToolDefinition = {
   },
 };
 
+// ── Tier 2 WRITE tools (direct) ─────────────────────────────────────────────
+//
+// Seven new direct (no approval card) write tools added by Tier 2
+// (apps/web PRs #470, #472, #473, #475). Each fans through
+// /approval/execute on the same channel-action substrate as the
+// existing direct writes (set-direction, update-metric, etc.).
+//
+// All seven are intentionally NOT approval-gated:
+//   - add_contact: free, reversible, high-frequency.
+//   - create/preview/pause/resume_campaign: drafts/state toggles —
+//     the actual money-spending gate is on send_campaign (Tier 1,
+//     approval-gated).
+//   - update_roadmap_item: low-risk edits, founder undoes from
+//     dashboard if wrong.
+//   - create_prospect_search: Apollo SEARCHES are free (only reveals
+//     deduct credits, via baget_reveal_prospect). The plan's
+//     "approval-gated" annotation was based on a misread of Apollo's
+//     pricing model — see apps/web/src/lib/founder-chat/search-prospects.ts
+//     for the full rationale.
+
+const addContact: McpToolDefinition = {
+  tool: {
+    name: 'baget_add_contact',
+    description:
+      'Add a single contact (email + optional name/title/company) to the founder\'s contact list. Use when the founder says "add jane@acme.com", "save Bob from Acme — bob@acme.com, CEO", "I met Sarah, her email is sarah@x.com — add her to the list". RUNS IMMEDIATELY (free). The (companyId, email) UNIQUE INDEX is the natural dedup contract — a second call with the same email REFRESHES name/title/companyName but does NOT duplicate the row. Email is normalized (lowercased + trimmed) before insert. Source is recorded as "manual".',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        email: { type: 'string', minLength: 3, maxLength: 320, description: 'Email address; gets lowercased + trimmed.' },
+        name: { type: 'string', maxLength: 200, description: 'Display name (e.g., "Sam Founder").' },
+        title: { type: 'string', maxLength: 200, description: 'Job title (e.g., "CEO", "VP Eng").' },
+        companyName: { type: 'string', maxLength: 200, description: 'Employer (e.g., "Acme Inc.").' },
+      },
+      required: ['email'],
+      additionalProperties: false,
+    },
+  },
+  async handler(args) {
+    return dispatchDirect({
+      action: 'add-contact',
+      payload: {
+        email: String(args.email),
+        ...(args.name !== undefined ? { name: String(args.name) } : {}),
+        ...(args.title !== undefined ? { title: String(args.title) } : {}),
+        ...(args.companyName !== undefined ? { companyName: String(args.companyName) } : {}),
+      },
+      fallbackMessage: `Contact added.`,
+    });
+  },
+};
+
+const createCampaign: McpToolDefinition = {
+  tool: {
+    name: 'baget_create_campaign',
+    description:
+      'Create a DRAFT email campaign — name + subject template + body template. Use when the founder says "draft a welcome email to all contacts", "make a campaign for the Series A announcement", "write a re-engagement email to the manual leads". Templates use Mustache-lite `{{ name }}`, `{{ email }}`, `{{ title }}`, `{{ company }}` interpolation against each recipient. RUNS IMMEDIATELY (free) — creates the draft only. Founder iterates with `baget_preview_campaign` then sends with `baget_send_campaign` (approval-gated, the actual money-spending gate).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        name: { type: 'string', minLength: 1, maxLength: 200, description: 'Founder-facing label (e.g., "Welcome to Baget", "Series A announcement").' },
+        subjectTemplate: { type: 'string', minLength: 1, maxLength: 500, description: 'Subject line with optional {{ var }} interpolation.' },
+        bodyTemplate: { type: 'string', minLength: 1, maxLength: 50000, description: 'Body text with optional {{ var }} interpolation.' },
+        segment: {
+          type: 'string',
+          enum: ['all', 'opted_in', 'source:manual', 'source:import', 'source:website_lead', 'source:prospect'],
+          description: 'Recipient segment. Default "all". Use "source:manual" / "source:import" / etc. to target a specific origin.',
+        },
+      },
+      required: ['name', 'subjectTemplate', 'bodyTemplate'],
+      additionalProperties: false,
+    },
+  },
+  async handler(args) {
+    return dispatchDirect({
+      action: 'create-campaign',
+      payload: {
+        name: String(args.name),
+        subjectTemplate: String(args.subjectTemplate),
+        bodyTemplate: String(args.bodyTemplate),
+        ...(args.segment !== undefined ? { segment: String(args.segment) } : {}),
+      },
+      fallbackMessage: `Draft campaign created.`,
+    });
+  },
+};
+
+const previewCampaign: McpToolDefinition = {
+  tool: {
+    name: 'baget_preview_campaign',
+    description:
+      'Render the FIRST recipient\'s subject + body for a draft email campaign — sanity check before sending. Use when the founder says "show me what the email looks like", "preview the campaign", "render the welcome email for the first contact". Returns the rendered text WITH variable interpolation against the first recipient (alphabetical by email). If the segment has zero recipients, uses placeholder vars ([Sample Person] etc.). FLAGS missing merge fields (template references {{ unknownField }} but recipients don\'t provide it) so the founder can spot template bugs before send. RUNS IMMEDIATELY (free, read-only — no DB writes).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        campaignId: {
+          type: 'string',
+          format: 'uuid',
+          description: 'UUID of the campaign to preview. Resolve from `baget_create_campaign`\'s response (the campaign id is in the activity log) or by listing campaigns from the dashboard.',
+        },
+      },
+      required: ['campaignId'],
+      additionalProperties: false,
+    },
+  },
+  async handler(args) {
+    return dispatchDirect({
+      action: 'preview-campaign',
+      payload: { campaignId: String(args.campaignId) },
+      fallbackMessage: `Campaign preview rendered.`,
+    });
+  },
+};
+
+const pauseCampaign: McpToolDefinition = {
+  tool: {
+    name: 'baget_pause_campaign',
+    description:
+      'Pause a scheduled or actively-sending email campaign — stops further deliveries until resumed. Use when the founder says "pause the campaign", "stop the welcome series mid-flight", "halt the announcement". RUNS IMMEDIATELY (free). Status transitions: scheduled → paused, sending → paused. If the campaign is in any other state (draft / sent / cancelled / paused), returns a precise message ("can\'t pause a draft" / "already paused" / "already finished sending") so you know the action didn\'t take effect.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        campaignId: { type: 'string', format: 'uuid', description: 'UUID of the campaign to pause.' },
+      },
+      required: ['campaignId'],
+      additionalProperties: false,
+    },
+  },
+  async handler(args) {
+    return dispatchDirect({
+      action: 'pause-campaign',
+      payload: { campaignId: String(args.campaignId) },
+      fallbackMessage: `Campaign paused.`,
+    });
+  },
+};
+
+const resumeCampaign: McpToolDefinition = {
+  tool: {
+    name: 'baget_resume_campaign',
+    description:
+      'Resume a paused email campaign — flips status back to scheduled so deliveries continue. Use when the founder says "resume the campaign", "unpause it", "send the rest". RUNS IMMEDIATELY (free). Status transition: paused → scheduled. If the campaign is in any other state, returns a precise message ("already scheduled" / "already sending" / "already finished sending" / etc.) so you know the action didn\'t take effect.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        campaignId: { type: 'string', format: 'uuid', description: 'UUID of the campaign to resume.' },
+      },
+      required: ['campaignId'],
+      additionalProperties: false,
+    },
+  },
+  async handler(args) {
+    return dispatchDirect({
+      action: 'resume-campaign',
+      payload: { campaignId: String(args.campaignId) },
+      fallbackMessage: `Campaign resumed.`,
+    });
+  },
+};
+
+const updateRoadmapItem: McpToolDefinition = {
+  tool: {
+    name: 'baget_update_roadmap_item',
+    description:
+      'Edit a roadmap item — change title, description, horizon, or target metric. Use when the founder says "change the title of that goal", "move it to mid_term", "the target should be 1000 not 500", "rename it". Pass at least one of title/description/horizon/targetMetric. RUNS IMMEDIATELY (free). If the item was archived (e.g., by a Regenerate), returns a "was archived" message so you re-read the roadmap. Resolve `itemId` from `baget_read_roadmap` first; never guess UUIDs.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        itemId: { type: 'string', format: 'uuid', description: 'UUID of the roadmap item; resolve via baget_read_roadmap.' },
+        title: { type: 'string', minLength: 1, maxLength: 200 },
+        description: { type: 'string', maxLength: 4000, description: 'Empty string clears the description.' },
+        horizon: { type: 'string', enum: ['short_term', 'mid_term', 'long_term'] },
+        targetMetric: {
+          type: 'object',
+          properties: {
+            name: { type: 'string', minLength: 1, maxLength: 80 },
+            target: { type: 'number' },
+            unit: { type: 'string', minLength: 1, maxLength: 24 },
+          },
+          required: ['name', 'target', 'unit'],
+          additionalProperties: false,
+          description: 'Structured measurable goal (e.g., { name: "MRR", target: 10000, unit: "$" }).',
+        },
+      },
+      required: ['itemId'],
+      additionalProperties: false,
+    },
+  },
+  async handler(args) {
+    const payload: Record<string, unknown> = { itemId: String(args.itemId) };
+    if (args.title !== undefined) payload.title = String(args.title);
+    if (args.description !== undefined) payload.description = String(args.description);
+    if (args.horizon !== undefined) payload.horizon = String(args.horizon);
+    if (args.targetMetric !== undefined) payload.targetMetric = args.targetMetric;
+    return dispatchDirect({
+      action: 'update-roadmap-item',
+      payload,
+      fallbackMessage: `Roadmap item updated.`,
+    });
+  },
+};
+
+const createProspectSearch: McpToolDefinition = {
+  tool: {
+    name: 'baget_create_prospect_search',
+    description:
+      'Run a NEW Apollo prospect search — discover people matching the founder\'s ICP filters (titles, seniorities, locations, company size, etc.). Use when the founder says "find me Series A founders in NYC", "look up CEOs at companies with 50-200 employees in healthcare", "search for VPs of Engineering at SaaS companies". RUNS IMMEDIATELY (free — Apollo SEARCHES are 0 credits; reveals are 1 credit each via `baget_reveal_prospect`). Cap 500 leads per search. Provide AT LEAST ONE filter or the search is rejected (an empty query would return Apollo\'s entire database — useless and slow). Optional `name` for the dashboard label; defaults to a derived label from the filters.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        query: {
+          type: 'object',
+          properties: {
+            person_titles: { type: 'array', items: { type: 'string', minLength: 1, maxLength: 100 }, maxItems: 20, description: 'Job titles to match. e.g., ["CEO", "Founder", "Co-Founder"].' },
+            person_seniorities: { type: 'array', items: { type: 'string', minLength: 1, maxLength: 40 }, maxItems: 10, description: 'Seniorities. e.g., ["c_suite", "founder", "vp"].' },
+            person_locations: { type: 'array', items: { type: 'string', minLength: 1, maxLength: 120 }, maxItems: 20, description: 'Person locations. e.g., ["United States", "California, US"].' },
+            organization_num_employees_ranges: { type: 'array', items: { type: 'string', minLength: 1, maxLength: 40 }, maxItems: 10, description: 'Org size buckets. e.g., ["11,50", "51,200"].' },
+            organization_locations: { type: 'array', items: { type: 'string', minLength: 1, maxLength: 120 }, maxItems: 20 },
+            q_organization_domains_list: { type: 'array', items: { type: 'string', minLength: 1, maxLength: 253 }, maxItems: 50, description: 'Specific company domains. e.g., ["stripe.com"].' },
+            q_organization_keyword_tags: { type: 'array', items: { type: 'string', minLength: 1, maxLength: 80 }, maxItems: 20, description: 'Industry keywords. e.g., ["fintech", "saas"].' },
+            contact_email_status: { type: 'array', items: { type: 'string', minLength: 1, maxLength: 40 }, maxItems: 10 },
+            page: { type: 'integer', minimum: 1, maximum: 50 },
+            per_page: { type: 'integer', minimum: 1, maximum: 100 },
+          },
+          additionalProperties: false,
+          description: 'Apollo filter object. At least ONE filter required.',
+        },
+        name: { type: 'string', minLength: 1, maxLength: 120, description: 'Optional dashboard label for the search.' },
+      },
+      required: ['query'],
+      additionalProperties: false,
+    },
+  },
+  async handler(args) {
+    return dispatchDirect({
+      action: 'create-prospect-search',
+      payload: {
+        query: args.query as Record<string, unknown>,
+        ...(args.name !== undefined ? { name: String(args.name) } : {}),
+      },
+      fallbackMessage: `Prospect search complete.`,
+    });
+  },
+};
+
 // ── WRITE tools (approval-gated) ─────────────────────────────────────────────
 
 const runTask: McpToolDefinition = {
@@ -1526,18 +1951,25 @@ const sendCampaign: McpToolDefinition = {
 // ── Register ─────────────────────────────────────────────────────────────────
 
 registerTools([
-  // Read
+  // Read (existing)
   getCompanyOverview,
   queryMetrics,
   getCredits,
   listRecentActivity,
   listDocuments,
   readDocument,
+  // Read — Tier 2
+  listContacts,
+  exportContacts,
+  listProspectSearches,
+  getProspectSearchLeads,
+  readRoadmap,
+  readAdMetrics,
   // File transfer
   sendDocumentFile,
   // Generate
   generateImage,
-  // Write — direct
+  // Write — direct (existing)
   setDirection,
   updateMetric,
   archiveMetric,
@@ -1550,6 +1982,14 @@ registerTools([
   rejectPending,
   pauseAd,
   resumeAd,
+  // Write — direct (Tier 2)
+  addContact,
+  createCampaign,
+  previewCampaign,
+  pauseCampaign,
+  resumeCampaign,
+  updateRoadmapItem,
+  createProspectSearch,
   // Write — approval-gated
   launchBatch,
   runTask,
@@ -1559,5 +1999,5 @@ registerTools([
 ]);
 
 log(
-  'baget MCP tools registered: 6 read + 1 file-transfer + 1 generate + 12 direct write + 5 approval-gated = 25 total',
+  'baget MCP tools registered: 12 read + 1 file-transfer + 1 generate + 19 direct write + 5 approval-gated = 38 total (Tier 2: +6 read +7 direct write)',
 );
