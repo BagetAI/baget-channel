@@ -1358,7 +1358,7 @@ const runTask: McpToolDefinition = {
         taskId: {
           type: 'string',
           format: 'uuid',
-          description: 'The UUID of the task to run. Get this from list_recent_activity or the founder\'s explicit reference.',
+          description: 'The UUID of the task to run. Sources, in order of preference: (a) the `[taskId=<uuid>]` suffix in the most recent baget_add_task response (when the founder JUST asked to add and now wants to run it — no extra calls needed), or (b) baget_get_company_overview which returns `tasks: [{ id, title, agentRole, status }]`. DO NOT use baget_list_recent_activity — it returns activity_log row IDs, NOT task IDs.',
         },
         confirmed: {
           type: 'boolean',
