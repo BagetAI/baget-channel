@@ -249,18 +249,61 @@ async function dispatchDirect(args: { action: string; payload: Record<string, un
 // approval-gated action (run-task, launch-batch, edit-document,
 // reveal-prospect, send-campaign) was therefore unrunnable end-to-end.
 //
-// Cache keyed by `companyId|action|JSON(payload)`. The LLM is
-// instructed to pass the IDENTICAL payload on confirmed:true, so
-// the cache hits. TTL is 5 min (matches the approval-request
-// expiry); cleanup happens lazily on lookup. Process-local Map is
-// fine — the agent-runner is single-process per company.
+// Cache keyed by `companyId|action|<canonical payload>`. The LLM
+// is instructed to pass the IDENTICAL payload on confirmed:true,
+// so the cache hits. TTL is 5 min (matches the approval-request
+// expiry).
+//
+// Hardening (Gemini medium on PR #44):
+//   1. **Memory leak fix**: every read/write sweeps expired entries
+//      so a series of preview-only / no-tap calls (e.g. founder
+//      dismisses the card, network drop) can't grow the Map
+//      unbounded over a long-running process. Sweep is O(N) but N
+//      is bounded by founder activity (5-min TTL × concurrent
+//      agents = ~tens at most), and only fires on cache touch, not
+//      on a timer — keeps the agent-runner deterministic.
+//   2. **Canonical key fix**: `JSON.stringify` order depends on
+//      object construction order. The LLM nominally sends the
+//      identical payload, but defense-in-depth: serialize via a
+//      sorted-key replacer so `{a:1, b:2}` and `{b:2, a:1}` map to
+//      the same cache slot.
+//
+// Process-local Map is safe — agent-runner is single-process per
+// company, container restart loses pending approvals (founder
+// re-issues the request; 5-min TTL was already a soft contract).
 interface PendingApproval {
   requestId: string;
   expiresAtMs: number;
 }
 const pendingApprovals = new Map<string, PendingApproval>();
+
+function canonicalizePayload(payload: Record<string, unknown>): string {
+  // Sorted-key serialization. Recurse into nested objects so
+  // `{outer: {b:2, a:1}}` and `{outer: {a:1, b:2}}` produce the
+  // same string. Arrays preserve order (semantically meaningful).
+  const sortKeys = (value: unknown): unknown => {
+    if (Array.isArray(value)) return value.map(sortKeys);
+    if (value !== null && typeof value === 'object') {
+      const sorted: Record<string, unknown> = {};
+      for (const k of Object.keys(value as Record<string, unknown>).sort()) {
+        sorted[k] = sortKeys((value as Record<string, unknown>)[k]);
+      }
+      return sorted;
+    }
+    return value;
+  };
+  return JSON.stringify(sortKeys(payload));
+}
+
 function approvalCacheKey(companyId: string, action: string, payload: Record<string, unknown>): string {
-  return `${companyId}|${action}|${JSON.stringify(payload)}`;
+  return `${companyId}|${action}|${canonicalizePayload(payload)}`;
+}
+
+function sweepExpiredApprovals(): void {
+  const now = Date.now();
+  for (const [key, entry] of pendingApprovals) {
+    if (entry.expiresAtMs < now) pendingApprovals.delete(key);
+  }
 }
 
 async function dispatchApproval(args: {
@@ -273,6 +316,10 @@ async function dispatchApproval(args: {
   if (!ctx.ok) return fail(ctx.error);
 
   const cacheKey = approvalCacheKey(ctx.companyId, args.action, args.payload);
+  // Lazy sweep — every dispatch touch clears expired entries. Cheap
+  // (O(N) over a short list) and avoids needing a separate timer
+  // that would have its own lifecycle in the runtime.
+  sweepExpiredApprovals();
 
   if (!args.confirmed) {
     // Cost preview — show the founder what they'd be approving.
