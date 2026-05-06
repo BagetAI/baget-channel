@@ -993,6 +993,49 @@ function buildAdapter(cfg: BagetTelegramConfig): ChannelAdapter {
   }
 
   /**
+   * Phase 4 v0.2 — strip the inline keyboard off an approval card
+   * after the founder taps a button. Sam 2026-05-06: tapping ✅ left
+   * the card looking unchanged so the founder didn't know the tap
+   * registered AND could re-tap (each re-tap synth's another "yes"
+   * inbound, looping the agent). Calling `editMessageReplyMarkup`
+   * with an empty `reply_markup` removes the keyboard. Telegram
+   * preserves the original message text, so the founder still sees
+   * "Run this task — Cost: 65 credits" + the toast confirmation
+   * but the tappable buttons are gone.
+   *
+   * Best-effort: a Telegram outage just leaves the buttons in place
+   * (founder sees the agent's text reply as the next signal). Don't
+   * fail the synth-inbound path on this.
+   */
+  async function stripInlineKeyboard(
+    chatId: number,
+    messageId: number,
+    botToken: string,
+  ): Promise<void> {
+    const url = `${apiBase}/bot${botToken}/editMessageReplyMarkup`;
+    try {
+      await fetchFn(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          chat_id: chatId,
+          message_id: messageId,
+          // Empty inline_keyboard array removes the keyboard. Sending
+          // `reply_markup: null` doesn't work on every Telegram client
+          // version — the empty-keyboard form is the documented way.
+          reply_markup: { inline_keyboard: [] },
+        }),
+      });
+    } catch (err) {
+      log.warn('Baget telegram: stripInlineKeyboard failed (buttons stay clickable)', {
+        err,
+        chatId,
+        messageId,
+      });
+    }
+  }
+
+  /**
    * Phase 4 v0.1 — turn an inline-keyboard tap into a synthesized
    * text inbound message. `callback_data` schema: `appr:yes` /
    * `appr:no` (the bare-minimum design — the LLM still owns the
@@ -1064,6 +1107,16 @@ function buildAdapter(cfg: BagetTelegramConfig): ChannelAdapter {
 
     const ackToast = decision === 'yes' ? '✅ Confirming…' : '❌ Cancelled';
     await answerCallbackQuery(cb.id, resolvedBotToken, ackToast);
+
+    // Phase 4 v0.2: strip the inline keyboard immediately after the
+    // tap so the founder gets visual confirmation AND can't re-tap
+    // (each re-tap synthesizes another "yes" inbound — loops the
+    // agent). Best-effort; if Telegram errors we still synth the
+    // inbound (the agent's reply is the next signal anyway).
+    const messageId = cb.message?.message_id;
+    if (typeof messageId === 'number') {
+      await stripInlineKeyboard(chatId, messageId, resolvedBotToken);
+    }
 
     if (!setup) {
       log.warn('Baget telegram: callback_query before setup() — dropping', { id: cb.id });
