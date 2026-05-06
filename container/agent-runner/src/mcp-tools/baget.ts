@@ -1968,6 +1968,234 @@ const sendCampaign: McpToolDefinition = {
   },
 };
 
+// ── Tier 3 cluster 1: Credits & billing ─────────────────────────────────────
+
+const topupCredits: McpToolDefinition = {
+  tool: {
+    name: 'baget_topup_credits',
+    description:
+      "Generate a Stripe Checkout link the founder can tap to add credits. Use when the founder says \"I'm running low\" / \"add $20 in credits\" / \"top me up\". Bot CANNOT charge directly — payment data must stay with Stripe + the founder's browser. Tool returns a `url` you echo verbatim; founder taps in mobile browser, completes payment, webhook fires, balance updates. Confirm with `baget_get_credits` after the founder reports completion. Apprenti tier rejected (zero credits-per-dollar — checkout would charge real money for nothing). Range: $1–$1,000.",
+    inputSchema: {
+      type: 'object',
+      properties: {
+        amountCents: {
+          type: 'integer',
+          minimum: 100,
+          maximum: 100000,
+          description: 'Amount in cents. e.g., 2000 = $20. Range [100, 100000].',
+        },
+      },
+      required: ['amountCents'],
+      additionalProperties: false,
+    },
+  },
+  async handler(args) {
+    const ctx = requireCompanyId();
+    if (!ctx.ok) return fail(ctx.error);
+    const result = await bagetFetch({
+      method: 'POST',
+      path: `/api/companies/${ctx.companyId}/credits/topup`,
+      body: { amountCents: Number(args.amountCents) },
+    });
+    if (!result.ok) return fail(`topup_credits failed: ${result.error}`);
+    return ok(JSON.stringify(result.data, null, 2));
+  },
+};
+
+const getBillingHistory: McpToolDefinition = {
+  tool: {
+    name: 'baget_get_billing_history',
+    description:
+      "Read the founder's recent transaction history — top-ups, daily refills, task spending, refunds. Use when the founder asks \"did my last top-up go through?\" / \"what have I spent this week?\" / \"show me my recent charges\". Default 25 most recent; cap 50. Filter by `type` (\"credit\" / \"debit\" / \"withdrawal\" / \"hold\") to narrow. Pagination via opaque `cursor` (pass back `pagination.nextCursor` from a prior response).",
+    inputSchema: {
+      type: 'object',
+      properties: {
+        limit: { type: 'integer', minimum: 1, maximum: 50 },
+        type: {
+          type: 'string',
+          enum: ['credit', 'debit', 'withdrawal', 'hold'],
+          description:
+            'Optional filter. credit = top-up / treasury grant. debit = task spend. withdrawal = refund / chargeback. hold = pending ad-charge reservation.',
+        },
+        cursor: {
+          type: 'string',
+          description:
+            'Opaque pagination cursor from a prior response. Pass `pagination.nextCursor` verbatim.',
+        },
+      },
+      additionalProperties: false,
+    },
+  },
+  async handler(args) {
+    const ctx = requireCompanyId();
+    if (!ctx.ok) return fail(ctx.error);
+    const q = buildQueryString(args, ['limit', 'type', 'cursor']);
+    const result = await bagetFetch({
+      method: 'GET',
+      path: `/api/companies/${ctx.companyId}/billing${q}`,
+    });
+    if (!result.ok) return fail(`get_billing_history failed: ${result.error}`);
+    return ok(JSON.stringify(result.data, null, 2));
+  },
+};
+
+// ── Tier 3 cluster 2: Customer site ─────────────────────────────────────────
+
+const getSiteStatus: McpToolDefinition = {
+  tool: {
+    name: 'baget_get_site_status',
+    description:
+      "Read the founder's customer-facing site status — auto-deployed Vercel URL plus any custom domains they've configured (with DNS verification status). Use when the founder asks \"what's my URL\" / \"is my site live\" / \"did the domain finish verifying\". Returns `deploymentUrl` (the auto Vercel URL — always set on running companies), `hasCustomDomains` shortcut, and `customDomains` array. If the founder hasn't configured a custom domain, the auto URL is the answer.",
+    inputSchema: { type: 'object', properties: {}, additionalProperties: false },
+  },
+  async handler() {
+    const ctx = requireCompanyId();
+    if (!ctx.ok) return fail(ctx.error);
+    const result = await bagetFetch({
+      method: 'GET',
+      path: `/api/companies/${ctx.companyId}/site`,
+    });
+    if (!result.ok) return fail(`get_site_status failed: ${result.error}`);
+    return ok(JSON.stringify(result.data, null, 2));
+  },
+};
+
+// ── Tier 3 cluster 3: Email domains ─────────────────────────────────────────
+
+const listEmailDomains: McpToolDefinition = {
+  tool: {
+    name: 'baget_list_email_domains',
+    description:
+      "Read the founder's configured email-sending domains — the custom domains they verified with Resend so emails come from their brand instead of baget.ai. Use when the founder asks \"what email domains do I have\" / \"is my custom sending domain verified\" / \"can I send from yourstartup.com yet\". Returns id, domainName, status (\"pending\" / \"verified\" / \"failed\" / etc), isPrimary, region, createdAt, verifiedAt. Empty array means the founder is still using baget.ai's managed sending address.",
+    inputSchema: { type: 'object', properties: {}, additionalProperties: false },
+  },
+  async handler() {
+    const ctx = requireCompanyId();
+    if (!ctx.ok) return fail(ctx.error);
+    const result = await bagetFetch({
+      method: 'GET',
+      path: `/api/companies/${ctx.companyId}/email-domains`,
+    });
+    if (!result.ok) return fail(`list_email_domains failed: ${result.error}`);
+    return ok(JSON.stringify(result.data, null, 2));
+  },
+};
+
+// ── Tier 3 cluster 4: Inbox ─────────────────────────────────────────────────
+
+const listInbox: McpToolDefinition = {
+  tool: {
+    name: 'baget_list_inbox',
+    description:
+      "Read the founder's recent email threads — incoming replies + outbound conversations stitched into threads. Use when the founder asks \"what new emails came in\" / \"did Jane reply\" / \"search for 'pricing'\". Compact projection (no message bodies — use `baget_read_email_thread` for those). Default 25, cap 50. Optional `q` ILIKE search across subject + contactEmail + contactName (case-insensitive, max 100 chars). Filter by `status` (\"open\" / \"closed\"). Pagination via opaque `cursor`.",
+    inputSchema: {
+      type: 'object',
+      properties: {
+        limit: { type: 'integer', minimum: 1, maximum: 50 },
+        cursor: {
+          type: 'string',
+          description:
+            'Opaque pagination cursor from a prior response. Pass `pagination.nextCursor` verbatim.',
+        },
+        q: {
+          type: 'string',
+          maxLength: 100,
+          description:
+            'Optional search term. Matches anywhere in subject / contactEmail / contactName (case-insensitive).',
+        },
+        status: { type: 'string', enum: ['open', 'closed'] },
+      },
+      additionalProperties: false,
+    },
+  },
+  async handler(args) {
+    const ctx = requireCompanyId();
+    if (!ctx.ok) return fail(ctx.error);
+    const q = buildQueryString(args, ['limit', 'cursor', 'q', 'status']);
+    const result = await bagetFetch({
+      method: 'GET',
+      path: `/api/companies/${ctx.companyId}/inbox${q}`,
+    });
+    if (!result.ok) return fail(`list_inbox failed: ${result.error}`);
+    return ok(JSON.stringify(result.data, null, 2));
+  },
+};
+
+const readEmailThread: McpToolDefinition = {
+  tool: {
+    name: 'baget_read_email_thread',
+    description:
+      "Read one email thread's full message history. Use AFTER `baget_list_inbox` when the founder asks \"show me the conversation with Jane\" / \"what did Bob write back\". Returns thread metadata + messages array (chronological) with bodyText (HTML→text converted) and `bodyTruncated` flag if a single message exceeded 8000 chars. Resolve `threadId` via `baget_list_inbox` first; never guess UUIDs.",
+    inputSchema: {
+      type: 'object',
+      properties: {
+        threadId: {
+          type: 'string',
+          format: 'uuid',
+          description: 'UUID from baget_list_inbox.',
+        },
+      },
+      required: ['threadId'],
+      additionalProperties: false,
+    },
+  },
+  async handler(args) {
+    const ctx = requireCompanyId();
+    if (!ctx.ok) return fail(ctx.error);
+    const threadId = String(args.threadId ?? '').trim();
+    if (!threadId) return fail('threadId is required');
+    const result = await bagetFetch({
+      method: 'GET',
+      path: `/api/companies/${ctx.companyId}/inbox/${encodeURIComponent(threadId)}`,
+    });
+    if (!result.ok) return fail(`read_email_thread failed: ${result.error}`);
+    return ok(JSON.stringify(result.data, null, 2));
+  },
+};
+
+// ── Tier 3 cluster 5: Briefing controls ─────────────────────────────────────
+
+const setBriefingPreferences: McpToolDefinition = {
+  tool: {
+    name: 'baget_set_briefing_preferences',
+    description:
+      "Change the founder's morning-briefing notification settings — snooze briefings for N days OR change cadence (daily / weekly / blockers-only). Either or both fields can be set in one call; at least one is required. Use when the founder asks \"snooze briefings for 3 days\" / \"switch me to weekly briefings\" / \"only ping me on blocker days\". `snoozeDays: 0` clears an active snooze (founder wants briefings back NOW). Range 0–30 days. RUNS IMMEDIATELY (free).",
+    inputSchema: {
+      type: 'object',
+      properties: {
+        snoozeDays: {
+          type: 'integer',
+          minimum: 0,
+          maximum: 30,
+          description:
+            'Snooze briefing emails for this many days. 0 = clear snooze (resume now). 1–30 = future date.',
+        },
+        frequency: {
+          type: 'string',
+          enum: ['daily', 'weekly', 'blockers-only'],
+          description:
+            'daily = every day at morningHour. weekly = Monday only. blockers-only = only days with at least one blocker.',
+        },
+      },
+      additionalProperties: false,
+    },
+  },
+  async handler(args) {
+    const ctx = requireCompanyId();
+    if (!ctx.ok) return fail(ctx.error);
+    const result = await bagetFetch({
+      method: 'POST',
+      path: `/api/companies/${ctx.companyId}/briefing/preferences`,
+      body: {
+        ...(args.snoozeDays !== undefined ? { snoozeDays: Number(args.snoozeDays) } : {}),
+        ...(args.frequency !== undefined ? { frequency: String(args.frequency) } : {}),
+      },
+    });
+    if (!result.ok) return fail(`set_briefing_preferences failed: ${result.error}`);
+    return ok(JSON.stringify(result.data, null, 2));
+  },
+};
+
 // ── Register ─────────────────────────────────────────────────────────────────
 
 registerTools([
@@ -1985,6 +2213,12 @@ registerTools([
   getProspectSearchLeads,
   readRoadmap,
   readAdMetrics,
+  // Read — Tier 3
+  getBillingHistory,
+  getSiteStatus,
+  listEmailDomains,
+  listInbox,
+  readEmailThread,
   // File transfer
   sendDocumentFile,
   // Generate
@@ -2010,6 +2244,9 @@ registerTools([
   resumeCampaign,
   updateRoadmapItem,
   createProspectSearch,
+  // Write — direct (Tier 3)
+  topupCredits,
+  setBriefingPreferences,
   // Write — approval-gated
   launchBatch,
   runTask,
@@ -2019,5 +2256,5 @@ registerTools([
 ]);
 
 log(
-  'baget MCP tools registered: 12 read + 1 file-transfer + 1 generate + 19 direct write + 5 approval-gated = 38 total (Tier 2: +6 read +7 direct write)',
+  'baget MCP tools registered: 17 read + 1 file-transfer + 1 generate + 21 direct write + 5 approval-gated = 47 total (Tier 3: +5 read +2 direct write)',
 );
