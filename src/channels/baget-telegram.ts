@@ -80,7 +80,28 @@ export { BAGET_TELEGRAM_CHANNEL_TYPE };
 const PLATFORM_PREFIX = 'baget-telegram:';
 
 export interface BagetTelegramConfig {
-  botToken: string;
+  /**
+   * Optional global / Vela-legacy bot token. The adapter previously
+   * REQUIRED this — every outbound write defaulted to it and the
+   * registration gate refused to wire the channel without it. With
+   * the pool design, every active chat is bound to a pool bot whose
+   * token comes from `bot_pool.bot_token_value`, so the global token
+   * is now an opt-in legacy fallback for pre-pool pairings only.
+   *
+   * 2026-05-06 S-10.2 smoke (Sam): removing the legacy
+   * `@baget_team_staging_bot` from BotFather and dropping
+   * `TELEGRAM_BOT_TOKEN` from staging Railway killed the entire
+   * Telegram surface because the registration gate refused to wire
+   * without it (line ~1333). Fix: register on adminToken +
+   * webhookSecret alone; let per-call pool lookups resolve the
+   * actual token. Outbound writes that fall through to an undefined
+   * `cfg.botToken` will fail loudly at the Telegram API call site —
+   * acceptable on a staging environment with no legacy chats; in
+   * prod this only matters if there's an actually-paired chat with
+   * NO pool entry, which means it was bound to the global bot
+   * before the pool migration.
+   */
+  botToken?: string;
   /** Header value Telegram echoes on every webhook delivery. Constant-time-checked. */
   webhookSecret: string;
   /** Required so /start can verify pairing-token HMACs. */
@@ -496,8 +517,18 @@ function buildAdapter(cfg: BagetTelegramConfig): ChannelAdapter {
       // founders' uploads land on their per-company bot's webhook,
       // so the file_id only resolves under that token. Falling
       // through to `cfg.botToken` for legacy / Vela pairings is
-      // correct (those agent_groups have no pool entry).
+      // correct (those agent_groups have no pool entry). On a
+      // pool-only deploy with no global token, this is undefined for
+      // legacy chats — treat the attachment as undownloadable and
+      // skip it (the agent still sees the text).
       const inboundBotToken = getBotPoolEntryByAgentGroup(agentGroup.id)?.bot_token_value ?? cfg.botToken;
+      if (!inboundBotToken) {
+        log.warn(
+          'Baget telegram: cannot download attachment — agent_group has no pool entry AND no global cfg.botToken (pool-only deploy)',
+          { agentGroupId: agentGroup.id, fileId: parsedAttachment.fileId },
+        );
+        return;
+      }
 
       try {
         const { filePath, sizeBytes } = await downloadTelegramAttachment({
@@ -683,7 +714,7 @@ function buildAdapter(cfg: BagetTelegramConfig): ChannelAdapter {
     //    chat or a chat the founder hasn't opened.
     const startWelcomeBotToken = getBotPoolEntryByAgentGroup(row.agent_group_id)?.bot_token_value ?? cfg.botToken;
     const team = parseTeamMembers(agentGroup.baget_team_members);
-    if (team) {
+    if (team && startWelcomeBotToken) {
       await sendBagetTelegramWelcome({
         botToken: startWelcomeBotToken,
         apiBaseUrl: cfg.apiBaseUrl,
@@ -743,6 +774,18 @@ function buildAdapter(cfg: BagetTelegramConfig): ChannelAdapter {
     // get their own. NEVER log the resolved token; it's a secret.
     const resolvedBotToken =
       (agentGroupId && getBotPoolEntryByAgentGroup(agentGroupId)?.bot_token_value) || cfg.botToken;
+    // Pool-only deploys without a global `cfg.botToken`: if the agent
+    // group has no pool entry AND no global fallback, we have no way
+    // to send. Log loudly so the operator sees the misconfiguration
+    // (almost certainly a missed seed step) instead of an opaque
+    // Telegram 404 from sendBagetBotMessage.
+    if (!resolvedBotToken) {
+      log.error(
+        'Baget telegram: deliver dropped — no pool entry for agent_group AND no global cfg.botToken',
+        { platformId, agentGroupId, kind: message.kind },
+      );
+      return undefined;
+    }
 
     // Celebrations BYPASS the multi-bind / archived security checks below
     // by design. The `/celebrate` admin endpoint (#19) has already
@@ -889,9 +932,22 @@ function buildAdapter(cfg: BagetTelegramConfig): ChannelAdapter {
     chatId: number | string,
     text: string,
     agentGroupId: string | null,
-    botToken: string = cfg.botToken,
+    botToken: string | undefined = cfg.botToken,
     replyMarkup?: TelegramReplyMarkup,
   ): Promise<string | undefined> {
+    // Pool-only deploys (no global `cfg.botToken`) reach this with
+    // `botToken === undefined` only on pre-pair token-shape failure
+    // replies — i.e. the `/start <bad-token>` path, where we have
+    // no agent_group to look up a per-pool token from. Log loudly
+    // instead of POSTing to /bot/sendMessage with an empty token
+    // (which Telegram returns 404 for, but the founder sees nothing).
+    if (!botToken) {
+      log.warn(
+        'Baget telegram: sendBotMessage called with no botToken — pool-only deploy on a pre-pair / legacy code path. Dropping send.',
+        { chatId, agentGroupId, textLen: text.length },
+      );
+      return undefined;
+    }
     const result = await sendBagetBotMessage({
       botToken,
       apiBaseUrl: apiBase,
@@ -992,6 +1048,19 @@ function buildAdapter(cfg: BagetTelegramConfig): ChannelAdapter {
     const agentGroupId = wired.length === 1 ? (wired[0]?.agent_group_id ?? null) : null;
     const resolvedBotToken =
       (agentGroupId && getBotPoolEntryByAgentGroup(agentGroupId)?.bot_token_value) || cfg.botToken;
+    if (!resolvedBotToken) {
+      // Pool-only deploy without a global token, AND no pool entry
+      // for this agent_group. We can't ACK the callback — Telegram
+      // will leave the spinner stuck on the founder's screen for ~5s
+      // before it times out. Log loud for the operator; don't synth
+      // the inbound either (no agent on the other end can respond).
+      log.error('Baget telegram: refusing callback — no pool token and no global cfg.botToken', {
+        platformId,
+        agentGroupId,
+        callbackQueryId: cb.id,
+      });
+      return;
+    }
 
     const ackToast = decision === 'yes' ? '✅ Confirming…' : '❌ Cancelled';
     await answerCallbackQuery(cb.id, resolvedBotToken, ackToast);
@@ -1327,32 +1396,62 @@ function parseTeamMembers(json: string | null | undefined): BagetTeamMembers | n
 //
 // The adapter is constructed lazily from env at install time so test
 // suites that only import the module don't try to bind the webhook
-// port. Wiring is gated on TELEGRAM_BOT_TOKEN — if the env var is
-// unset the adapter doesn't register and the host runs as a
-// pure-nanoclaw with no Baget channel.
-if (process.env.TELEGRAM_BOT_TOKEN) {
-  const webhookSecret = process.env.TELEGRAM_WEBHOOK_SECRET ?? '';
-  const adminToken = process.env.BAGET_ADMIN_TOKEN ?? '';
-  if (webhookSecret.length < 16) {
-    throw new Error(
-      'TELEGRAM_BOT_TOKEN is set but TELEGRAM_WEBHOOK_SECRET is missing or shorter than 16 chars. ' +
-        'Refusing to register the Baget Telegram adapter — every webhook would 401 silently.',
-    );
-  }
-  if (adminToken.length < 16) {
-    throw new Error(
-      'TELEGRAM_BOT_TOKEN is set but BAGET_ADMIN_TOKEN is missing or shorter than 16 chars. ' +
-        'Refusing to register the Baget Telegram adapter — pairing-token HMAC would default to the empty key.',
-    );
-  }
+// port.
+//
+// Registration requirements (pool-first, post-2026-05-06):
+//   - `BAGET_ADMIN_TOKEN` — pairing-token HMAC key. Required;
+//     without it `/start <token>` security collapses.
+//   - `TELEGRAM_WEBHOOK_SECRET` — echoed by Telegram on every
+//     webhook delivery. Required; without it every webhook 401s.
+//   - At least ONE of:
+//     - `TELEGRAM_BOT_TOKEN` (legacy global) — for legacy chats
+//       bound before the pool migration
+//     - `bot_pool` rows (per-bot tokens) — for pool-assigned chats
+//
+// We can't query `bot_pool` at module-import time (DB isn't ready
+// yet), so we DON'T gate on it here. Instead we register
+// unconditionally when admin + webhook secret are valid; per-call
+// pool lookups inside the adapter resolve the right token at
+// runtime. Outbound calls that fall through to an undefined
+// `cfg.botToken` (no pool entry AND no global) fail at the
+// Telegram API with a loud 404 — debuggable, not silent.
+//
+// Sam 2026-05-06 S-10.2: the prior `if (process.env.TELEGRAM_BOT_TOKEN)`
+// gate killed the entire Telegram surface on staging the moment
+// the legacy global was deleted from BotFather and the env var
+// removed. The pool-only deploy had everything wired (pool entries
+// + per-bot webhooks) but the channel adapter never registered, so
+// no inbound updates ever flowed to Baget.
+const __webhookSecret = process.env.TELEGRAM_WEBHOOK_SECRET ?? '';
+const __adminToken = process.env.BAGET_ADMIN_TOKEN ?? '';
+if (__webhookSecret.length >= 16 && __adminToken.length >= 16) {
   registerChannelAdapter(BAGET_TELEGRAM_CHANNEL_TYPE, {
     factory: () =>
       buildAdapter({
-        botToken: process.env.TELEGRAM_BOT_TOKEN!,
-        webhookSecret,
-        adminToken,
+        // Optional now — pool entries take precedence at every
+        // outbound site. Empty/undefined when staging operators
+        // run pool-only.
+        botToken: process.env.TELEGRAM_BOT_TOKEN || undefined,
+        webhookSecret: __webhookSecret,
+        adminToken: __adminToken,
       }),
   });
+} else if (__webhookSecret.length > 0 || __adminToken.length > 0 || process.env.TELEGRAM_BOT_TOKEN) {
+  // Operator partially configured the adapter — stricter than the
+  // old "all-or-nothing" gate so a half-set deploy fails loudly
+  // instead of silently disabling the channel.
+  if (__webhookSecret.length < 16) {
+    throw new Error(
+      'Baget Telegram adapter: TELEGRAM_WEBHOOK_SECRET is missing or shorter than 16 chars. ' +
+        'Refusing to register — every webhook would 401 silently.',
+    );
+  }
+  if (__adminToken.length < 16) {
+    throw new Error(
+      'Baget Telegram adapter: BAGET_ADMIN_TOKEN is missing or shorter than 16 chars. ' +
+        'Refusing to register — pairing-token HMAC would default to the empty key.',
+    );
+  }
 }
 
 // Exported so tests can construct an adapter without touching env or
