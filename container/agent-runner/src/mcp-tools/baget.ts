@@ -2177,12 +2177,30 @@ const setBriefingPreferences: McpToolDefinition = {
             'daily = every day at morningHour. weekly = Monday only. blockers-only = only days with at least one blocker.',
         },
       },
+      // Codex P2 on PR #53: at least one of snoozeDays / frequency
+      // must be present. Without `anyOf`, the in-process Gemini
+      // provider's `call.args ?? {}` happily passes `{}` to the
+      // handler, which then POSTs an empty-body update upstream
+      // (baget.ai's route returns 400 no-fields-provided, but we'd
+      // rather fail locally and let the agent re-prompt).
+      anyOf: [
+        { required: ['snoozeDays'] },
+        { required: ['frequency'] },
+      ],
       additionalProperties: false,
     },
   },
   async handler(args) {
     const ctx = requireCompanyId();
     if (!ctx.ok) return fail(ctx.error);
+    // Defense-in-depth: even with the anyOf schema, some providers
+    // skip JSON-Schema validation. Guard locally so we never POST a
+    // no-op mutation upstream.
+    if (args.snoozeDays === undefined && args.frequency === undefined) {
+      return fail(
+        'set_briefing_preferences: at least one of `snoozeDays` or `frequency` is required',
+      );
+    }
     const result = await bagetFetch({
       method: 'POST',
       path: `/api/companies/${ctx.companyId}/briefing/preferences`,
