@@ -232,7 +232,9 @@ export async function runIteration(args: {
   // Routing must be telegram for delivery to make sense. If the host
   // hasn't published a routing row yet, or the session is bound to
   // something else, skip the poll entirely — no point fetching events
-  // we can't deliver. Cursor stays put.
+  // we can't deliver. Cursor stays put. Bug #4 diagnostic logs:
+  // surface the precise reason for skip so a "loop running but never
+  // delivers" report has a definitive trace in container logs.
   //
   // 2026-05-06 Bug #4 root cause: the Baget Telegram adapter registers
   // under `channel_type: 'baget-telegram'` (BAGET_TELEGRAM_CHANNEL_TYPE
@@ -243,6 +245,9 @@ export async function runIteration(args: {
   const isTelegramChannel =
     routing.channel_type === 'telegram' || routing.channel_type === 'baget-telegram';
   if (!isTelegramChannel || !routing.platform_id) {
+    log(
+      `Skip iteration: routing not ready (channel_type=${routing.channel_type ?? 'null'}, platform_id=${routing.platform_id ?? 'null'}). Will retry next tick.`,
+    );
     return cursorIso;
   }
 
@@ -254,7 +259,14 @@ export async function runIteration(args: {
     fetchImpl,
     signal,
   });
-  if (!result) return cursorIso;
+  if (!result) {
+    // pollOnce already logged the failure mode (network, non-2xx, bad
+    // JSON / shape, abort). Don't log again — keep one line per fail.
+    return cursorIso;
+  }
+  log(
+    `Polled since=${cursorIso} → events=${result.events.length}, server-cursor=${result.cursor}`,
+  );
 
   const dashboardUrl = dashboardLinkFor(env.appUrl, env.companyId);
 
@@ -296,6 +308,9 @@ export async function runIteration(args: {
         thread_id: routing.thread_id,
         content: JSON.stringify({ text }),
       });
+      log(
+        `Delivered completion: action=${event.channelAction} taskId=${event.taskId} createdAt=${event.createdAt}`,
+      );
       lastDeliveredCursor = event.createdAt;
     } catch (err) {
       // A single SQLite hiccup shouldn't poison the rest of the page.
@@ -348,7 +363,19 @@ export async function runChannelCompletionLoop(
 
   log(`Loop started (interval=${intervalMs}ms, base=${env.baseUrl}, company=${env.companyId})`);
 
+  // Heartbeat counter — every N iterations, log a "still alive"
+  // line so a Bug #4-style "loop running but never delivers" report
+  // can be definitively distinguished from "loop never started" by
+  // grepping container logs. POLL_INTERVAL_MS=60s + heartbeat every
+  // 10 iterations = one beat per 10 minutes, cheap.
+  let iterationCount = 0;
+  const HEARTBEAT_EVERY = 10;
+
   while (!config.signal?.aborted) {
+    iterationCount++;
+    if (iterationCount % HEARTBEAT_EVERY === 0) {
+      log(`Heartbeat: ${iterationCount} iterations, cursor=${cursor}`);
+    }
     let routing: RoutingSnapshot;
     try {
       routing = routingProvider();
