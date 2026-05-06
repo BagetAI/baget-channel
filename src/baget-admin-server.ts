@@ -1755,6 +1755,48 @@ export function createBagetAdminServer(config: BagetAdminServerConfig): BagetAdm
           createdAt: nowIso,
         });
         results.push({ botUsername: telegramUsername, outcome });
+
+        // Sam 2026-05-06 staging smoke: rotation regenerated the
+        // webhook_secret in SQLite but Telegram side still held the
+        // OLD secret from a previous registration (handleCreate is
+        // the only path that previously called setWebhook). Result:
+        // every inbound update from Telegram was rejected with
+        // "rejected webhook with bad secret token" and the bot went
+        // silent. Fix: every seed/rotation MUST push the new secret
+        // to Telegram via setWebhook so the wire-side and DB-side
+        // secrets stay in sync.
+        //
+        // Best-effort: a Telegram outage doesn't fail the whole
+        // seed call (the pool row is still good, operator can retry
+        // by re-running seed). On success, stamp
+        // webhook_registered_at so the next /baget/agent-groups
+        // create call doesn't re-register unnecessarily.
+        if (
+          (outcome === 'inserted' || outcome === 'rotated') &&
+          config.publicBaseUrl
+        ) {
+          const webhookUrl = buildPerBotWebhookUrl({
+            publicBaseUrl: config.publicBaseUrl,
+            botUsername: telegramUsername,
+          });
+          const webhook = await registerTelegramWebhook({
+            botToken,
+            webhookUrl,
+            webhookSecret,
+            apiBaseUrl: config.telegramApiBaseUrl,
+            fetchImpl: config.telegramFetchImpl,
+          });
+          if (webhook.ok) {
+            markWebhookRegistered(telegramUsername, nowIso);
+          } else {
+            log.warn('seed bot pool: setWebhook failed (will retry on next seed)', {
+              botUsername: telegramUsername,
+              reason: webhook.reason,
+              telegramErrorCode: webhook.telegramErrorCode,
+              telegramDescription: webhook.telegramDescription,
+            });
+          }
+        }
       } catch (err) {
         log.error('seed bot pool: DB insert failed', { botUsername: telegramUsername, err });
         results.push({ botUsername: telegramUsername, outcome: 'skipped', reason: 'db_insert_failed' });
