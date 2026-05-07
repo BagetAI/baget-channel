@@ -669,7 +669,17 @@ const listDocuments: McpToolDefinition = {
   tool: {
     name: 'baget_list_documents',
     description:
-      'List the founder\'s documents — business plan, brand guide, pitch deck, research, etc. Returns id, title, category, and createdAt for each. Call this first before referring to a specific document by name; never guess document ids. After listing, route to ONE of two follow-up tools based on what the founder asked for. The CHAT-NATIVE DEFAULT is `baget_read_document` — fetch the markdown body and quote it INLINE in your reply. Use it for any unqualified content request: "send me the deck", "share the BP", "give me the brand guide", "what\'s in the deck?", "summarize the BP", "show me the pitch". Inline markdown reads cleanly in Telegram in one tap; a file attachment requires a download and breaks the conversation flow. Use `baget_send_document_file` ONLY when (a) the founder explicitly names a file format or a forward/save intent — phrases like "as a PDF", "the file", "to forward", "to save", "attach the file", "I need the PDF" — AND (b) the target document\'s `category` is NOT `"deck"`. **For documents with `category === "deck"` (or "pitch deck" / "presentation" / "slides" in the title), ALWAYS call `baget_read_document` instead, and tell the founder the Documents tab on their dashboard has the proper visual slide rendering** — pdfkit cannot preserve slide layout, so a deck PDF is unreadable. When in doubt for non-deck docs, default to `baget_read_document` and offer the file as a follow-up ("Want it as a PDF too?").',
+      'List the founder\'s documents — business plan, brand guide, pitch deck, research, etc. Returns id, title, category, and createdAt for each. Call this first before referring to a specific document by name; never guess document ids. After listing, route to the right follow-up tool based on the founder\'s intent and the document category:\n' +
+      '\n' +
+      '**For DECKS (`category === "deck"`, or "pitch deck" / "presentation" / "slides" in the title):**\n' +
+      '- Bare delivery requests ("send me the deck", "share the pitch", "give me the deck", "show me the slides") → call `baget_send_deck_visuals`. The founder gets actual rendered slide IMAGES inline — visual layout preserved, scrollable in chat.\n' +
+      '- Content discussion ("what\'s in the deck?", "summarize the pitch", "read me the problem statement") → call `baget_read_document` to fetch the markdown body and quote it inline.\n' +
+      '\n' +
+      '**For NON-DECK documents** (BPs, brand guides, research, etc.):\n' +
+      '- Bare delivery + content discussion → call `baget_read_document` (markdown inline; chat-native default).\n' +
+      '- Explicit file/forward intent ("as a PDF", "the file", "to forward", "to save", "attach the file") → call `baget_send_document_file`.\n' +
+      '\n' +
+      'When in doubt, default to the inline path (`baget_read_document` for non-decks, `baget_send_deck_visuals` for decks); offer the file as a follow-up.',
     inputSchema: { type: 'object', properties: {}, additionalProperties: false },
   },
   async handler() {
@@ -688,7 +698,7 @@ const readDocument: McpToolDefinition = {
   tool: {
     name: 'baget_read_document',
     description:
-      'Fetch the markdown body of a single document and QUOTE it INLINE in your reply. This is the CHAT-NATIVE DEFAULT for any document-content request on Telegram — markdown renders cleanly inline and the founder reads it in one tap, without leaving the chat. Use for the full range of content-delivery intents: discuss / summarize / read aloud ("what\'s in the BP?", "summarize the brand guide", "read me the deck\'s problem section", "what\'s the positioning?") AND bare delivery requests ("send me the deck", "share the BP", "give me the brand guide", "show me the pitch"). For long documents, quote the most relevant section and offer to expand or scroll through other sections inline. **DECKS ALWAYS USE THIS TOOL** — `category === "deck"` documents have no usable PDF render path (pdfkit produces wall-of-text without slide structure), so this tool is the only chat-friendly way to deliver deck content. After quoting the deck inline, tell the founder the Documents tab on their dashboard has the proper visual slide rendering. Pairs with `baget_send_document_file` for the explicit-attachment path: pick THIS tool by default; pick `baget_send_document_file` ONLY when the founder explicitly names a format or forward/save intent ("as a PDF", "the file", "to forward", "to save", "attach the file") AND the document is NOT a deck. Call `baget_list_documents` FIRST to resolve a name (e.g., \'pitch deck\') to a documentId; never guess document ids.',
+      'Fetch the markdown body of a single document and QUOTE it INLINE in your reply. This is the CHAT-NATIVE DEFAULT for content-discussion intent on NON-DECK documents (BPs, brand guides, research) AND for content-discussion intent on DECKS ("what\'s in the deck?", "summarize the pitch", "read me the problem statement"). Markdown renders cleanly inline and the founder reads it in one tap, without leaving the chat. Use for: discuss / summarize / read-aloud ("what\'s in the BP?", "summarize the brand guide", "what\'s the positioning?") AND bare delivery on NON-DECK docs ("send me the BP", "share the brand guide"). For long documents, quote the most relevant section and offer to expand or scroll through other sections inline. **For DECK delivery (bare "send me the deck", "share the pitch", "show me the slides") use `baget_send_deck_visuals` INSTEAD** — that tool ships actual rendered slide images so the visual layout is preserved; this tool is for deck CONTENT-DISCUSSION only. Pairs with `baget_send_document_file` for explicit non-deck file intent ("as a PDF", "the file", "to forward", "to save"). Call `baget_list_documents` FIRST to resolve a name (e.g. \'pitch deck\') to a documentId; never guess document ids.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -976,7 +986,7 @@ const sendDocumentFile: McpToolDefinition = {
   tool: {
     name: 'baget_send_document_file',
     description:
-      'Send a document to the founder as a real downloadable FILE attachment — PDF for markdown docs (server-side render via pdfkit), original media for image/video docs. The TRIGGER for this tool is an EXPLICIT signal that the founder wants a file (not chat-readable text): either an explicit format mention (the words "PDF", "file", or "attachment") OR an explicit downstream-of-chat verb (forward, save, print, share with someone outside the conversation). Positive examples — every one explicitly mentions a format or downstream verb: "give me the PDF version of the BP", "I need the file to forward to a lawyer", "attach the brand guide so I can print it", "I want a PDF I can save", "shoot me the file for the investor email". The chat-native default for ANY content delivery without one of those explicit signals is `baget_read_document` — markdown body inline reads in one tap on Telegram, no download required. When in doubt, default to read; offer the file as a follow-up. **DECK-CATEGORY DOCUMENTS ALWAYS USE `baget_read_document` REGARDLESS OF PHRASING** — pdfkit renders markdown as a wall of styled text without slide layout, so a deck PDF is intrinsically unreadable on phone (Sam confirmed 2026-05-07 staging Telegram smoke). For any document where `category === "deck"` from `baget_list_documents`, OR where the title contains "pitch deck" / "presentation" / "slides", call `baget_read_document` to quote the deck inline section-by-section, and tell the founder the Documents tab on their dashboard has the proper visual slide rendering. The visual deck lives on the dashboard; the deck CONTENT lives inline; the file path is a dead end for decks. SUPPORTED OUTPUT FORMATS for this tool are PDF + original-media only. HTML, DOCX, and slide-deck (.key/.pptx) cannot be shipped as files from here — call `baget_read_document` for HTML/markdown intent (the markdown body IS what the dashboard\'s HTML view is built from), or tell the founder the Documents tab on their dashboard has the rich rendering and offer to send a PDF as a substitute (except for decks — see deck rule above). NEVER quote a literal URL — never paste any URL or path with placeholders or the substring "dashboard/" in your reply; the founder is already signed into their dashboard and knows where it is. NEVER attempt to convert documents using shell utilities (npx marked / pandoc / wkhtmltopdf / similar via the Bash tool) — the container does not have npm-registry access or these binaries; the attempt will fail and the founder will see a confusing "still encountering an issue" loop. Call `baget_list_documents` FIRST to resolve a name (e.g. \'pitch deck\') to a documentId. Lands in the same chat thread as the conversation — no "to" parameter needed.',
+      'Send a NON-DECK document to the founder as a real downloadable FILE attachment — PDF for markdown docs (server-side render via pdfkit), original media for image/video docs. The TRIGGER is an EXPLICIT signal that the founder wants a file (not chat-readable text): either an explicit format mention (the words "PDF", "file", or "attachment") OR an explicit downstream-of-chat verb (forward, save, print, share with someone outside the conversation). Positive examples — every one explicitly mentions a format or downstream verb: "give me the PDF version of the BP", "I need the file to forward to a lawyer", "attach the brand guide so I can print it", "I want a PDF I can save", "shoot me the file for the investor email". The chat-native default for ANY content delivery without one of those explicit signals is `baget_read_document` — markdown body inline reads in one tap on Telegram, no download required. When in doubt for non-deck docs, default to read; offer the file as a follow-up. **For DECK-CATEGORY documents — `category === "deck"` or "pitch deck" / "presentation" / "slides" in the title — use `baget_send_deck_visuals` instead.** That tool ships actual rendered slide IMAGES (one PNG per slide, 1920×1080, scrollable inline on Telegram) — visual layout preserved, which the pdfkit text-render path cannot do. If the founder explicitly asks for a deck PDF, route to `baget_send_deck_visuals` first and offer the PDF as a follow-up; the visual delivery is strictly better for chat consumption than a styled-text PDF. SUPPORTED OUTPUT FORMATS for THIS tool are PDF + original-media only. HTML, DOCX, and slide-deck (.key/.pptx) cannot be shipped as files from here — call `baget_read_document` for HTML/markdown intent on non-deck docs, or tell the founder the Documents tab on their dashboard has the rich rendering and offer to send a PDF as a substitute. NEVER quote a literal URL — never paste any URL or path with placeholders or the substring "dashboard/" in your reply; the founder is already signed into their dashboard and knows where it is. NEVER attempt to convert documents using shell utilities (npx marked / pandoc / wkhtmltopdf / similar via the Bash tool) — the container does not have npm-registry access or these binaries; the attempt will fail and the founder will see a confusing "still encountering an issue" loop. Call `baget_list_documents` FIRST to resolve a name (e.g. \'pitch deck\') to a documentId. Lands in the same chat thread as the conversation — no "to" parameter needed.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -1185,6 +1195,222 @@ const sendDocumentFile: McpToolDefinition = {
 
     log(`send_document_file: ${id} → ${routing.resolvedName} (${safeFilename}, ${buffer.length} bytes)`);
     return ok(`Sent ${safeFilename} (${(buffer.length / 1024).toFixed(0)} KB).`);
+  },
+};
+
+// ── DECK VISUALS ────────────────────────────────────────────────────────────
+
+/**
+ * Per-slide download timeout. Each slide is ~150-500 KB on Vercel Blob
+ * (CDN-cached, sub-100ms in practice); 10s is conservative for the
+ * tail. Mirrors the BLOB_FETCH_TIMEOUT_MS used by send_document_file.
+ */
+const SLIDE_BLOB_FETCH_TIMEOUT_MS = 10_000;
+
+/**
+ * Per-slide size cap. A 1920×1080 PNG with rich content rarely exceeds
+ * 1.5 MB; 5 MB gives generous headroom while protecting against an
+ * attacker-controlled blobUrl smuggling a 4K-bombing payload before
+ * SSRF host check rejects it. Aggregate cap (cap × MAX_SLIDES_PER_RENDER)
+ * stays well under MAX_ATTACHMENT_BYTES (45 MB).
+ */
+const MAX_SLIDE_BYTES = 5 * 1024 * 1024;
+
+/**
+ * Telegram caption cap on a single photo is 1024 chars; we keep it
+ * tighter to leave room for emoji + persona prefix on the host side.
+ */
+const MAX_DECK_CAPTION_CHARS = 500;
+
+interface RenderSlidesResponse {
+  slides?: Array<{
+    index: number;
+    blobUrl: string;
+    mimeType: string;
+    width: number;
+    height: number;
+    slideType: string | null;
+  }>;
+}
+
+const sendDeckVisuals: McpToolDefinition = {
+  tool: {
+    name: 'baget_send_deck_visuals',
+    description:
+      "Send a pitch deck to the founder as VISUAL slides — actual rendered PNG images of every slide, in order. This is the chat-native default for ANY delivery of a deck-category document on Telegram: bare 'send me the deck', 'share the pitch', 'give me the deck', 'show me the slides'. The founder gets a sequence of slide images they can scroll through inline — visual layout preserved, not text. Use `baget_read_document` instead ONLY when the founder asks for CONTENT discussion ('what's in the deck?', 'summarize the pitch', 'read me the problem statement') — that path returns markdown for inline quoting. Use `baget_send_document_file` instead for NON-deck documents (BPs, brand guides, research) when the founder explicitly asks for a file. Call `baget_list_documents` FIRST to resolve a name (e.g. 'pitch deck') to a documentId; never guess document ids. Caption rides on the first slide only — keep it short (≤500 chars). The renderer caps at 20 slides; a deck longer than that returns a friendly 'see the dashboard' message.",
+    inputSchema: {
+      type: 'object',
+      properties: {
+        documentId: {
+          type: 'string',
+          format: 'uuid',
+          description: 'UUID of the deck to render; resolve via baget_list_documents.',
+        },
+        text: {
+          type: 'string',
+          maxLength: MAX_DECK_CAPTION_CHARS,
+          description:
+            "Optional one-line caption for the FIRST slide (e.g. 'Here's the deck — let me know which slide to expand.'). Telegram convention: caption attaches to the lead image only.",
+        },
+      },
+      required: ['documentId'],
+      additionalProperties: false,
+    },
+  },
+  async handler(args) {
+    const ctx = requireCompanyId();
+    if (!ctx.ok) return fail(ctx.error);
+
+    const documentId = String(args.documentId ?? '').trim();
+    if (!documentId) return fail('documentId is required');
+
+    // 1. Ask baget.ai to render the deck to per-slide PNGs. The route
+    //    is bearer-aware via the same channel-token path as the LIST +
+    //    per-doc routes. encodeURIComponent neutralizes a hallucinated
+    //    path traversal in the model-supplied id.
+    const render = await bagetFetch<RenderSlidesResponse>({
+      method: 'POST',
+      path: `/api/companies/${ctx.companyId}/documents/${encodeURIComponent(documentId)}/render-slides`,
+      timeoutMs: RENDER_PDF_TIMEOUT_MS, // chromium cold-start + render budget — same shape as render-pdf
+    });
+
+    // Failure mapping — typed status codes from the apps/web route
+    // (PR #493). bagetFetch only surfaces { status, error: string } on
+    // non-2xx, so we discriminate on the status code and emit the
+    // matching founder-facing copy. Generic 5xx falls through to the
+    // raw error string.
+    if (!render.ok) {
+      if (render.status === 413) {
+        return fail(
+          'That deck is longer than I can ship in chat. ' +
+            'Take a look at the Documents tab on your dashboard for the full version.',
+        );
+      }
+      if (render.status === 422) {
+        return fail(
+          "That document isn't a deck — call baget_read_document with the same id " +
+            'to fetch its content inline instead.',
+        );
+      }
+      if (render.status === 404) {
+        return fail(`I couldn't find that document — call baget_list_documents to refresh the catalogue.`);
+      }
+      return fail(`send_deck_visuals failed: ${render.error}`);
+    }
+
+    if (!render.data || typeof render.data !== 'object' || !Array.isArray(render.data.slides)) {
+      return fail('send_deck_visuals got an unexpected response shape from /render-slides');
+    }
+    const slides = render.data.slides;
+    if (slides.length === 0) {
+      return fail('send_deck_visuals: /render-slides returned no slides — deck may be empty.');
+    }
+
+    // 2. Validate every slide URL up-front (fail-fast SSRF check).
+    //    A single bad URL aborts the whole send rather than half-
+    //    delivering and confusing the founder.
+    for (const slide of slides) {
+      let parsed: URL;
+      try {
+        parsed = new URL(slide.blobUrl);
+      } catch {
+        return fail(`send_deck_visuals got an invalid blobUrl from /render-slides: ${slide.blobUrl}`);
+      }
+      if (parsed.protocol !== 'https:' || !parsed.hostname.endsWith(ALLOWED_BLOB_HOST_SUFFIX)) {
+        return fail(
+          `send_deck_visuals refused to fetch a blobUrl outside the allowed Vercel Blob domain (host=${parsed.hostname}).`,
+        );
+      }
+    }
+
+    // 3. Resolve the destination — always reply in-place.
+    const routing = resolveRouting(undefined);
+    if ('error' in routing) return fail(routing.error);
+
+    // 4. Stage every slide PNG in one outbox dir.
+    //    Sequential downloads — the channel adapter ships them one by
+    //    one anyway, and parallel fetches against the same Blob CDN
+    //    don't actually help latency for 6-20 small files. Each fetch
+    //    has its own size cap (matches send_document_file pattern).
+    const outboxId = generateId();
+    const outboxDir = path.join(workspaceOutboxDir(), outboxId);
+    try {
+      fs.mkdirSync(outboxDir, { recursive: true });
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      return fail(`send_deck_visuals failed to stage the outbox dir: ${msg}`);
+    }
+
+    const captionText = typeof args.text === 'string' ? args.text.trim() : '';
+    const attachments: Array<{ kind: 'photo'; path: string; filename: string; caption?: string }> = [];
+
+    for (const slide of slides) {
+      let buffer: Buffer;
+      try {
+        const res = await fetch(slide.blobUrl, { signal: AbortSignal.timeout(SLIDE_BLOB_FETCH_TIMEOUT_MS) });
+        if (!res.ok) {
+          return fail(`send_deck_visuals failed to fetch slide ${slide.index + 1} (HTTP ${res.status})`);
+        }
+        const lenHeader = res.headers.get('content-length');
+        if (lenHeader && Number.parseInt(lenHeader, 10) > MAX_SLIDE_BYTES) {
+          return fail(`send_deck_visuals: slide ${slide.index + 1} is over the ${MAX_SLIDE_BYTES / 1024 / 1024} MB cap.`);
+        }
+        const arr = await res.arrayBuffer();
+        if (arr.byteLength > MAX_SLIDE_BYTES) {
+          return fail(`send_deck_visuals: slide ${slide.index + 1} is over the ${MAX_SLIDE_BYTES / 1024 / 1024} MB cap.`);
+        }
+        buffer = Buffer.from(arr);
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        return fail(`send_deck_visuals failed to fetch slide ${slide.index + 1}: ${msg}`);
+      }
+
+      // Filename: `slide-1-cover.png`, `slide-2-problem.png`, etc.
+      // The slideType comes from the composer's `data-slide-type`
+      // attribute (cover / problem / solution / market / traction /
+      // ask). Index is 1-based for founder-readable filenames; null
+      // slideType degrades to just `slide-N.png`.
+      const safeType = slide.slideType
+        ? slide.slideType.replace(/[^a-z0-9]+/gi, '-').toLowerCase().slice(0, 32)
+        : '';
+      const filename = safeType
+        ? `slide-${slide.index + 1}-${safeType}.png`
+        : `slide-${slide.index + 1}.png`;
+      const stagedPath = path.join(outboxDir, filename);
+      try {
+        fs.writeFileSync(stagedPath, buffer);
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        return fail(`send_deck_visuals failed to stage slide ${slide.index + 1} locally: ${msg}`);
+      }
+
+      attachments.push({
+        kind: 'photo',
+        path: stagedPath,
+        filename,
+        // Telegram convention: caption rides on the lead photo only.
+        // Subsequent photos in the same outbox row ship without
+        // caption; the persona-prefixed text reply (if any) follows
+        // separately per the adapter's existing flow.
+        ...(slide.index === 0 && captionText ? { caption: captionText } : {}),
+      });
+    }
+
+    // 5. Emit ONE outbox row with all attachments. The adapter loops
+    //    and ships each as a separate Telegram photo message in
+    //    sequence. (sendMediaGroup album would fold them into a
+    //    swipeable carousel; that's a future adapter optimization.)
+    writeMessageOut({
+      id: outboxId,
+      kind: 'chat',
+      platform_id: routing.platform_id,
+      channel_type: routing.channel_type,
+      thread_id: routing.thread_id,
+      content: JSON.stringify({ text: '', attachments }),
+    });
+
+    log(`send_deck_visuals: ${outboxId} → ${routing.resolvedName} (${slides.length} slides)`);
+    return ok(`Sent the deck — ${slides.length} slide${slides.length === 1 ? '' : 's'}.`);
   },
 };
 
@@ -2449,6 +2675,7 @@ registerTools([
   checkDomainAvailability,
   // File transfer
   sendDocumentFile,
+  sendDeckVisuals,
   // Generate
   generateImage,
   // Write — direct (existing)

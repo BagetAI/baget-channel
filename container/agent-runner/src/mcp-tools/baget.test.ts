@@ -149,15 +149,23 @@ describe('baget_read_document tool registration', () => {
   // Before this fix the description only listed discuss/summarize
   // intents, so the LLM defaulted to send_document_file (PDF) for
   // delivery requests. Pin the new positive triggers.
-  it('description claims the chat-native default for bare delivery requests', () => {
+  it('description claims the chat-native default for NON-DECK content + deck content-discussion', () => {
+    // Sam 2026-05-07 Phase 2: read_document is NO LONGER the bare-
+    // delivery default for DECKS — `baget_send_deck_visuals` ships
+    // visual slide images for that intent. read_document is the
+    // chat-native default for (a) bare delivery on non-deck docs
+    // (BPs, brand guides, research) and (b) content-discussion on
+    // ANY document including decks ("what's in the deck?", "summarize
+    // the pitch"). Pin the new framing.
     const tool = getRegisteredToolByName('baget_read_document');
     const description = (tool!.tool.description ?? '').toLowerCase();
     expect(description).toContain('chat-native default');
-    // Positive triggers for the bare-delivery class — the description
-    // must list at least one phrase from each shape so the model
-    // generalizes to the family, not just one literal.
-    expect(description).toContain('send me the deck');
-    expect(description).toMatch(/share the bp|give me the (bp|brand guide)|show me the pitch/i);
+    // Must steer DECK delivery requests to send_deck_visuals, not itself.
+    expect(description).toContain('baget_send_deck_visuals');
+    // Must keep content-discussion intents as positive triggers.
+    expect(description).toMatch(/what'?s in|summarize|read me|positioning|content-discussion/i);
+    // Must list at least one bare-delivery phrase for non-deck docs.
+    expect(description).toMatch(/send me the bp|share the bp|give me the (bp|brand guide)/i);
   });
 
   it('declares documentId as a required uuid string', () => {
@@ -468,48 +476,39 @@ describe('baget_send_document_file tool registration', () => {
     expect(description).not.toContain('share the brand guide');
   });
 
-  // Sam 2026-05-07 Telegram smoke (PR #63 follow-up): the explicit-
-  // format request "I want the deck PDF" correctly routed to send_file,
-  // BUT the resulting PDF was unreadable on phone — pdfkit renders
-  // markdown as a wall of styled text and loses all slide structure.
-  // Decks have NO usable PDF render path; the tool must steer the
-  // model away from the file path for `category === "deck"` docs
-  // regardless of phrasing. Pinned across all three descriptions
-  // because the model learns from layered reinforcement (landmine
-  // #19: layered prompts can't override a base — flip all three or
-  // the bug returns).
-  it('hard-rules deck-category documents to baget_read_document', () => {
+  // Sam 2026-05-07 Phase 2: PR #64's "decks ALWAYS read_document" rule
+  // is REVOKED — `baget_send_deck_visuals` now ships actual rendered
+  // slide images for deck delivery. The send_document_file description
+  // must redirect deck-delivery intent to send_deck_visuals (NOT
+  // read_document like PR #64 did). Pin the new redirect.
+  it('redirects deck-delivery intent to baget_send_deck_visuals (Phase 2 revokes PR #64 deck=read rule)', () => {
     const sendDescription = (getRegisteredToolByName('baget_send_document_file')!.tool.description ?? '').toLowerCase();
     expect(sendDescription).toContain('deck');
-    expect(sendDescription).toMatch(/category.*deck|deck.*category/i);
-    // Steers back to read_document and dashboard for decks.
-    expect(sendDescription).toMatch(/baget_read_document/i);
-    expect(sendDescription).toMatch(/dashboard/i);
-    expect(sendDescription).toMatch(/slide layout|slide structure|slide rendering|slide-by-slide|wall of (styled )?text/i);
+    // Steers DECK requests to send_deck_visuals, not read_document.
+    expect(sendDescription).toContain('baget_send_deck_visuals');
+    // Visual-rendering rationale (the why behind the redirect).
+    expect(sendDescription).toMatch(/visual|slide image|slide images|rendered slide/i);
   });
 });
 
-// Sam 2026-05-07 (PR #64): the deck-no-PDF rule MUST appear in all
-// three coordinated descriptions (landmine #19 — layered prompts can't
-// override a base; one-off rules in the send tool only would still
-// have the read tool say "send_file is the alternative" without the
-// caveat). Pin the rule's presence across the discovery surface.
-describe('deck-category routing rule is reinforced across all three document tools', () => {
+// Sam 2026-05-07 Phase 2: the visual-deck-delivery rule MUST appear in
+// all three coordinated descriptions (landmine #19 — layered prompts
+// can't override a base; one-off rules get drowned out). Pin the rule's
+// presence across the discovery surface.
+describe('deck routing rule (Phase 2) is reinforced across all three document tools', () => {
   it.each([
-    // Each tool must mention "deck" + the dashboard fallback. The
-    // routing pointer (which OTHER tool to use) is per-tool: list and
-    // send point at read_document; read points at... itself, so we
-    // just assert it mentions the deck rule + dashboard, which is
-    // sufficient — the model already knows it's holding `read` when
-    // it consumes `read`'s description.
-    ['baget_list_documents', /baget_read_document/i],
-    ['baget_read_document', /quote.*inline|inline.*quote|markdown body/i],
-    ['baget_send_document_file', /baget_read_document/i],
-  ])('%s description mentions the deck-category guard', (toolName, redirectMatcher) => {
+    // Each tool must mention "deck" + steer deck-delivery to
+    // send_deck_visuals. Note: send_deck_visuals doesn't need to point
+    // at itself — that test covers list_documents + read_document +
+    // send_document_file as the three OTHER tools that must route
+    // decks correctly.
+    ['baget_list_documents', /baget_send_deck_visuals/i],
+    ['baget_read_document', /baget_send_deck_visuals/i],
+    ['baget_send_document_file', /baget_send_deck_visuals/i],
+  ])('%s description routes deck-delivery to baget_send_deck_visuals', (toolName, redirectMatcher) => {
     const description = (getRegisteredToolByName(toolName)!.tool.description ?? '').toLowerCase();
     expect(description).toContain('deck');
     expect(description).toMatch(redirectMatcher);
-    expect(description).toMatch(/dashboard/i);
   });
 
   it('declares documentId as required uuid plus an optional caption text', () => {
@@ -664,6 +663,177 @@ describe('baget_send_document_file handler — success path', () => {
     await tool!.handler({ documentId: '../other-tenant/secret' });
     expect(fetchCalls[0].url).not.toContain('/other-tenant/');
     expect(fetchCalls[0].url).toContain('%2F');
+  });
+});
+
+describe('baget_send_deck_visuals handler — success + failure mapping', () => {
+  // The full chromium-render path can't be unit-tested (no binary in CI),
+  // so these tests cover the route's RESPONSE-shape handling: 200 →
+  // download + outbox emission, 413/422/404 → typed founder-readable
+  // error, 500 → generic. Each of the typed errors maps to a different
+  // founder-facing message string the agent surfaces verbatim.
+
+  const SLIDE_BASE = 'https://test-store-abc.public.blob.vercel-storage.com/attachments/company-uuid-123/pitch-deck';
+  const PNG_BYTES = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d]);
+
+  it('downloads each slide PNG, stages them in one outbox dir, and emits ONE messages_out row with all attachments', async () => {
+    seedSingleDestination();
+    const workspace = setupWorkspace();
+
+    routeResponse(
+      (url) => url.includes('/render-slides'),
+      () =>
+        new Response(
+          JSON.stringify({
+            slides: [
+              { index: 0, blobUrl: `${SLIDE_BASE}-1.png`, mimeType: 'image/png', width: 1920, height: 1080, slideType: 'cover' },
+              { index: 1, blobUrl: `${SLIDE_BASE}-2.png`, mimeType: 'image/png', width: 1920, height: 1080, slideType: 'problem' },
+              { index: 2, blobUrl: `${SLIDE_BASE}-3.png`, mimeType: 'image/png', width: 1920, height: 1080, slideType: null },
+            ],
+          }),
+          { status: 200 },
+        ),
+    );
+    // Each slide URL returns the PNG fixture.
+    routeResponse(
+      (url) => url.startsWith(SLIDE_BASE),
+      () => new Response(PNG_BYTES, { status: 200 }),
+    );
+
+    const tool = getRegisteredToolByName('baget_send_deck_visuals');
+    const result = await tool!.handler({ documentId: 'doc-uuid-deck', text: "Here's the deck — tap any slide." });
+    expect(result.isError).toBeUndefined();
+    expect((result.content[0] as { text: string }).text).toContain('3 slides');
+
+    // 1 POST to render-slides + 3 GETs to the slide blobs = 4 fetches.
+    expect(fetchCalls).toHaveLength(4);
+    expect(fetchCalls[0].method).toBe('POST');
+    expect(fetchCalls[0].url).toContain('/render-slides');
+    expect(fetchCalls[0].authHeader).toBe('Bearer test-bearer-token');
+    expect(fetchCalls[1].url).toBe(`${SLIDE_BASE}-1.png`);
+
+    // All slides staged in ONE outbox dir.
+    const outboxRoot = path.join(workspace, 'outbox');
+    const messageDirs = fs.readdirSync(outboxRoot);
+    expect(messageDirs).toHaveLength(1);
+    const dirEntries = fs.readdirSync(path.join(outboxRoot, messageDirs[0]));
+    expect(dirEntries.sort()).toEqual(['slide-1-cover.png', 'slide-2-problem.png', 'slide-3.png']);
+
+    // ONE messages_out row with all 3 attachments — adapter loops and
+    // ships each as a separate Telegram photo message.
+    const rows = getOutboundDb().prepare('SELECT content FROM messages_out').all() as Array<{ content: string }>;
+    expect(rows).toHaveLength(1);
+    const content = JSON.parse(rows[0].content);
+    expect(content.text).toBe('');
+    expect(content.attachments).toHaveLength(3);
+    expect(content.attachments.every((a: { kind: string }) => a.kind === 'photo')).toBe(true);
+    // Caption rides ONLY on the first attachment (Telegram convention).
+    expect(content.attachments[0].caption).toBe("Here's the deck — tap any slide.");
+    expect(content.attachments[1].caption).toBeUndefined();
+    expect(content.attachments[2].caption).toBeUndefined();
+  });
+
+  it('omits caption when text arg is empty / whitespace-only', async () => {
+    seedSingleDestination();
+    setupWorkspace();
+    routeResponse(
+      (url) => url.includes('/render-slides'),
+      () =>
+        new Response(
+          JSON.stringify({
+            slides: [
+              { index: 0, blobUrl: `${SLIDE_BASE}-1.png`, mimeType: 'image/png', width: 1920, height: 1080, slideType: 'cover' },
+            ],
+          }),
+          { status: 200 },
+        ),
+    );
+    routeResponse(
+      (url) => url.startsWith(SLIDE_BASE),
+      () => new Response(PNG_BYTES, { status: 200 }),
+    );
+    const tool = getRegisteredToolByName('baget_send_deck_visuals');
+    const result = await tool!.handler({ documentId: 'doc-uuid-deck', text: '   ' });
+    expect(result.isError).toBeUndefined();
+    const rows = getOutboundDb().prepare('SELECT content FROM messages_out').all() as Array<{ content: string }>;
+    const content = JSON.parse(rows[0].content);
+    expect(content.attachments[0].caption).toBeUndefined();
+  });
+
+  it('returns the friendly 413 message when the deck is too long', async () => {
+    seedSingleDestination();
+    setupWorkspace();
+    routeResponse(
+      (url) => url.includes('/render-slides'),
+      () =>
+        new Response(JSON.stringify({ error: 'deck-too-many-slides', count: 50, limit: 20 }), { status: 413 }),
+    );
+    const tool = getRegisteredToolByName('baget_send_deck_visuals');
+    const result = await tool!.handler({ documentId: 'doc-uuid-toobig' });
+    expect(result.isError).toBe(true);
+    const text = (result.content[0] as { text: string }).text;
+    expect(text).toMatch(/longer than I can ship/i);
+    expect(text).toMatch(/dashboard/i);
+  });
+
+  it('returns the read_document fallback message when the doc is not a deck (422)', async () => {
+    seedSingleDestination();
+    setupWorkspace();
+    routeResponse(
+      (url) => url.includes('/render-slides'),
+      () => new Response(JSON.stringify({ error: 'Document is not a deck' }), { status: 422 }),
+    );
+    const tool = getRegisteredToolByName('baget_send_deck_visuals');
+    const result = await tool!.handler({ documentId: 'doc-uuid-bp' });
+    expect(result.isError).toBe(true);
+    const text = (result.content[0] as { text: string }).text;
+    // Must steer the agent at the right next-tool call so the founder
+    // doesn't see a dead-end refusal.
+    expect(text).toContain('baget_read_document');
+  });
+
+  it('returns the list_documents-refresh hint on 404', async () => {
+    seedSingleDestination();
+    setupWorkspace();
+    routeResponse(
+      (url) => url.includes('/render-slides'),
+      () => new Response(JSON.stringify({ error: 'Document not found' }), { status: 404 }),
+    );
+    const tool = getRegisteredToolByName('baget_send_deck_visuals');
+    const result = await tool!.handler({ documentId: 'doc-uuid-stale' });
+    expect(result.isError).toBe(true);
+    expect((result.content[0] as { text: string }).text).toContain('baget_list_documents');
+  });
+
+  it('refuses to fetch a slide URL outside the Vercel Blob domain (SSRF guard)', async () => {
+    seedSingleDestination();
+    setupWorkspace();
+    routeResponse(
+      (url) => url.includes('/render-slides'),
+      () =>
+        new Response(
+          JSON.stringify({
+            slides: [
+              {
+                index: 0,
+                blobUrl: 'https://attacker.example.com/internal/aws-metadata',
+                mimeType: 'image/png',
+                width: 1920,
+                height: 1080,
+                slideType: null,
+              },
+            ],
+          }),
+          { status: 200 },
+        ),
+    );
+    const tool = getRegisteredToolByName('baget_send_deck_visuals');
+    const result = await tool!.handler({ documentId: 'doc-uuid-deck' });
+    expect(result.isError).toBe(true);
+    expect((result.content[0] as { text: string }).text).toMatch(/blob domain|attacker\.example\.com/i);
+    // No slide fetch happened — the SSRF check fires BEFORE any blob GET.
+    // Only the render-slides POST should be in fetchCalls.
+    expect(fetchCalls.filter((c) => c.url.includes('attacker.example.com'))).toHaveLength(0);
   });
 });
 
@@ -1430,6 +1600,52 @@ describe('baget_generate_image handler — failure paths', () => {
     // Generation failed BEFORE any I/O — no outbox dir created.
     const rows = getOutboundDb().prepare('SELECT id FROM messages_out').all();
     expect(rows).toHaveLength(0);
+  });
+});
+
+describe('baget_send_deck_visuals tool registration', () => {
+  it('is registered under the name the prompts now point at', () => {
+    const tool = getRegisteredToolByName('baget_send_deck_visuals');
+    expect(tool).toBeDefined();
+    expect(tool!.tool.name).toBe('baget_send_deck_visuals');
+  });
+
+  it('description claims chat-native default for deck delivery, with positive trigger phrases', () => {
+    // Sam 2026-05-07 Phase 2: this tool is the new chat-native default
+    // for any DECK-delivery request on Telegram. The description must
+    // (a) name the chat-native default explicitly, (b) list bare-
+    // delivery triggers as POSITIVE (per landmine #21 additive framing
+    // + landmine #28 no negative literals), (c) carve out the content-
+    // discussion path back to baget_read_document so the LLM picks the
+    // right tool when the founder asks about CONTENTS not DELIVERY.
+    const tool = getRegisteredToolByName('baget_send_deck_visuals');
+    const description = (tool!.tool.description ?? '').toLowerCase();
+    expect(description).toContain('chat-native default');
+    expect(description).toContain('deck');
+    // Bare-delivery family — triggers we WANT the model to pattern on.
+    expect(description).toMatch(/send me the deck|share the pitch|give me the deck|show me the slides/i);
+    // Carve-out: content-discussion still goes to read_document.
+    expect(description).toContain('baget_read_document');
+    expect(description).toMatch(/what'?s in|summarize|content[-\s]?discuss|read me/i);
+    // Discoverability: the model must know to call list_documents
+    // first to resolve a name to a documentId.
+    expect(description).toContain('baget_list_documents');
+  });
+
+  it('declares documentId required uuid + optional caption text with sane cap', () => {
+    const tool = getRegisteredToolByName('baget_send_deck_visuals');
+    const schema = tool!.tool.inputSchema as {
+      properties: Record<string, { type: string; format?: string; maxLength?: number }>;
+      required?: string[];
+    };
+    expect(schema.required).toEqual(['documentId']);
+    expect(schema.properties.documentId?.type).toBe('string');
+    expect(schema.properties.documentId?.format).toBe('uuid');
+    expect(schema.properties.text?.type).toBe('string');
+    expect(typeof schema.properties.text?.maxLength).toBe('number');
+    // Caption cap: ≤500 chars (Telegram caption limit is 1024 but we
+    // leave headroom for emoji + persona prefix).
+    expect(schema.properties.text!.maxLength!).toBeLessThanOrEqual(500);
   });
 });
 
