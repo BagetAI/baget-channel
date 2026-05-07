@@ -143,6 +143,23 @@ describe('baget_read_document tool registration', () => {
     expect(description).toContain('baget_list_documents');
   });
 
+  // Sam 2026-05-07 Telegram regression (companion to the same assertion
+  // in baget_list_documents above): read_document is the CHAT-NATIVE
+  // DEFAULT for any bare "send me X" / "share X" / "give me X" request.
+  // Before this fix the description only listed discuss/summarize
+  // intents, so the LLM defaulted to send_document_file (PDF) for
+  // delivery requests. Pin the new positive triggers.
+  it('description claims the chat-native default for bare delivery requests', () => {
+    const tool = getRegisteredToolByName('baget_read_document');
+    const description = (tool!.tool.description ?? '').toLowerCase();
+    expect(description).toContain('chat-native default');
+    // Positive triggers for the bare-delivery class — the description
+    // must list at least one phrase from each shape so the model
+    // generalizes to the family, not just one literal.
+    expect(description).toContain('send me the deck');
+    expect(description).toMatch(/share the bp|give me the (bp|brand guide)|show me the pitch/i);
+  });
+
   it('declares documentId as a required uuid string', () => {
     const tool = getRegisteredToolByName('baget_read_document');
     const schema = tool!.tool.inputSchema as {
@@ -165,6 +182,28 @@ describe('baget_list_documents description', () => {
     const description = tool!.tool.description ?? '';
     expect(description).toContain('baget_read_document');
     expect(description).toContain('baget_send_document_file');
+  });
+
+  // Sam 2026-05-07 Telegram regression: bare "send me the pitch deck" was
+  // returning a 9 KB PDF attachment because all three tool descriptions
+  // (list / read / send) reinforced the same wrong default — file
+  // attachment for any "send me X" intent. PDF on Telegram requires a
+  // download, has no inline preview, and breaks the conversation flow.
+  // The right chat-native default is `baget_read_document` (markdown
+  // body inline). Pin the new routing in all three description tests so
+  // a future prompt edit can't silently re-default to the file path.
+  it('routes bare "send me X" intents to baget_read_document as the chat-native default', () => {
+    const tool = getRegisteredToolByName('baget_list_documents');
+    const description = (tool!.tool.description ?? '').toLowerCase();
+    // The hint must spell out that bare delivery requests default to
+    // read, not send-file. Use phrase fragments the LLM can pattern on.
+    expect(description).toContain('chat-native default');
+    expect(description).toContain('baget_read_document');
+    expect(description).toContain('send me the deck');
+    // The send_document_file tool MUST be gated on explicit format /
+    // forward / save intent — the description should mention at least
+    // one such trigger so the model learns the contrast.
+    expect(description).toMatch(/as a pdf|the file|to forward|to save|attach the file/i);
   });
 });
 
@@ -318,14 +357,40 @@ describe('baget_send_document_file tool registration', () => {
     // The original bug was the model hallucinating this tool name when it
     // didn't exist. Now it exists; the failure mode shifts to the model
     // picking the WRONG document tool. The description has to lead with
-    // the file-attachment intent so the founder's "send me the deck"
-    // → this tool, not read_document.
+    // the file-attachment intent so the founder's EXPLICIT-format request
+    // ("send me the deck as a PDF") routes here.
     const tool = getRegisteredToolByName('baget_send_document_file');
     const description = tool!.tool.description ?? '';
     expect(description.toLowerCase()).toContain('file attachment');
-    expect(description.toLowerCase()).toContain('send me the deck');
     expect(description).toContain('baget_read_document');
     expect(description).toContain('baget_list_documents');
+  });
+
+  // Sam 2026-05-07 Telegram regression: bare "send me the pitch deck"
+  // returned a 9 KB PDF. Root cause was three coordinated description
+  // failures — list / read / send all listed bare delivery requests as
+  // a send-file trigger. THIS tool's description must now narrow the
+  // trigger to EXPLICIT format-or-forward intent, and must NOT reference
+  // bare delivery phrases as triggers (per landmine #28: literal
+  // negative examples reinforce the banned content; describe the shape,
+  // not the phrase).
+  it('triggers ONLY on explicit format / forward / save intent — no bare-delivery literal in the description', () => {
+    const tool = getRegisteredToolByName('baget_send_document_file');
+    const description = (tool!.tool.description ?? '').toLowerCase();
+    // Must name the chat-native default by tool name + steer back to it
+    // when the founder didn't specify a format.
+    expect(description).toContain('chat-native default');
+    expect(description).toContain('baget_read_document');
+    // Must list at least one positive trigger from the explicit-format
+    // family so the model learns the shape.
+    expect(description).toMatch(/as a pdf|the file to forward|the pdf|attach the/i);
+    // Must NOT contain the bare-delivery literal that previously misrouted
+    // (landmine #28: "send me the deck" appearing anywhere in the
+    // description — even in a NOT framing — increases its salience as a
+    // trigger candidate). Read_document owns this phrase now.
+    expect(description).not.toContain('send me the deck');
+    expect(description).not.toContain('share the bp');
+    expect(description).not.toContain('share the brand guide');
   });
 
   it('declares documentId as required uuid plus an optional caption text', () => {
