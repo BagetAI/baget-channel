@@ -1920,7 +1920,7 @@ const revealProspect: McpToolDefinition = {
   tool: {
     name: 'baget_reveal_prospect',
     description:
-      'Reveal email addresses for N prospects from the most-recent discovery search. Use when the founder says "reveal 10 leads", "unlock 20 prospects", "get me emails for the next 5". Costs 1 credit per SUCCESSFUL email match — fewer than `count` may be returned if some prospects have no matchable contact. APPROVAL-GATED — the cost preview shows the worst-case credit charge (= count) before the founder confirms. Cap is 100 from chat (vs 500 from dashboard) to limit runaway spends. WHEN RELAYING THE RESULT to the founder, ALWAYS state the actual reveal count vs the requested count — e.g. "Revealed 2 of the 3 you asked for (1 prospect had no matchable contact). Charged 2 credits." Never report the requested count as if it were the result; mismatch reads as a bug.',
+      'Reveal email addresses for N prospects from the most-recent discovery search. Use when the founder says "reveal 10 leads", "unlock 20 prospects", "get me emails for the next 5". Costs 1 credit per SUCCESSFUL email match — fewer than `count` may be returned if some prospects have no matchable contact. APPROVAL-GATED — the cost preview shows the worst-case credit charge (= count) before the founder confirms. Cap is 100 from chat (vs 500 from dashboard) to limit runaway spends. WHEN RELAYING THE RESULT to the founder, ALWAYS state the actual reveal count vs the requested count — e.g. "Revealed 2 of the 3 you asked for (1 prospect had no matchable contact). Charged 2 credits." Never report the requested count as if it were the result; mismatch reads as a bug.\n\nOperates on the LATEST discovery search by default. If you don\'t know whether the founder has any discovered leads yet, call `baget_list_prospect_searches` first — if `searches[]` is empty or all rows are status="failed", reveal will fail with no source to draw from, and you should run `baget_create_prospect_search` instead. The chat agent often wants to reveal "more leads" without realising no search has actually run; this guard prevents the silent fail.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -1974,7 +1974,7 @@ const topupCredits: McpToolDefinition = {
   tool: {
     name: 'baget_topup_credits',
     description:
-      "Generate a Stripe Checkout link the founder can tap to add credits. Use when the founder says \"I'm running low\" / \"add $20 in credits\" / \"top me up\". Bot CANNOT charge directly — payment data must stay with Stripe + the founder's browser. Tool returns a `url` you echo verbatim; founder taps in mobile browser, completes payment, webhook fires, balance updates. Confirm with `baget_get_credits` after the founder reports completion. Apprenti tier rejected (zero credits-per-dollar — checkout would charge real money for nothing). Range: $1–$1,000.",
+      "Generate a Stripe Checkout link the founder can tap to add credits. APPROVAL-GATED — surfaces a confirmation card with the dollar amount before the link is minted (the bot does NOT charge; it just generates a URL the founder taps in their browser). Use when the founder says \"I'm running low\" / \"add $20 in credits\" / \"top me up\". On confirm, baget.ai returns a `url` the LLM echoes verbatim; founder taps, completes Stripe Checkout, webhook fires, balance updates. Confirm with `baget_get_credits` after the founder reports completion. Apprenti tier rejected (zero credits-per-dollar). Range: $1–$1,000.\n\nFlow:\n1. First call: `confirmed: false` with `amountCents`.\n2. baget.ai surfaces approval card showing 'Generate a $X Stripe Checkout link?'\n3. Founder taps Approve → call again with `confirmed: true` and the IDENTICAL payload.\n4. baget.ai returns the URL — relay it verbatim.",
     inputSchema: {
       type: 'object',
       properties: {
@@ -1984,21 +1984,28 @@ const topupCredits: McpToolDefinition = {
           maximum: 100000,
           description: 'Amount in cents. e.g., 2000 = $20. Range [100, 100000].',
         },
+        confirmed: {
+          type: 'boolean',
+          description:
+            'Set to false on the first call (surfaces preview card). Set to true with the IDENTICAL payload after the founder confirms.',
+        },
       },
       required: ['amountCents'],
       additionalProperties: false,
     },
   },
   async handler(args) {
-    const ctx = requireCompanyId();
-    if (!ctx.ok) return fail(ctx.error);
-    const result = await bagetFetch({
-      method: 'POST',
-      path: `/api/companies/${ctx.companyId}/credits/topup`,
-      body: { amountCents: Number(args.amountCents) },
+    const amountCents = Number(args.amountCents);
+    if (!Number.isInteger(amountCents) || amountCents < 100 || amountCents > 100000) {
+      return fail('amountCents must be an integer in [100, 100000]');
+    }
+    const dollars = (amountCents / 100).toFixed(2);
+    return dispatchApproval({
+      action: 'topup-credits',
+      payload: { amountCents },
+      confirmed: args.confirmed === true,
+      summary: `Generate a $${dollars} Stripe Checkout link to add credits to your wallet.`,
     });
-    if (!result.ok) return fail(`topup_credits failed: ${result.error}`);
-    return ok(JSON.stringify(result.data, null, 2));
   },
 };
 
@@ -2325,11 +2332,37 @@ const buyDomain: McpToolDefinition = {
       return fail('expectedPriceCents must be a positive integer');
     }
     const dollars = (expectedPriceCents / 100).toFixed(2);
+
+    // DS-audit follow-up (2026-05-07). The approval-card summary used to
+    // say "your saved card" — founders with multiple PMs had no idea
+    // which card was about to be charged. Pre-fetch the default PM so we
+    // can interpolate `${BRAND} ••••${LAST4}` into the summary text the
+    // founder is approving. Best-effort: if the lookup fails (no card,
+    // provider outage, fork talking to an old baget.ai before the route
+    // existed) we fall back to "your saved card" — the server side still
+    // re-validates payment in `buyDomain.execute`, so the worst case is
+    // a slightly less informative card, never a wrong charge.
+    const ctx = requireCompanyId();
+    if (!ctx.ok) return fail(ctx.error);
+    let cardLabel = 'your saved card';
+    const pmRes = await bagetFetch<{
+      hasCard: boolean;
+      brand?: string;
+      last4?: string;
+    }>({
+      method: 'GET',
+      path: `/api/companies/${ctx.companyId}/payment-method`,
+    });
+    if (pmRes.ok && pmRes.data.hasCard && pmRes.data.brand && pmRes.data.last4) {
+      const brand = String(pmRes.data.brand).toUpperCase();
+      cardLabel = `${brand} ••••${pmRes.data.last4}`;
+    }
+
     return dispatchApproval({
       action: 'buy-domain',
       payload: { name, expectedPriceCents },
       confirmed: args.confirmed === true,
-      summary: `Register **${name}** for $${dollars}/year. Charges your saved card.`,
+      summary: `Register **${name}** for $${dollars}/year. Charges ${cardLabel}.`,
     });
   },
 };
@@ -2385,7 +2418,6 @@ registerTools([
   updateRoadmapItem,
   createProspectSearch,
   // Write — direct (Tier 3)
-  topupCredits,
   setBriefingPreferences,
   // Write — approval-gated
   launchBatch,
@@ -2393,6 +2425,8 @@ registerTools([
   editDocument,
   revealProspect,
   sendCampaign,
+  // Write — approval-gated (Tier 3)
+  topupCredits,
   // Write — approval-gated (Tier 3.5)
   redeploySite,
   // Write — approval-gated (Tier 4)
