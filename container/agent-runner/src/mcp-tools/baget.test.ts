@@ -393,6 +393,50 @@ describe('baget_send_document_file tool registration', () => {
     expect(description).not.toContain('share the brand guide');
   });
 
+  // Sam 2026-05-07 Telegram smoke (PR #63 follow-up): the explicit-
+  // format request "I want the deck PDF" correctly routed to send_file,
+  // BUT the resulting PDF was unreadable on phone — pdfkit renders
+  // markdown as a wall of styled text and loses all slide structure.
+  // Decks have NO usable PDF render path; the tool must steer the
+  // model away from the file path for `category === "deck"` docs
+  // regardless of phrasing. Pinned across all three descriptions
+  // because the model learns from layered reinforcement (landmine
+  // #19: layered prompts can't override a base — flip all three or
+  // the bug returns).
+  it('hard-rules deck-category documents to baget_read_document', () => {
+    const sendDescription = (getRegisteredToolByName('baget_send_document_file')!.tool.description ?? '').toLowerCase();
+    expect(sendDescription).toContain('deck');
+    expect(sendDescription).toMatch(/category.*deck|deck.*category/i);
+    // Steers back to read_document and dashboard for decks.
+    expect(sendDescription).toMatch(/baget_read_document/i);
+    expect(sendDescription).toMatch(/dashboard/i);
+    expect(sendDescription).toMatch(/slide layout|slide structure|slide rendering|slide-by-slide|wall of (styled )?text/i);
+  });
+});
+
+// Sam 2026-05-07 (PR #64): the deck-no-PDF rule MUST appear in all
+// three coordinated descriptions (landmine #19 — layered prompts can't
+// override a base; one-off rules in the send tool only would still
+// have the read tool say "send_file is the alternative" without the
+// caveat). Pin the rule's presence across the discovery surface.
+describe('deck-category routing rule is reinforced across all three document tools', () => {
+  it.each([
+    // Each tool must mention "deck" + the dashboard fallback. The
+    // routing pointer (which OTHER tool to use) is per-tool: list and
+    // send point at read_document; read points at... itself, so we
+    // just assert it mentions the deck rule + dashboard, which is
+    // sufficient — the model already knows it's holding `read` when
+    // it consumes `read`'s description.
+    ['baget_list_documents', /baget_read_document/i],
+    ['baget_read_document', /quote.*inline|inline.*quote|markdown body/i],
+    ['baget_send_document_file', /baget_read_document/i],
+  ])('%s description mentions the deck-category guard', (toolName, redirectMatcher) => {
+    const description = (getRegisteredToolByName(toolName)!.tool.description ?? '').toLowerCase();
+    expect(description).toContain('deck');
+    expect(description).toMatch(redirectMatcher);
+    expect(description).toMatch(/dashboard/i);
+  });
+
   it('declares documentId as required uuid plus an optional caption text', () => {
     const tool = getRegisteredToolByName('baget_send_document_file');
     const schema = tool!.tool.inputSchema as {
