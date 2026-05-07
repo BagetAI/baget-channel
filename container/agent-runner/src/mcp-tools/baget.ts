@@ -2286,6 +2286,54 @@ const redeploySite: McpToolDefinition = {
   },
 };
 
+// ── Tier 4: domain purchase ──────────────────────────────────────────────────
+
+const buyDomain: McpToolDefinition = {
+  tool: {
+    name: 'baget_buy_domain',
+    description:
+      "Register (purchase) a NEW domain on behalf of the founder. APPROVAL-GATED — surfaces a confirmation card with the domain name + price before charging. CHARGES THE FOUNDER'S SAVED CARD via Stripe. The bot CANNOT charge directly; baget.ai handles the Stripe → Vercel /v5/domains/buy → refund-on-failure flow synchronously.\n\nYou MUST call `baget_check_domain_availability` IMMEDIATELY before this — the price quoted there flows into `expectedPriceCents` so baget.ai can detect a price-jump race and refuse to charge above what the founder approved. baget.ai re-quotes anyway and refuses if the price moved beyond a $0.10 tolerance.\n\nFlow:\n1. First call: `confirmed: false` with `name` + `expectedPriceCents` from the prior availability check.\n2. baget.ai surfaces approval card showing 'Charge $X.XX to your VISA •••• 4242 to register yourstartup.com.'\n3. Founder taps Approve → call again with `confirmed: true` and the IDENTICAL payload.\n4. baget.ai charges → buys → attaches → returns `{ domain, expiresAt, addedToProject }`.\n\nFailure modes you need to be ready to relay verbatim: card declined, 3DS required (\"buy via dashboard\"), Vercel rejected (founder is auto-refunded), price changed at registry (auto-refunded, re-quote and try again). The `messageForFounder` in baget.ai's response always tells the truth — echo it.",
+    inputSchema: {
+      type: 'object',
+      properties: {
+        name: {
+          type: 'string',
+          minLength: 3,
+          maxLength: 253,
+          description: "Domain to register, e.g. 'yourstartup.com'. Lowercased + trimmed by baget.ai.",
+        },
+        expectedPriceCents: {
+          type: 'integer',
+          minimum: 1,
+          maximum: 100000000,
+          description: "Quoted price in CENTS from the prior baget_check_domain_availability call. baget.ai re-quotes and rejects if the price moved beyond $0.10.",
+        },
+        confirmed: {
+          type: 'boolean',
+          description: "Set to false on the first call (surfaces preview card). Set to true with the IDENTICAL payload after the founder confirms.",
+        },
+      },
+      required: ['name', 'expectedPriceCents'],
+      additionalProperties: false,
+    },
+  },
+  async handler(args) {
+    const name = String(args.name ?? '').trim().toLowerCase();
+    if (!name) return fail('name is required');
+    const expectedPriceCents = Number(args.expectedPriceCents);
+    if (!Number.isInteger(expectedPriceCents) || expectedPriceCents <= 0) {
+      return fail('expectedPriceCents must be a positive integer');
+    }
+    const dollars = (expectedPriceCents / 100).toFixed(2);
+    return dispatchApproval({
+      action: 'buy-domain',
+      payload: { name, expectedPriceCents },
+      confirmed: args.confirmed === true,
+      summary: `Register **${name}** for $${dollars}/year. Charges your saved card.`,
+    });
+  },
+};
+
 // ── Register ─────────────────────────────────────────────────────────────────
 
 registerTools([
@@ -2347,8 +2395,10 @@ registerTools([
   sendCampaign,
   // Write — approval-gated (Tier 3.5)
   redeploySite,
+  // Write — approval-gated (Tier 4)
+  buyDomain,
 ]);
 
 log(
-  'baget MCP tools registered: 18 read + 1 file-transfer + 1 generate + 21 direct write + 6 approval-gated = 49 total (Tier 3.5: +1 read +1 approval-gated)',
+  'baget MCP tools registered: 18 read + 1 file-transfer + 1 generate + 21 direct write + 7 approval-gated = 50 total (Tier 4: +1 approval-gated)',
 );
