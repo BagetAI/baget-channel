@@ -246,3 +246,66 @@ describe('end-to-end with mock provider', () => {
     expect(outMessages[0].in_reply_to).toBe('m1');
   });
 });
+
+/**
+ * Regression tests for `dispatchResultText` — pinning the `<internal>` strip
+ * inside `<message>` blocks. PR #38 added this fix; PR #40's squash-merge
+ * silently reverted it (see commit c3af5ba's diff at line 379). These tests
+ * fail loud if a future squash drops the strip again.
+ *
+ * The function is exported solely for these tests; production callers go
+ * through the poll-loop event handler.
+ */
+describe('dispatchResultText — <internal> tag strip regression (Bug #19, PR #38)', () => {
+  it('strips <internal>...</internal> from inside a <message to="founder"> block before sending', async () => {
+    const { dispatchResultText } = await import('./poll-loop.js');
+    // Register a destination the LLM can target by name.
+    getInboundDb()
+      .prepare(
+        `INSERT INTO destinations (name, display_name, type, channel_type, platform_id)
+         VALUES ('founder', 'Founder', 'channel', 'baget-telegram', 'pid-1')`,
+      )
+      .run();
+
+    const llmOutput = [
+      '<message to="founder">',
+      '  <internal>Writing Pitch Deck content to a markdown file.</internal>',
+      "  Here's the actual reply you should see.",
+      '</message>',
+    ].join('\n');
+
+    dispatchResultText(llmOutput, {
+      channelType: 'baget-telegram',
+      platformId: 'pid-1',
+    } as never);
+
+    const outMessages = getUndeliveredMessages();
+    expect(outMessages).toHaveLength(1);
+    const text = JSON.parse(outMessages[0].content).text;
+    // The fix: founder must NOT see the literal <internal> tags.
+    expect(text).not.toContain('<internal>');
+    expect(text).not.toContain('</internal>');
+    expect(text).not.toContain('Writing Pitch Deck content');
+    expect(text).toContain("Here's the actual reply you should see.");
+  });
+
+  it('skips a <message> whose body is nothing but <internal>...</internal> (no empty Telegram bubble)', async () => {
+    const { dispatchResultText } = await import('./poll-loop.js');
+    getInboundDb()
+      .prepare(
+        `INSERT INTO destinations (name, display_name, type, channel_type, platform_id)
+         VALUES ('founder', 'Founder', 'channel', 'baget-telegram', 'pid-1')`,
+      )
+      .run();
+
+    const llmOutput = '<message to="founder"><internal>scratchpad only</internal></message>';
+    dispatchResultText(llmOutput, {
+      channelType: 'baget-telegram',
+      platformId: 'pid-1',
+    } as never);
+
+    // No outbound row — the empty body was skipped, NOT sent as an empty bubble.
+    const outMessages = getUndeliveredMessages();
+    expect(outMessages).toHaveLength(0);
+  });
+});
