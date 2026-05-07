@@ -2339,23 +2339,47 @@ const buyDomain: McpToolDefinition = {
     // can interpolate `${BRAND} ••••${LAST4}` into the summary text the
     // founder is approving. Best-effort: if the lookup fails (no card,
     // provider outage, fork talking to an old baget.ai before the route
-    // existed) we fall back to "your saved card" — the server side still
-    // re-validates payment in `buyDomain.execute`, so the worst case is
-    // a slightly less informative card, never a wrong charge.
-    const ctx = requireCompanyId();
-    if (!ctx.ok) return fail(ctx.error);
+    // existed, the new endpoint is slow / unreachable, etc.) we fall
+    // back to "your saved card" — the server side still re-validates
+    // payment in `buyDomain.execute`, so the worst case is a slightly
+    // less informative card, never a wrong charge.
+    //
+    // Code review (PR #58, 2026-05-07):
+    // - Skip the lookup on the second turn. `cardLabel` only feeds the
+    //   approval summary which is shown ONLY on the first turn (when
+    //   `confirmed` is false). Pre-#58 we hit the route on every call.
+    //   [Gemini HIGH]
+    // - Wrap `bagetFetch` in a try/catch — `fetch(..., AbortSignal.
+    //   timeout(...))` REJECTS on timeout instead of returning
+    //   `{ok: false}`, so a slow PM endpoint would fail the buy
+    //   instead of silently degrading to "your saved card". [Codex P2]
+    // - Null-check `pmRes.data` — bagetFetch can return ok:true with a
+    //   null body if the response isn't valid JSON. [Gemini HIGH]
     let cardLabel = 'your saved card';
-    const pmRes = await bagetFetch<{
-      hasCard: boolean;
-      brand?: string;
-      last4?: string;
-    }>({
-      method: 'GET',
-      path: `/api/companies/${ctx.companyId}/payment-method`,
-    });
-    if (pmRes.ok && pmRes.data.hasCard && pmRes.data.brand && pmRes.data.last4) {
-      const brand = String(pmRes.data.brand).toUpperCase();
-      cardLabel = `${brand} ••••${pmRes.data.last4}`;
+    if (args.confirmed !== true) {
+      const ctx = requireCompanyId();
+      if (!ctx.ok) return fail(ctx.error);
+      try {
+        const pmRes = await bagetFetch<{
+          hasCard: boolean;
+          brand?: string;
+          last4?: string;
+        }>({
+          method: 'GET',
+          path: `/api/companies/${ctx.companyId}/payment-method`,
+        });
+        if (
+          pmRes.ok &&
+          pmRes.data?.hasCard &&
+          pmRes.data?.brand &&
+          pmRes.data?.last4
+        ) {
+          const brand = String(pmRes.data.brand).toUpperCase();
+          cardLabel = `${brand} ••••${pmRes.data.last4}`;
+        }
+      } catch {
+        // Network / timeout / abort — keep the generic fallback.
+      }
     }
 
     return dispatchApproval({
