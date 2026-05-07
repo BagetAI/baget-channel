@@ -363,7 +363,10 @@ function handleEvent(event: ProviderEvent, _routing: RoutingContext): void {
  * This preserves the simple case of one user on one channel — the agent
  * doesn't need to know about wrapping syntax at all.
  */
-function dispatchResultText(text: string, routing: RoutingContext): void {
+// Exported for the regression test in poll-loop.test.ts that pins the
+// `<internal>` strip inside `<message>` blocks (Bug #19 / PR #38, silently
+// reverted by PR #40's squash-merge).
+export function dispatchResultText(text: string, routing: RoutingContext): void {
   const MESSAGE_RE = /<message\s+to="([^"]+)"\s*>([\s\S]*?)<\/message>/g;
 
   let match: RegExpExecArray | null;
@@ -376,13 +379,32 @@ function dispatchResultText(text: string, routing: RoutingContext): void {
       scratchpadParts.push(text.slice(lastIndex, match.index));
     }
     const toName = match[1];
-    const body = match[2].trim();
+    // Strip `<internal>…</internal>` tags BEFORE sending to the destination.
+    // Bug #19 (2026-05-05 smoke) — the LLM sometimes nests scratchpad
+    // INSIDE a `<message to="founder">` block, e.g.
+    //   <message to="founder">
+    //     <internal>Writing Pitch Deck content to a markdown file.</internal>
+    //     [actual reply or none]
+    //   </message>
+    // The other strip (line below at `scratchpadParts.join`) only fires on
+    // text OUTSIDE message blocks — bodies INSIDE go to sendToDestination
+    // raw. PR #38 fixed this; PR #40's squash-merge silently reverted the
+    // line by branching off pre-#38 main and overwriting on merge. Restored
+    // here, with `assert-internal-tag-stripped.test.ts` pinning the rule
+    // so a future squash that drops the call fails CI before merge.
+    const body = stripInternalTags(match[2]);
     lastIndex = MESSAGE_RE.lastIndex;
 
     const dest = findByName(toName);
     if (!dest) {
       log(`Unknown destination in <message to="${toName}">, dropping block`);
       scratchpadParts.push(`[dropped: unknown destination "${toName}"] ${body}`);
+      continue;
+    }
+    if (!body) {
+      // After the strip, the message block was nothing but scratchpad.
+      // Skip rather than fire an empty Telegram message.
+      log(`Empty body after stripping <internal> from <message to="${toName}">; not sending`);
       continue;
     }
     sendToDestination(dest, body, routing);
