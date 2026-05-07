@@ -64,6 +64,12 @@ export interface BotPoolRow {
   assigned_at: string | null;
   webhook_registered_at: string | null;
   created_at: string;
+  /** Provenance — `'admin'` for rows inserted via `POST /baget/bot-pool/seed`,
+   *  `'env'` for rows inserted by the boot-time `BAGET_BOT_POOL_SEED_JSON`
+   *  self-seeder. Default `'admin'` per migration #019, so legacy rows
+   *  needed no back-fill. The tag records the FIRST insert path; rotation
+   *  by the other path leaves the tag alone. */
+  source: 'admin' | 'env';
 }
 
 /**
@@ -104,13 +110,21 @@ export type SeedOutcome = 'inserted' | 'rotated';
  * credentials in the DB, bot 401'd silently on every webhook /
  * outbound until manual intervention). Codex P1 catch.
  */
+export type SeedSource = 'admin' | 'env';
+
 export function seedBotPoolEntry(args: {
   botUsername: string;
   botTokenValue: string;
   webhookSecret: string;
   createdAt: string;
+  /** Optional — defaults to `'admin'` for back-compat with all
+   *  existing callers (the operator POST route). The env-var
+   *  self-seeder added in PR #56 passes `'env'` so a debugging
+   *  operator can tell at a glance which channel inserted each row. */
+  source?: SeedSource;
 }): SeedOutcome {
   const db = getDb();
+  const source: SeedSource = args.source ?? 'admin';
   // Wrap the existence check + upsert in one transaction so the
   // outcome flag matches the actual write (no TOCTOU window where a
   // racing seed lands between the SELECT and the INSERT). Since
@@ -118,18 +132,24 @@ export function seedBotPoolEntry(args: {
   // /baget/bot-pool/seed is operator-only / low-frequency, the
   // transaction overhead is negligible.
   return db.transaction((): SeedOutcome => {
-    const existed = db
-      .prepare('SELECT 1 AS one FROM baget_bot_pool WHERE bot_username = ?')
-      .get(args.botUsername) as { one: number } | undefined;
+    const existed = db.prepare('SELECT 1 AS one FROM baget_bot_pool WHERE bot_username = ?').get(args.botUsername) as
+      | { one: number }
+      | undefined;
+    // On rotation we deliberately DO NOT touch `source` — a row that
+    // came in via the admin POST stays tagged 'admin' even when the
+    // env-var seeder later refreshes its token (and vice-versa). The
+    // tag records "where did this entry first arrive?", not "what was
+    // the most recent write?". Flipping it on rotation would make the
+    // debugging signal noisy.
     db.prepare(
       `INSERT INTO baget_bot_pool
          (bot_username, bot_token_value, webhook_secret, status,
-          assigned_agent_group_id, assigned_at, webhook_registered_at, created_at)
-       VALUES (?, ?, ?, 'available', NULL, NULL, NULL, ?)
+          assigned_agent_group_id, assigned_at, webhook_registered_at, created_at, source)
+       VALUES (?, ?, ?, 'available', NULL, NULL, NULL, ?, ?)
        ON CONFLICT(bot_username) DO UPDATE SET
          bot_token_value = excluded.bot_token_value,
          webhook_secret  = excluded.webhook_secret`,
-    ).run(args.botUsername, args.botTokenValue, args.webhookSecret, args.createdAt);
+    ).run(args.botUsername, args.botTokenValue, args.webhookSecret, args.createdAt, source);
     return existed ? 'rotated' : 'inserted';
   })();
 }
@@ -170,7 +190,7 @@ export function assignNextAvailableBot(agentGroupId: string): BotPoolRow | null 
   const db = getDb();
   const SELECT_BY_AGENT = db.prepare(
     `SELECT bot_username, bot_token_value, webhook_secret, status,
-            assigned_agent_group_id, assigned_at, webhook_registered_at, created_at
+            assigned_agent_group_id, assigned_at, webhook_registered_at, created_at, source
        FROM baget_bot_pool
       WHERE assigned_agent_group_id = ?`,
   );
@@ -231,7 +251,7 @@ export function assignNextAvailableBot(agentGroupId: string): BotPoolRow | null 
     return db
       .prepare(
         `SELECT bot_username, bot_token_value, webhook_secret, status,
-                assigned_agent_group_id, assigned_at, webhook_registered_at, created_at
+                assigned_agent_group_id, assigned_at, webhook_registered_at, created_at, source
            FROM baget_bot_pool
           WHERE bot_username = ?`,
       )
@@ -287,7 +307,7 @@ export function getBotPoolEntryByAgentGroup(agentGroupId: string): BotPoolRow | 
   return getDb()
     .prepare(
       `SELECT bot_username, bot_token_value, webhook_secret, status,
-              assigned_agent_group_id, assigned_at, webhook_registered_at, created_at
+              assigned_agent_group_id, assigned_at, webhook_registered_at, created_at, source
          FROM baget_bot_pool
         WHERE assigned_agent_group_id = ?`,
     )
@@ -305,7 +325,7 @@ export function getBotPoolEntryByUsername(botUsername: string): BotPoolRow | und
   return getDb()
     .prepare(
       `SELECT bot_username, bot_token_value, webhook_secret, status,
-              assigned_agent_group_id, assigned_at, webhook_registered_at, created_at
+              assigned_agent_group_id, assigned_at, webhook_registered_at, created_at, source
          FROM baget_bot_pool
         WHERE bot_username = ?`,
     )
@@ -334,8 +354,45 @@ export function markWebhookRegistered(botUsername: string, registeredAt: string)
  * the operator sees the new total.
  */
 export function countAvailableBots(): number {
-  const row = getDb()
-    .prepare(`SELECT COUNT(*) AS n FROM baget_bot_pool WHERE status = 'available'`)
-    .get() as { n: number };
+  const row = getDb().prepare(`SELECT COUNT(*) AS n FROM baget_bot_pool WHERE status = 'available'`).get() as {
+    n: number;
+  };
   return row.n;
+}
+
+/**
+ * Total pool size (any status). Distinct from `countAvailableBots`
+ * because the env-var self-seeder gate keys on "is the table EMPTY?",
+ * not "are there any AVAILABLE bots?". A pool with N assigned-but-no-
+ * available rows is not empty — adding env-seeded rows on top would
+ * silently double-seed any usernames that overlap (the rotation
+ * semantics in `seedBotPoolEntry` would handle this safely, but the
+ * spammed log lines on every boot would be noise). The empty-table
+ * gate avoids that.
+ */
+export function countBotPoolEntries(): number {
+  const row = getDb().prepare(`SELECT COUNT(*) AS n FROM baget_bot_pool`).get() as { n: number };
+  return row.n;
+}
+
+/**
+ * Full-pool dump for the `GET /baget/bot-pool/export` admin route. The
+ * export is the recovery artifact the operator stashes after each seed
+ * so a lost-volume scenario can be restored from JSON without bouncing
+ * back to BotFather for token retrieval. Includes secrets — the route
+ * is bearer-gated like every other admin endpoint.
+ *
+ * Ordered by `created_at ASC` so a side-by-side diff of two exports
+ * highlights what changed (rotated tokens stay in place, new rows
+ * appear at the end).
+ */
+export function listAllBotPoolEntries(): BotPoolRow[] {
+  return getDb()
+    .prepare(
+      `SELECT bot_username, bot_token_value, webhook_secret, status,
+              assigned_agent_group_id, assigned_at, webhook_registered_at, created_at, source
+         FROM baget_bot_pool
+        ORDER BY created_at ASC`,
+    )
+    .all() as BotPoolRow[];
 }
