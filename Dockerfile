@@ -107,13 +107,15 @@ RUN cd /app/container/agent-runner && bun add --no-frozen-lockfile \
 # Pre-create groups/ + data/ — first request to provision a Baget
 # agent_group needs them present.
 #
-# Owned by the `node` user (UID/GID 1000 in node:20-bookworm-slim,
-# matching `USER node` below) with 0755 so only the runtime user can
-# write. The original `chmod 0777` was a multi-tenant exposure: any
-# compromised process in the container could clobber another founder's
-# rendered `CLAUDE.local.md` or `container.json`. We don't have shells
-# in the agent containers today, but the fix is cheap and removes the
-# class of attack from the threat model.
+# Owned by the `node` user (UID/GID 1000 in node:20-bookworm-slim).
+# The container starts as root (see entrypoint section below) and
+# drops to `node` before exec'ing CMD, so this build-time chown is
+# what node sees on local Docker runs (no volume mount). On Railway
+# with a volume on /app/data, the volume overlay clobbers this
+# ownership at mount time — the entrypoint re-chowns at runtime to
+# restore it. The 0755 instead of original `chmod 0777` keeps the
+# multi-tenant exposure closed: a compromised process can't clobber
+# another founder's rendered `CLAUDE.local.md` or `container.json`.
 RUN mkdir -p groups data && chown -R node:node groups data && chmod 0755 groups data
 
 # Single public port. Railway sets PORT and routes its public ingress
@@ -122,8 +124,24 @@ RUN mkdir -p groups data && chown -R node:node groups data && chmod 0755 groups 
 # same listener via registerExtraRoute() — no second port needed.
 EXPOSE 8443
 
-# Drop privileges. node:20-bookworm-slim ships a `node` user (uid 1000).
-USER node
+# Privilege model:
+#   The container starts as root so the entrypoint can chown the
+#   Railway volume that mounts on top of /app/data (the volume
+#   directory is created root:root by the Railway runtime, ignoring
+#   the build-time `chown -R node:node` above — without the chown-on-
+#   start the host crash-loops trying to write circuit-breaker.json).
+#   The entrypoint then drops to the `node` user via `runuser` before
+#   exec'ing CMD, so the actual Node process runs unprivileged and the
+#   "compromised process can clobber another founder's files" threat
+#   model from the original `chmod 0755` comment still holds.
+#
+# DO NOT add a `USER node` here — it bypasses the entrypoint's chown
+# step and reintroduces the EACCES crash-loop on volume-attached
+# Railway services.
+
+COPY docker-entrypoint.sh /docker-entrypoint.sh
+RUN chmod 0755 /docker-entrypoint.sh
+ENTRYPOINT ["/docker-entrypoint.sh"]
 
 ENV RUNTIME=single-process
 ENV NODE_ENV=production
