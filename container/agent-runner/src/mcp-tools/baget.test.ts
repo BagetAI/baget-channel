@@ -295,6 +295,81 @@ describe('baget_read_document handler', () => {
     expect(text).toContain('document not found');
   });
 
+  // Sam 2026-05-07 Telegram smoke (PR #65): the deck doc body had been
+  // regenerated as the new HTML deck format (HTML/CSS for visual
+  // rendering on the dashboard). Without HTML→markdown conversion
+  // here, the agent dutifully quoted the returned `content` inline
+  // and the founder saw 1000+ lines of `<section>` / `<style>` / CSS
+  // tokens in the chat. Pin the conversion at the handler level so
+  // any future channel surface inherits clean markdown automatically.
+  it('converts HTML-shaped content (deck composer output) to markdown before returning', async () => {
+    const docPayload = {
+      document: {
+        id: 'doc-uuid-deck',
+        title: 'Pitch Deck',
+        category: 'deck',
+        content: `<!--baget-deck-html:{"accent":"#3c47ff"}-->
+<section class="baget-deck-slide" data-slide-type="cover">
+  <style>.cover { padding: 80px; background: #f5f2ed; }</style>
+  <h1>Vela</h1>
+  <p>Connecting independent designers with local master makers.</p>
+</section>
+<section class="baget-deck-slide" data-slide-type="problem">
+  <h2>Problem</h2>
+  <ul>
+    <li>Factories require 100+ unit minimums.</li>
+    <li>Sourcing skilled artisans is opaque.</li>
+  </ul>
+</section>`,
+      },
+    };
+    setDefaultResponse(() => new Response(JSON.stringify(docPayload), { status: 200 }));
+
+    const tool = getRegisteredToolByName('baget_read_document');
+    const result = await tool!.handler({ documentId: 'doc-uuid-deck' });
+
+    expect(result.isError).toBeUndefined();
+    const text = (result.content[0] as { text: string }).text;
+    const parsed = JSON.parse(text) as { content: string };
+    // Markdown content survives.
+    expect(parsed.content).toContain('Vela');
+    expect(parsed.content).toContain('Connecting independent designers');
+    expect(parsed.content).toContain('Problem');
+    expect(parsed.content).toContain('Factories require 100+ unit minimums');
+    expect(parsed.content).toContain('Sourcing skilled artisans is opaque');
+    // HTML/CSS noise stripped — the founder-facing failure mode.
+    expect(parsed.content).not.toContain('<style>');
+    expect(parsed.content).not.toContain('<section');
+    expect(parsed.content).not.toContain('padding: 80px');
+    expect(parsed.content).not.toContain('baget-deck-html');
+    expect(parsed.content).not.toContain('data-slide-type');
+  });
+
+  it('passes plain-markdown content through unchanged (no double-conversion of BPs / brand guides)', async () => {
+    // The looksLikeHtml gate must not fire on plain markdown — running
+    // turndown on already-markdown content can subtly mangle escaping.
+    // Pin the no-op behavior with a doc whose content is unmistakably
+    // markdown.
+    const md = '# Vela\n\nFashion designer marketplace.\n\n## Problem\n\n- Factories\n- Skilled artisans\n';
+    const docPayload = {
+      document: {
+        id: 'doc-uuid-bp',
+        title: 'Business Plan',
+        category: 'business',
+        content: md,
+      },
+    };
+    setDefaultResponse(() => new Response(JSON.stringify(docPayload), { status: 200 }));
+
+    const tool = getRegisteredToolByName('baget_read_document');
+    const result = await tool!.handler({ documentId: 'doc-uuid-bp' });
+
+    expect(result.isError).toBeUndefined();
+    const text = (result.content[0] as { text: string }).text;
+    const parsed = JSON.parse(text) as { content: string };
+    expect(parsed.content).toBe(md);
+  });
+
   it('errors clearly when the channel token is missing', async () => {
     delete process.env.BAGET_CHANNEL_TOKEN;
     const tool = getRegisteredToolByName('baget_read_document');
