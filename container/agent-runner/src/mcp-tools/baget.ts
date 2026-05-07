@@ -85,6 +85,7 @@ import { writeMessageOut } from '../db/messages-out.js';
 import { workspaceOutboxDir } from '../workspace-paths.js';
 import { generateImageBytes, type AspectRatio, type GenerateImageDeps } from './image-gen.js';
 import { generateId, resolveRouting } from './core.js';
+import { htmlToMarkdown, looksLikeHtml } from './html-to-markdown.js';
 import { registerTools } from './server.js';
 import type { McpToolDefinition } from './types.js';
 
@@ -723,6 +724,40 @@ const readDocument: McpToolDefinition = {
       result.data && typeof result.data === 'object' && 'document' in result.data
         ? (result.data as { document: unknown }).document
         : result.data;
+
+    // Sam 2026-05-07 Telegram smoke (after PR #64): the deck doc body
+    // had been regenerated as the new HTML deck format (HTML/CSS for
+    // visual rendering on the dashboard). The agent dutifully quoted
+    // the returned `content` inline and the founder saw 1000+ lines
+    // of `<section>` / `<style>` / CSS tokens — equally unreadable
+    // as the PDF render path PR #64 just shut off. Fix: detect HTML
+    // content here and convert to clean markdown via `turndown`
+    // (already pre-installed in the Dockerfile for the markdown→PDF
+    // path). The conversion is gated on `looksLikeHtml` so plain-
+    // markdown bodies (BPs, brand guides, research) round-trip
+    // unchanged. On any conversion error, return the original body
+    // — degrades to today's behavior, never blocks the read.
+    //
+    // This is the fork-side bridge until apps/web ships a
+    // `?format=text` variant on GET /api/companies/:id/documents/
+    // :docId that returns stripped-to-text content for chat
+    // consumers (queued as the principled fix).
+    if (inner && typeof inner === 'object' && 'content' in inner) {
+      const doc = inner as { content?: unknown };
+      const rawContent = doc.content;
+      if (typeof rawContent === 'string' && looksLikeHtml(rawContent)) {
+        try {
+          doc.content = htmlToMarkdown(rawContent);
+        } catch {
+          // Swallow turndown failures — the original content is
+          // still better than nothing, and the model + persona
+          // renderer downstream will handle a wall-of-html more
+          // gracefully than a tool error would (which surfaces as
+          // a founder-visible "send me the deck failed" message).
+        }
+      }
+    }
+
     return ok(JSON.stringify(inner, null, 2));
   },
 };
