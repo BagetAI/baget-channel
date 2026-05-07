@@ -14,6 +14,7 @@ import path from 'path';
 import { randomUUID } from 'crypto';
 
 import { createBagetAdminServer, type BagetAdminServer } from './baget-admin-server.js';
+import { maybeSeedBotPoolFromEnv } from './baget-bot-pool-env-seeder.js';
 import { DATA_DIR } from './config.js';
 import { enforceStartupBackoff, resetCircuitBreaker } from './circuit-breaker.js';
 import { migrateGroupsToClaudeLocal } from './claude-md-compose.js';
@@ -77,6 +78,15 @@ async function main(): Promise<void> {
   const db = initDb(dbPath);
   runMigrations(db);
   log.info('Central DB ready', { path: dbPath });
+
+  // 1a. Bot-pool env-var self-seeder. Recovery safety-net for the
+  //     scenario where the Railway persistent volume on /app/data is
+  //     lost or replaced — without this, the operator has to re-POST
+  //     every bot via /baget/bot-pool/seed by hand. Empty-table gated
+  //     so once a real pool exists (volume intact, admin POSTs landed)
+  //     this is a no-op on every boot. See baget-bot-pool-env-seeder.ts
+  //     for the full rationale.
+  maybeSeedBotPoolFromEnv(process.env.BAGET_BOT_POOL_SEED_JSON, new Date().toISOString());
 
   // 1b. One-time filesystem cutover — idempotent, no-op after first run.
   migrateGroupsToClaudeLocal();

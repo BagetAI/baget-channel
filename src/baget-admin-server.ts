@@ -64,6 +64,7 @@ import {
   assignNextAvailableBot,
   countAvailableBots,
   getBotPoolEntryByAgentGroup,
+  listAllBotPoolEntries,
   markWebhookRegistered,
   releaseBot,
   seedBotPoolEntry,
@@ -577,6 +578,16 @@ export function createBagetAdminServer(config: BagetAdminServerConfig): BagetAdm
       await handleSeedBotPool(req, res);
       return;
     }
+    // Recovery artifact for the operator: full pool dump as JSON,
+    // re-postable into the seed endpoint as-is. Stash after each
+    // seed so a lost-volume scenario rebuilds without bouncing back
+    // to BotFather for token retrieval. Includes secrets — bearer-gated
+    // like every other admin endpoint. See `listAllBotPoolEntries`
+    // jsdoc for the diff-friendly ordering rationale.
+    if (method === 'GET' && urlNoQuery === '/baget/bot-pool/export') {
+      handleExportBotPool(res);
+      return;
+    }
     // Body-keyed DELETE /baget/agent-groups (with body { userId, companyId })
     // — matches the path-style DELETE /baget/agent-groups/:groupId
     // semantically but lets the baget.ai bridge skip the get-then-
@@ -1020,9 +1031,7 @@ export function createBagetAdminServer(config: BagetAdminServerConfig): BagetAdm
       }
     }
 
-    const deepLinkBotUsername = poolResult
-      ? poolResult.row.bot_username
-      : config.telegramBotUsername;
+    const deepLinkBotUsername = poolResult ? poolResult.row.bot_username : config.telegramBotUsername;
 
     const response: CreateAgentGroupResponse = {
       ok: true,
@@ -1655,6 +1664,46 @@ export function createBagetAdminServer(config: BagetAdminServerConfig): BagetAdm
    *
    * Bearer-token gated like all admin routes.
    */
+  /**
+   * GET /baget/bot-pool/export
+   *
+   * Recovery artifact. Dumps every bot-pool row as JSON in a shape
+   * that can be POSTed back into `/baget/bot-pool/seed` (or pasted
+   * into `BAGET_BOT_POOL_SEED_JSON` env var) verbatim — the operator's
+   * intended recovery flow when the Railway volume is ever lost.
+   *
+   * Includes `botToken` and `webhookSecret` because both are needed
+   * for re-seeding. Bearer-token gated like every other admin route;
+   * the rationale is the same as the seed endpoint (operator-only,
+   * never reached by founders).
+   *
+   * Response shape mirrors the seed POST body exactly so the operator
+   * can do `curl … export | curl … seed` round-trips without any
+   * shape transformation:
+   *   { bots: [{ botUsername, botToken, webhookSecret }, ...] }
+   *
+   * Sam 2026-05-07: stash the output in 1Password under
+   * `baget/staging/bot-pool-export-<date>.json` after each seed.
+   */
+  function handleExportBotPool(res: http.ServerResponse): void {
+    const rows = listAllBotPoolEntries();
+    const bots = rows.map((row) => ({
+      botUsername: row.bot_username,
+      botToken: row.bot_token_value,
+      webhookSecret: row.webhook_secret,
+      // Diagnostic-only fields — ignored on POST seed, but useful when
+      // the operator inspects the export in 1Password to spot a row
+      // that was env-seeded vs admin-seeded.
+      _meta: {
+        source: row.source,
+        status: row.status,
+        assignedAgentGroupId: row.assigned_agent_group_id,
+        createdAt: row.created_at,
+      },
+    }));
+    sendJson(res, 200, { ok: true, total: bots.length, bots });
+  }
+
   async function handleSeedBotPool(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
     const body = await readJson<{ bots?: Array<{ botUsername?: string; botToken?: string; webhookSecret?: string }> }>(
       req,
@@ -1771,10 +1820,7 @@ export function createBagetAdminServer(config: BagetAdminServerConfig): BagetAdm
         // by re-running seed). On success, stamp
         // webhook_registered_at so the next /baget/agent-groups
         // create call doesn't re-register unnecessarily.
-        if (
-          (outcome === 'inserted' || outcome === 'rotated') &&
-          config.publicBaseUrl
-        ) {
+        if ((outcome === 'inserted' || outcome === 'rotated') && config.publicBaseUrl) {
           const webhookUrl = buildPerBotWebhookUrl({
             publicBaseUrl: config.publicBaseUrl,
             botUsername: telegramUsername,

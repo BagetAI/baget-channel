@@ -68,6 +68,7 @@ describe('baget_bot_pool migration shape', () => {
         'bot_token_value',
         'bot_username',
         'created_at',
+        'source', // PR #56 — provenance tag (`'admin'` | `'env'`), default `'admin'`
         'status',
         'webhook_registered_at',
         'webhook_secret',

@@ -246,7 +246,25 @@ The Railway service reads these at startup. Set them on the
 | `ONECLI_URL`, `ONECLI_API_KEY` | yes (docker) / no (single-process) | — | Vault config. In single-process mode the agent inherits the host process env, so OneCLI is optional. |
 | `BAGET_BUN_PATH` | no | `bun` | Override the `bun` binary path. Useful for local dev where bun lives at `~/.bun/bin/bun`. |
 | `DATABASE_URL` | no | `data/v2.db` | Currently the host writes a per-volume SQLite file under `data/`. Future: switch to a managed Postgres if multi-replica becomes a thing. |
+| `BAGET_BOT_POOL_SEED_JSON` | no | — | Boot-time self-seeder for the Telegram bot pool. JSON array of `{ botUsername, botToken, webhookSecret? }`. Only seeds when the `baget_bot_pool` table is empty (recovery path for a lost-volume scenario) — otherwise it's a no-op. Set this once after creating the Railway service, never touch it again. The `webhookSecret` field is optional; a fresh 16-byte hex value is minted per row when omitted. **NOT** a substitute for the Railway volume on `/app/data` — see *Persistence requirements* below. |
 | `WEBHOOK_PORT` | no | `3000` | Used by the upstream Chat-SDK webhook server (legacy). Distinct from `TELEGRAM_WEBHOOK_PORT` above. |
+
+### Persistence requirements (Railway)
+
+The host writes its central SQLite DB to `/app/data/v2.db`. Railway containers have ephemeral filesystems, so a **persistent volume mounted at `/app/data` is required** — without it, every redeploy wipes the bot pool and active pairings, and the next founder bind returns `503 pool_exhausted`.
+
+```bash
+railway volume add --mount-path /app/data
+```
+
+After attaching the volume, seed the pool once via `POST /baget/bot-pool/seed`. The seeded rows survive every subsequent redeploy.
+
+**Recovery flow if the volume is ever lost or replaced:**
+1. Set `BAGET_BOT_POOL_SEED_JSON` env var on the Railway service with the JSON exported from `GET /baget/bot-pool/export` (you stash this in 1Password after each seed).
+2. Redeploy. The boot-time seeder rebuilds the pool from the env var.
+3. Existing per-company assignments do NOT survive — `assigned_agent_group_id` was on the lost volume. Founders re-pair to fresh pool slots; the OLD bot username is now unassigned and goes back into rotation.
+
+**Hard constraint: do NOT set `numReplicas > 1` on the Railway service.** SQLite + WAL on a shared volume corrupts under concurrent writers across replicas. If horizontal scaling ever becomes necessary, migrate the pool tables to a managed Postgres first (the `seedBotPoolEntry` / `assignNextAvailableBot` helpers are the only call sites; the rest of the SQLite schema can stay local).
 
 **Important:** `RUNTIME=single-process` does NOT bypass tenant isolation. Every founder still gets a distinct `agent_groups` row, distinct session DB files (3-DB model), and distinct OneCLI bearer-token credential. What it bypasses is the kernel-level Docker isolation between sessions — safe in our threat model because the agent has no shell. See § "Why we don't need DinD" above.
 
