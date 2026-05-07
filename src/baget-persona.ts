@@ -159,9 +159,28 @@ const SILENT_TAGS = new Set<string>(['intern']);
  * - On a junk tag (looked tag-shaped but isn't one we know): pass
  *   through the raw message untouched. We leave it visible rather
  *   than silently re-prefixing so QA notices.
+ *
+ * Returns `null` when the resolved BODY (post-tag-strip + trim) is
+ * empty — e.g. the model emitted just `cos:` with no content,
+ * typically the empty turn that follows an approval-card-delivered
+ * tool result. Caller drops the message rather than rendering
+ * `🧭 Pauline:` with a blank body, which Sam reported on 2026-05-07
+ * as test "A" failing the audit smoke (PR #54 told the LLM "the
+ * card IS the message"; LLM complied by emitting an empty turn that
+ * still got persona-prefixed). Empty-body messages have no founder-
+ * facing value — they're just a UI noise after every approval card.
  */
-export function applyPersonaPrefix(message: string, team: BagetTeamMembers): string {
+export function applyPersonaPrefix(message: string, team: BagetTeamMembers): string | null {
   const parsed = parseRoleTag(message);
+
+  // Single source of truth: what we'd send to the founder if there
+  // were no persona prefix logic. Computed up-front so every return
+  // path (tagged role, silent tag, no tag) can short-circuit to null
+  // when there's nothing meaningful to render.
+  const effectiveBody = parsed.body.trim();
+  if (effectiveBody.length === 0) {
+    return null;
+  }
 
   if (parsed.tag !== null) {
     const memberName = team[ROLE_TO_MEMBER[parsed.tag]];

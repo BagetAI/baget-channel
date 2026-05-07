@@ -104,6 +104,32 @@ describe('applyPersonaPrefix', () => {
   it('handles multi-line body intact', () => {
     expect(applyPersonaPrefix('cos: line1\nline2', TEAM)).toBe('🧭 Louis: line1\nline2');
   });
+
+  // Sam 2026-05-07 audit smoke (test "A"): when fork PR #54 told the
+  // LLM "the card IS the message" after delivering an approval card,
+  // the model complied by emitting an EMPTY `cos:` turn that still
+  // got persona-prefixed into `🧭 Pauline:` (with nothing after) and
+  // shipped to Telegram as a blank text bubble riding behind the card.
+  // Returning null lets the channel adapter drop the message entirely.
+  it('returns null on a tag-only message with empty body (post-card empty turn)', () => {
+    expect(applyPersonaPrefix('cos:', TEAM)).toBeNull();
+    expect(applyPersonaPrefix('cos: ', TEAM)).toBeNull();
+    expect(applyPersonaPrefix('cos:\n', TEAM)).toBeNull();
+    expect(applyPersonaPrefix('cos: \t  ', TEAM)).toBeNull();
+  });
+
+  it('returns null on a known role tag with whitespace-only body', () => {
+    expect(applyPersonaPrefix('analyst: ', TEAM)).toBeNull();
+    expect(applyPersonaPrefix('dev:\n  \n', TEAM)).toBeNull();
+  });
+
+  it('returns null on a completely empty input (defensive)', () => {
+    expect(applyPersonaPrefix('', TEAM)).toBeNull();
+  });
+
+  it('still renders normally when body is just one character', () => {
+    expect(applyPersonaPrefix('cos: y', TEAM)).toBe('🧭 Louis: y');
+  });
 });
 
 describe('applyPersonaPrefix — CoS fallback for off-team roles', () => {

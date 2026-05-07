@@ -780,10 +780,11 @@ function buildAdapter(cfg: BagetTelegramConfig): ChannelAdapter {
     // (almost certainly a missed seed step) instead of an opaque
     // Telegram 404 from sendBagetBotMessage.
     if (!resolvedBotToken) {
-      log.error(
-        'Baget telegram: deliver dropped — no pool entry for agent_group AND no global cfg.botToken',
-        { platformId, agentGroupId, kind: message.kind },
-      );
+      log.error('Baget telegram: deliver dropped — no pool entry for agent_group AND no global cfg.botToken', {
+        platformId,
+        agentGroupId,
+        kind: message.kind,
+      });
       return undefined;
     }
 
@@ -825,7 +826,7 @@ function buildAdapter(cfg: BagetTelegramConfig): ChannelAdapter {
     // detect it here and drop loud rather than silently render under
     // the wrong identity. Single-bind is enforced by the /start
     // handler's UNIQUE constraint, but this is the second-line check.
-    let prefixed = text;
+    let prefixed: string | null = text;
     if (mg) {
       if (wired.length > 1) {
         log.error('Baget telegram: refusing to deliver — chat has >1 wired agent_group', {
@@ -849,6 +850,19 @@ function buildAdapter(cfg: BagetTelegramConfig): ChannelAdapter {
         if (team && text !== null) prefixed = applyPersonaPrefix(text, team);
       }
     }
+
+    // applyPersonaPrefix returns null when the LLM emitted a tag-only
+    // turn (e.g. `cos:` with no body). Most common trigger: the empty
+    // assistant turn that follows an `approval-card-delivered` tool
+    // result — fork PR #54 told the LLM "the card IS the message,"
+    // model complies by emitting an empty turn, persona renderer
+    // would otherwise produce `🧭 Pauline:` with nothing after.
+    // Drop entirely so the founder doesn't see a blank text bubble
+    // riding behind the approval card. (Test "A" of the 2026-05-07
+    // audit smoke caught this.) Still allow attachments to ship —
+    // attachments don't go through persona prefix and have their own
+    // value independent of the text turn.
+    if (prefixed === null && attachments.length === 0) return undefined;
 
     // Send attachments first, then the (persona-prefixed) text. Founders
     // see the artifact, then the team's commentary. Attachments are NOT
@@ -902,14 +916,12 @@ function buildAdapter(cfg: BagetTelegramConfig): ChannelAdapter {
       if (result.ok) lastMessageId = result.messageId;
     }
 
-    if (text !== null) {
-      const messageId = await sendBotMessage(
-        chatId,
-        prefixed!,
-        agentGroupId,
-        resolvedBotToken,
-        replyMarkup,
-      );
+    // Send the text iff we have a non-null prefix to ship. `prefixed`
+    // is null in two cases: (a) raw `text` was null (caller sent
+    // attachments only), (b) applyPersonaPrefix nulled it because the
+    // LLM emitted a tag-only empty turn. Either way, no sendMessage.
+    if (prefixed !== null) {
+      const messageId = await sendBotMessage(chatId, prefixed, agentGroupId, resolvedBotToken, replyMarkup);
       if (messageId !== undefined) lastMessageId = messageId;
     }
 
@@ -969,11 +981,7 @@ function buildAdapter(cfg: BagetTelegramConfig): ChannelAdapter {
    * over the chat (max 200 chars per Telegram); pass empty string
    * for a silent ACK.
    */
-  async function answerCallbackQuery(
-    callbackQueryId: string,
-    botToken: string,
-    text: string = '',
-  ): Promise<void> {
+  async function answerCallbackQuery(callbackQueryId: string, botToken: string, text: string = ''): Promise<void> {
     const url = `${apiBase}/bot${botToken}/answerCallbackQuery`;
     try {
       await fetchFn(url, {
@@ -1007,11 +1015,7 @@ function buildAdapter(cfg: BagetTelegramConfig): ChannelAdapter {
    * (founder sees the agent's text reply as the next signal). Don't
    * fail the synth-inbound path on this.
    */
-  async function stripInlineKeyboard(
-    chatId: number,
-    messageId: number,
-    botToken: string,
-  ): Promise<void> {
+  async function stripInlineKeyboard(chatId: number, messageId: number, botToken: string): Promise<void> {
     const url = `${apiBase}/bot${botToken}/editMessageReplyMarkup`;
     try {
       await fetchFn(url, {
@@ -1123,9 +1127,7 @@ function buildAdapter(cfg: BagetTelegramConfig): ChannelAdapter {
       return;
     }
     const synthText = decision === 'yes' ? 'yes' : 'cancel';
-    const senderId = cb.from
-      ? `telegram:${cb.from.id}`
-      : 'telegram:unknown';
+    const senderId = cb.from ? `telegram:${cb.from.id}` : 'telegram:unknown';
     const sender = cb.from
       ? cb.from.username
         ? `@${cb.from.username}`
