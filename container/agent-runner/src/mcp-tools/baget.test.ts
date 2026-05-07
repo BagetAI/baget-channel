@@ -24,7 +24,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
 
 import { closeSessionDb, getInboundDb, getOutboundDb, initTestSessionDb } from '../db/connection.js';
 import './baget.js'; // registers the tools as a side effect
-import { getRegisteredToolByName } from './server.js';
+import { getRegisteredToolByName, getRegisteredTools } from './server.js';
 
 const ORIGINAL_FETCH = globalThis.fetch;
 const ORIGINAL_TOKEN = process.env.BAGET_CHANNEL_TOKEN;
@@ -1247,4 +1247,50 @@ describe('baget_generate_image handler — failure paths', () => {
     const rows = getOutboundDb().prepare('SELECT id FROM messages_out').all();
     expect(rows).toHaveLength(0);
   });
+});
+
+describe('tool description hygiene — no literal env-var or template-placeholder leakage', () => {
+  // Sam 2026-05-07: `baget_send_document_file` description literally
+  // contained the string `BAGET_API_BASE_URL/dashboard/<companyId>/
+  // documents` as a "placeholder" the prompt author meant to be
+  // substituted. Models are obedient; Pauline pasted the unresolved
+  // placeholder verbatim into a Telegram reply ("the dashboard at
+  // BAGET_API_BASE_URL/dashboard/3ed5553c-…/documents …"). The class
+  // of bug: any tool description that quotes an env-var name or
+  // angle-bracket template variable expects the LLM to do a
+  // substitution it cannot do. Pin the class so the next prompt edit
+  // doesn't reopen it.
+  const FORBIDDEN_LITERALS = [
+    // Common env-var names that have shown up unsubstituted before.
+    'BAGET_API_BASE_URL',
+    'BAGET_PUBLIC_APP_URL',
+    'BAGET_CHANNEL_TOKEN',
+    'BAGET_ADMIN_TOKEN',
+    'BAGET_COMPANY_ID',
+    'BAGET_USER_ID',
+    'BAGET_AGENT_GROUP_ID',
+    'BAGET_WORKSPACE',
+    'process.env.',
+    // Angle-bracket placeholders meant to be substituted at runtime.
+    // (Tool input-schema descriptions legitimately use these for
+    // documenting a parameter shape — but tool top-level descriptions
+    // shouldn't, because the LLM has no context that they need
+    // substitution before quoting back.)
+    '<companyId>',
+    '<company_id>',
+    '<userId>',
+    '<user_id>',
+    '<agentGroupId>',
+    '<agent_group_id>',
+    '${',
+  ];
+
+  for (const literal of FORBIDDEN_LITERALS) {
+    it(`no top-level tool description contains the forbidden literal "${literal}"`, () => {
+      const offenders = getRegisteredTools()
+        .filter((t) => (t.tool.description ?? '').includes(literal))
+        .map((t) => t.tool.name);
+      expect(offenders).toEqual([]);
+    });
+  }
 });
