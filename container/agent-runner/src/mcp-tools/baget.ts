@@ -2214,6 +2214,78 @@ const setBriefingPreferences: McpToolDefinition = {
   },
 };
 
+// ── Tier 3.5: Vercel-backed domain & deploy tools ───────────────────────────
+
+const checkDomainAvailability: McpToolDefinition = {
+  tool: {
+    name: 'baget_check_domain_availability',
+    description:
+      "Check whether a domain is available for purchase, and get the renewal price. Use when the founder asks \"is yourstartup.com available\" / \"how much for alpha.io\" / \"can I register foo-bar.app\". Returns `{ available, priceCents, period }` — `available: true` with `priceCents: null` means available but Vercel can't quote (rare TLD). NO purchase happens here — this is read-only. The buy-domain action is deferred to Tier 4 (needs careful Stripe-backed money flow). Range checked at the route layer (≤253 chars, RFC domain shape).",
+    inputSchema: {
+      type: 'object',
+      properties: {
+        name: {
+          type: 'string',
+          minLength: 3,
+          maxLength: 253,
+          description: "Domain to look up. Lowercased + trimmed before lookup. e.g. 'yourstartup.com'.",
+        },
+      },
+      required: ['name'],
+      additionalProperties: false,
+    },
+  },
+  async handler(args) {
+    const ctx = requireCompanyId();
+    if (!ctx.ok) return fail(ctx.error);
+    const name = String(args.name ?? '').trim().toLowerCase();
+    if (!name) return fail('name is required');
+    const q = buildQueryString({ name }, ['name']);
+    const result = await bagetFetch({
+      method: 'GET',
+      path: `/api/companies/${ctx.companyId}/domain-availability${q}`,
+    });
+    if (!result.ok) return fail(`check_domain_availability failed: ${result.error}`);
+    return ok(JSON.stringify(result.data, null, 2));
+  },
+};
+
+const redeploySite: McpToolDefinition = {
+  tool: {
+    name: 'baget_redeploy_site',
+    description:
+      "Trigger a fresh Vercel build of the founder's customer site so they can recover from a broken build without leaving Telegram. Use when the founder says \"redeploy my site\" / \"rebuild it\" / \"the site is broken, restart it\". APPROVAL-GATED — surfaces a confirm card first because a bad redeploy could clobber a working site. NO Baget credit cost; Vercel build minutes only (baget-paid). Same git ref re-pulled — NOT a regenerate-via-agent (that's `run-task` on a deploy task). On first call set `confirmed: false` to surface the preview; on the founder's explicit confirmation word, call again with `confirmed: true` and the IDENTICAL payload.",
+    inputSchema: {
+      type: 'object',
+      properties: {
+        ref: {
+          type: 'string',
+          minLength: 1,
+          maxLength: 255,
+          description:
+            "Git ref to deploy. Default 'main'. Only set this if the founder asks to roll back to a specific branch or tag.",
+        },
+        confirmed: {
+          type: 'boolean',
+          description:
+            'Set to false on the first call (surfaces preview card). Set to true with the IDENTICAL payload after the founder confirms.',
+        },
+      },
+      additionalProperties: false,
+    },
+  },
+  async handler(args) {
+    return dispatchApproval({
+      action: 'redeploy-site',
+      payload: args.ref !== undefined ? { ref: String(args.ref) } : {},
+      confirmed: args.confirmed === true,
+      summary: args.ref
+        ? `Redeploy the customer site from ref \`${String(args.ref)}\`.`
+        : `Redeploy the customer site (latest main).`,
+    });
+  },
+};
+
 // ── Register ─────────────────────────────────────────────────────────────────
 
 registerTools([
@@ -2237,6 +2309,8 @@ registerTools([
   listEmailDomains,
   listInbox,
   readEmailThread,
+  // Read — Tier 3.5
+  checkDomainAvailability,
   // File transfer
   sendDocumentFile,
   // Generate
@@ -2271,8 +2345,10 @@ registerTools([
   editDocument,
   revealProspect,
   sendCampaign,
+  // Write — approval-gated (Tier 3.5)
+  redeploySite,
 ]);
 
 log(
-  'baget MCP tools registered: 17 read + 1 file-transfer + 1 generate + 21 direct write + 5 approval-gated = 47 total (Tier 3: +5 read +2 direct write)',
+  'baget MCP tools registered: 18 read + 1 file-transfer + 1 generate + 21 direct write + 6 approval-gated = 49 total (Tier 3.5: +1 read +1 approval-gated)',
 );
