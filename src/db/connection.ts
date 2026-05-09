@@ -16,6 +16,23 @@ export function initDb(dbPath: string): Database.Database {
   _db = new Database(dbPath);
   _db.pragma('journal_mode = WAL');
   _db.pragma('foreign_keys = ON');
+
+  // Defense-in-depth chmod. Primary protection is `process.umask(0o077)`
+  // set very early in src/index.ts so every creat/open inherits 0600 from
+  // the kernel — but that only covers files born under THIS process. A
+  // file from a previous boot under a looser umask, or a WAL/SHM sidecar
+  // created on first write across a startup race, is still caught here.
+  // ENOENT is expected (sidecars don't exist until the first write).
+  for (const suffix of ['', '-wal', '-shm']) {
+    try {
+      fs.chmodSync(dbPath + suffix, 0o600);
+    } catch (err: unknown) {
+      if ((err as NodeJS.ErrnoException)?.code !== 'ENOENT') {
+        log.warn('Failed to tighten DB file perms', { path: dbPath + suffix, err });
+      }
+    }
+  }
+
   log.info('Central DB initialized', { path: dbPath });
   return _db;
 }

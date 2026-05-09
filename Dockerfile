@@ -41,8 +41,24 @@ WORKDIR /app
 
 # Install bun for the agent-runner spawns. Pinned to a known-good
 # version — bumping Bun is a deliberate change because the agent-runner's
-# bun:sqlite + bun:test usage tends to drift on Bun majors.
-ARG BUN_VERSION=1.2.20
+# bun:sqlite + bun:test usage tends to drift on Bun majors. Stay on
+# 1.2.x; jumping to 1.3 needs its own validation pass.
+#
+# Why 1.2.23: 1.2.20's child_process polyfill cascades a `TypeError:
+# this.input.pause is not a function` (node:readline:654 ← :647 close ←
+# events:43 emitError ← child_process:686) when a spawned child errors
+# during startup. The Claude Agent SDK creates a readline interface over
+# the MCP stdio child's stdout — when that child errors, the cleanup
+# path crashes the runner with exit code 1, often mid-stream. 1.2.22
+# made stdin/stdout/stderr/stdio enumerable + fixed several spawnSync
+# RangeError paths; 1.2.23 added more node:tty + node:net compat.
+#
+# Rollback signal: if you see fresh `[mcp-tools/baget]` import errors,
+# `bun:sqlite` schema-shape complaints, or `Single-process runner exited
+# code=1` returning post-deploy with a NEW stack trace, drop to 1.2.22
+# here and redeploy. 1.2.20 is the known-bad floor and shouldn't be a
+# rollback target.
+ARG BUN_VERSION=1.2.23
 RUN apt-get update \
     && apt-get install -y --no-install-recommends curl ca-certificates unzip \
     && curl -fsSL https://bun.sh/install | bash -s -- "bun-v${BUN_VERSION}" \

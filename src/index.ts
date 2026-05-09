@@ -9,6 +9,14 @@
 // when SENTRY_DSN is unset (local dev). See src/sentry-init.ts.
 import './sentry-init.js';
 
+// Tighten umask before ANY filesystem write. Default on node:20-bookworm-slim
+// is 022 → files get created 0644. The central SQLite DB and its WAL/SHM
+// sidecars hold plaintext bearer tokens; we want them 0600 from the kernel
+// rather than racing a chmod after the fact (initDb still chmods as belt-
+// and-suspenders for sidecars created across boots). 0o077 = strip group +
+// world bits on every subsequent creat/open.
+process.umask(0o077);
+
 import path from 'path';
 
 import { randomUUID } from 'crypto';
@@ -16,6 +24,7 @@ import { randomUUID } from 'crypto';
 import { createBagetAdminServer, type BagetAdminServer } from './baget-admin-server.js';
 import { maybeSeedBotPoolFromEnv } from './baget-bot-pool-env-seeder.js';
 import { DATA_DIR } from './config.js';
+import { detectEphemeralDataDir } from './data-dir-classify.js';
 import { enforceStartupBackoff, resetCircuitBreaker } from './circuit-breaker.js';
 import { migrateGroupsToClaudeLocal } from './claude-md-compose.js';
 import { initDb } from './db/connection.js';
@@ -78,6 +87,26 @@ async function main(): Promise<void> {
   const db = initDb(dbPath);
   runMigrations(db);
   log.info('Central DB ready', { path: dbPath });
+
+  // 1.x. Volume self-check. The DB, bot pool, and channel-token
+  //      bearers all live under DATA_DIR; without a Railway volume
+  //      mounted there they're wiped every redeploy. A live deploy
+  //      with a real volume reports e.g. fstype=ext4 — we only warn
+  //      on the tmpfs/overlay case so a fresh checkout in a new env
+  //      doesn't fail silently.
+  const fsInfo = detectEphemeralDataDir(DATA_DIR);
+  if (fsInfo.ephemeral) {
+    log.warn(
+      'DATA_DIR is on an ephemeral filesystem — SQLite, bot pool, and channel tokens will be lost on every redeploy. Attach a persistent volume at this path.',
+      { dataDir: DATA_DIR, mountPoint: fsInfo.mountPoint, fstype: fsInfo.fstype },
+    );
+  } else if (fsInfo.fstype) {
+    log.info('DATA_DIR persistence confirmed', {
+      dataDir: DATA_DIR,
+      mountPoint: fsInfo.mountPoint,
+      fstype: fsInfo.fstype,
+    });
+  }
 
   // 1a. Bot-pool env-var self-seeder. Recovery safety-net for the
   //     scenario where the Railway persistent volume on /app/data is
