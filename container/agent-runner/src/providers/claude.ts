@@ -1,7 +1,65 @@
 import fs from 'fs';
+import { createRequire } from 'node:module';
 import path from 'path';
 
 import { query as sdkQuery, type HookCallback, type PreCompactHookInput } from '@anthropic-ai/claude-agent-sdk';
+
+const requireFromHere = createRequire(import.meta.url);
+
+/**
+ * Resolve the path to the Claude Code native binary that ships as a
+ * platform-specific optionalDependency of `@anthropic-ai/claude-agent-sdk`.
+ *
+ * Why we don't trust the SDK's own auto-resolution: the bun.lock entries
+ * for these optional deps lack a libc constraint (only `os` + `cpu`), so
+ * Bun + the SDK can disagree about glibc vs musl. Concretely on a
+ * `node:bookworm-slim` (glibc) image, the SDK was asking for the
+ * `linux-x64-musl` variant and erroring with "binary not found" — even
+ * though the glibc variant was the one Bun actually installed.
+ *
+ * Strategy: probe each plausible variant for the current platform/arch
+ * via `require.resolve` on the package's `package.json` (works across
+ * pnpm/bun/npm regardless of how node_modules is laid out), then check
+ * the sibling `claude` binary actually exists on disk before returning.
+ * Returns undefined if nothing is found — caller can either let the SDK
+ * fall back to its default lookup or surface a hard error.
+ */
+function resolveClaudeBinary(): string | undefined {
+  const platform = process.platform;
+  const arch = process.arch;
+
+  // Variant order matters: prefer the one likely to exist on this image.
+  // On Linux: prefer glibc (Bookworm/Ubuntu), fall back to musl (Alpine).
+  // The published binaries are dynamically linked against their target
+  // libc so DON'T fall back across libc — the SDK error is louder than
+  // a load-time crash.
+  const variants: string[] = [];
+  if (platform === 'linux') {
+    variants.push(`linux-${arch}`, `linux-${arch}-musl`);
+  } else if (platform === 'darwin') {
+    variants.push(`darwin-${arch}`);
+  } else if (platform === 'win32') {
+    variants.push(`win32-${arch}`);
+  }
+
+  for (const variant of variants) {
+    try {
+      const pkgJsonPath = requireFromHere.resolve(`@anthropic-ai/claude-agent-sdk-${variant}/package.json`);
+      const candidate = path.join(path.dirname(pkgJsonPath), 'claude');
+      if (fs.existsSync(candidate)) return candidate;
+    } catch {
+      // Variant package not installed for this platform — try next.
+    }
+  }
+  return undefined;
+}
+
+const RESOLVED_CLAUDE_BINARY = resolveClaudeBinary();
+log(
+  RESOLVED_CLAUDE_BINARY
+    ? `Resolved Claude Code binary: ${RESOLVED_CLAUDE_BINARY}`
+    : `Could not resolve Claude Code binary for ${process.platform}-${process.arch} — falling back to SDK default`,
+);
 
 import { clearContainerToolInFlight, setContainerToolInFlight } from '../db/connection.js';
 import { workspaceConversationsDir } from '../workspace-paths.js';
@@ -276,15 +334,12 @@ export class ClaudeProvider implements AgentProvider {
         cwd: input.cwd,
         additionalDirectories: this.additionalDirectories,
         resume: input.continuation,
-        // Omit pathToClaudeCodeExecutable: the SDK auto-resolves its
-        // bundled binary from `@anthropic-ai/claude-agent-sdk-<platform>`
-        // (an optionalDependency installed by the Dockerfile's
-        // `bun install --omit=dev --frozen-lockfile` — `--production`
-        // would silently drop optionalDependencies and re-break this).
-        // The previous hardcoded `/pnpm/claude` was wrong (image uses
-        // bun, not pnpm) — broken since 2026-04-20 but masked by an
-        // unrelated readline crash that killed the runner before the
-        // SDK ever invoked the binary.
+        // Probe-resolved binary path. See `resolveClaudeBinary` above
+        // for why we don't let the SDK's built-in auto-detect handle
+        // this (libc mismatch on glibc images). Falls through to the
+        // SDK's default if our probe finds nothing — which surfaces a
+        // clearer error than silently launching the wrong binary.
+        ...(RESOLVED_CLAUDE_BINARY ? { pathToClaudeCodeExecutable: RESOLVED_CLAUDE_BINARY } : {}),
         systemPrompt: instructions ? { type: 'preset' as const, preset: 'claude_code' as const, append: instructions } : undefined,
         allowedTools: TOOL_ALLOWLIST,
         disallowedTools: SDK_DISALLOWED_TOOLS,
