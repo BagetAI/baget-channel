@@ -48,7 +48,7 @@ Railway project: baget
     ├── Env:
     │   - DATABASE_URL              (per-host SQLite OR Neon for central state)
     │   - ANTHROPIC_API_KEY          (Claude Agent SDK)
-    │   - TELEGRAM_BOT_TOKEN         (the shared @baget_team_bot)
+    │   - TELEGRAM_BOT_TOKEN         (legacy single-bot mode; bot pool stores per-company tokens in `baget_bot_pool` table)
     │   - TELEGRAM_WEBHOOK_SECRET    (constant-time check)
     │   - BAGET_ADMIN_TOKEN          (HMAC for the pairing API)
     │   - BAGET_API_BASE_URL         (https://app.baget.ai for prod)
@@ -175,7 +175,11 @@ from the dashboard. Steps:
 3. Send goodbye message via the bot to the bound chat.
 4. Unbind the `conversation_channels` row.
 
-## Telegram bot — single shared bot, multi-founder routing
+## Telegram bot — routing
+
+> **Architecture note.** This section documents the original single-shared-bot design, which is still operational as a legacy path. The current default is the **bot pool** (per-company assigned bot, one of N pre-seeded tokens) — see *Persistence requirements* below for the pool seeder + recovery story. Schema and assignment logic live in `src/db/baget-bot-pool.ts` (`assignNextAvailableBot`, etc.); the boot-time env-var seeder is `src/baget-bot-pool-env-seeder.ts`. New pairings under multi-bot pool mode get their own per-company bot username; the single-bot path below remains for compatibility with pre-pool deployments.
+
+### Legacy: single shared bot
 
 ```
 @baget_team_bot (one bot, one TELEGRAM_BOT_TOKEN)

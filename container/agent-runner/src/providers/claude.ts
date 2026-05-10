@@ -276,7 +276,15 @@ export class ClaudeProvider implements AgentProvider {
         cwd: input.cwd,
         additionalDirectories: this.additionalDirectories,
         resume: input.continuation,
-        pathToClaudeCodeExecutable: '/pnpm/claude',
+        // Omit pathToClaudeCodeExecutable: the SDK auto-resolves its
+        // bundled binary from `@anthropic-ai/claude-agent-sdk-<platform>`
+        // (an optionalDependency installed by the Dockerfile's
+        // `bun install --omit=dev --frozen-lockfile` — `--production`
+        // would silently drop optionalDependencies and re-break this).
+        // The previous hardcoded `/pnpm/claude` was wrong (image uses
+        // bun, not pnpm) — broken since 2026-04-20 but masked by an
+        // unrelated readline crash that killed the runner before the
+        // SDK ever invoked the binary.
         systemPrompt: instructions ? { type: 'preset' as const, preset: 'claude_code' as const, append: instructions } : undefined,
         allowedTools: TOOL_ALLOWLIST,
         disallowedTools: SDK_DISALLOWED_TOOLS,
