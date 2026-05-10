@@ -1697,18 +1697,18 @@ const addTask: McpToolDefinition = {
   tool: {
     name: 'baget_add_task',
     description:
-      'Add a task to the current open batch. Use when the founder says "add a task to ship the pricing page", "we need to do X", "make sure to Y". Pick the right agent role from the topic (developer for code/site, marketing for campaigns, analyst for research/data, design for visuals, ops for infra/legal/business, chief-of-staff for strategy/planning). RUNS IMMEDIATELY — credits only deduct when the batch actually launches. RESPONSE includes `[taskId=<uuid>]` — REMEMBER this UUID; if the founder immediately says "run it" / "kick it off" / "start it" you pass that exact taskId to baget_run_task. STRIP `[taskId=…]` from your reply to the founder (it\'s an internal handle, not user-facing).',
+      'Add a task to the current open batch. Use when the founder says "add a task to ship the pricing page", "we need to do X", "make sure to Y". ALWAYS provide BOTH `title` (short imperative label, ≤80 chars, e.g. "Ship pricing page v2") AND `description` (1–3 sentence brief explaining what the worker should accomplish, including any context from the conversation — the founder\'s framing of WHY, the constraints they mentioned, what success looks like). The description is what the worker reads when picking up the task; without it the worker has no context. Pick the right agent role from the topic (developer for code/site, marketing for campaigns, analyst for research/data, design for visuals, ops for infra/legal/business, chief-of-staff for strategy/planning). RUNS IMMEDIATELY — credits only deduct when the batch actually launches. RESPONSE includes `[taskId=<uuid>]` — REMEMBER this UUID; if the founder immediately says "run it" / "kick it off" / "start it" you pass that exact taskId to baget_run_task. STRIP `[taskId=…]` from your reply to the founder (it\'s an internal handle, not user-facing).',
     inputSchema: {
       type: 'object',
       properties: {
         title: { type: 'string', minLength: 1, maxLength: 200 },
-        description: { type: 'string', maxLength: 4000 },
+        description: { type: 'string', minLength: 1, maxLength: 4000 },
         agentRole: {
           type: 'string',
           enum: ['chief-of-staff', 'developer', 'marketing', 'analyst', 'design', 'ops', 'intern'],
         },
       },
-      required: ['title', 'agentRole'],
+      required: ['title', 'description', 'agentRole'],
       additionalProperties: false,
     },
   },
