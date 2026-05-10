@@ -481,6 +481,11 @@ async function dispatchApproval(args: {
         // Tell the LLM the card has been delivered — DO NOT render
         // a second text message. Wrap the instruction in a clear
         // status the persona-handler can recognise.
+        // No `note` field — the model echoes long prose values as chat
+        // replies (Sam 2026-05-10 prod incident: leaked instruction prose
+        // showed up in founder's Telegram). System prompt's "Approval
+        // card rule" section covers behavior; status string alone is
+        // enough signal here.
         return ok(
           JSON.stringify({
             status: 'approval-card-delivered',
@@ -490,7 +495,6 @@ async function dispatchApproval(args: {
               remaining: cost.remaining,
               tasksRemaining: cost.tasksRemaining,
             },
-            note: 'The approval card has been sent to the founder via Telegram with [✅ Approve] / [❌ Cancel] inline buttons. The card IS the message — return immediately without writing additional text and await the founder\'s tap. When the founder taps a button, the host synthesizes a "yes" or "cancel" message into your inbound queue; on "yes" you call this tool again with `confirmed: true` and the IDENTICAL payload. On "cancel" / "no", acknowledge briefly ("Got it — cancelled.") and move on.',
           }),
         );
       } catch (err) {
@@ -504,6 +508,10 @@ async function dispatchApproval(args: {
 
     // Legacy fallback — text-only flow when we can't deliver
     // buttons (no telegram routing yet, etc.).
+    // No `note` field — same leak risk as the card-delivered path
+    // above. System prompt's "Approval card rule" already specifies
+    // behavior for the text-fallback case ("write a plain-text summary
+    // + cost and ask the founder to confirm by typing a word").
     return ok(
       JSON.stringify({
         status: 'approval-pending',
@@ -513,11 +521,6 @@ async function dispatchApproval(args: {
           remaining: cost.remaining,
           tasksRemaining: cost.tasksRemaining,
         },
-        note: [
-          'Reply in plain text with the summary + cost, and ask the founder to confirm by typing a word ("yes" / "go" / "approve" or "no" / "cancel"). Do NOT say "tap", "press", or "✅" — there is no button here.',
-          'Set `confirmed: true` ONLY on a standalone confirmation word in the NEXT message. A repeat of the original request is NOT a confirmation — ask "To confirm, reply \'yes\' or \'go\'." Then re-call this tool with the IDENTICAL payload.',
-          '`amount` is the credit deduction for this action; `remaining` is the founder\'s balance; `tasksRemaining` is budget headroom (how many MORE tasks of this size fit) — do not phrase it as "queues N tasks". When `amount === 0` say "included in your plan", not "0 credits".',
-        ].join(' '),
       }),
     );
   }
