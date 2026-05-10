@@ -49,7 +49,8 @@ function scrubBearer(text: string): string {
   const token = process.env.BAGET_CHANNEL_TOKEN;
   let out = text;
   if (token) out = out.split(token).join('***SCRUBBED***');
-  return out.replace(/Bearer\s+[A-Za-z0-9_\-=.]+/g, 'Bearer ***SCRUBBED***');
+  // Char class covers RFC 6750 b64token (URL-safe + standard base64 + ~).
+  return out.replace(/Bearer\s+[A-Za-z0-9_\-=.+/~]+/g, 'Bearer ***SCRUBBED***');
 }
 
 // Bun ≤ 1.2.22 has a child_process cleanup-path crash: when a spawned

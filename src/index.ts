@@ -4,18 +4,17 @@
  * Thin orchestrator: init DB, run migrations, start channel adapters,
  * start delivery polls, start sweep, handle shutdown.
  */
-// MUST be the first import: installs Sentry's global error handlers
-// before any subsequent module has a chance to throw at load time. No-op
-// when SENTRY_DSN is unset (local dev). See src/sentry-init.ts.
-import './sentry-init.js';
+// MUST be the first import: tightens umask BEFORE any other module
+// evaluates, so a future import that writes a file at load time (logger,
+// self-seeding cache, etc.) inherits 0600 perms. ES modules hoist all
+// imports before any top-level statements, so this can't be a `process.
+// umask(...)` call at module top level — it'd run too late.
+import './umask-init.js';
 
-// Tighten umask before ANY filesystem write. Default on node:20-bookworm-slim
-// is 022 → files get created 0644. The central SQLite DB and its WAL/SHM
-// sidecars hold plaintext bearer tokens; we want them 0600 from the kernel
-// rather than racing a chmod after the fact (initDb still chmods as belt-
-// and-suspenders for sidecars created across boots). 0o077 = strip group +
-// world bits on every subsequent creat/open.
-process.umask(0o077);
+// MUST be early: installs Sentry's global error handlers before any
+// subsequent module has a chance to throw at load time. No-op when
+// SENTRY_DSN is unset (local dev). See src/sentry-init.ts.
+import './sentry-init.js';
 
 import path from 'path';
 
