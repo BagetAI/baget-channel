@@ -83,7 +83,15 @@ COPY package.json ./
 #   `Cannot find module '@anthropic-ai/claude-agent-sdk'`
 # Bun resolves modules from the script's local node_modules, so we
 # install at /app/container/agent-runner/node_modules.
-RUN cd /app/container/agent-runner && bun install --production
+# --omit=dev (NOT --production): per Bun's install docs, `--production`
+# strips BOTH devDependencies AND optionalDependencies. The Claude Agent
+# SDK ships its native binary as a platform-specific optionalDependency
+# (`@anthropic-ai/claude-agent-sdk-linux-x64`, etc.) — `--production`
+# would silently drop it and the runner crashes at first SDK invocation
+# with "Claude Code native binary not found." `--omit=dev` strips ONLY
+# devDependencies. `--frozen-lockfile` keeps CI reproducibility (the
+# next layer's `bun add` deliberately overrides this — see below).
+RUN cd /app/container/agent-runner && bun install --omit=dev --frozen-lockfile
 
 # Pre-install converters the agent reaches for during composition
 # workflows ("send me the deck as HTML / TXT", inline doc tweaks,

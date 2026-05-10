@@ -177,7 +177,7 @@ from the dashboard. Steps:
 
 ## Telegram bot — routing
 
-> **Architecture note.** This section documents the original single-shared-bot design, which is still operational as a legacy path. The current default is the **bot pool** (per-company assigned bot, one of N pre-seeded tokens) — see *Persistence requirements* below for the pool seeder + recovery story, and `src/baget-bot-pool-*.ts` for the assignment logic. New pairings under multi-bot pool mode get their own per-company bot username; the single-bot path below remains for compatibility with pre-pool deployments.
+> **Architecture note.** This section documents the original single-shared-bot design, which is still operational as a legacy path. The current default is the **bot pool** (per-company assigned bot, one of N pre-seeded tokens) — see *Persistence requirements* below for the pool seeder + recovery story. Schema and assignment logic live in `src/db/baget-bot-pool.ts` (`assignNextAvailableBot`, etc.); the boot-time env-var seeder is `src/baget-bot-pool-env-seeder.ts`. New pairings under multi-bot pool mode get their own per-company bot username; the single-bot path below remains for compatibility with pre-pool deployments.
 
 ### Legacy: single shared bot
 
