@@ -4,6 +4,15 @@ import path from 'path';
 
 import { query as sdkQuery, type HookCallback, type PreCompactHookInput } from '@anthropic-ai/claude-agent-sdk';
 
+import { clearContainerToolInFlight, setContainerToolInFlight } from '../db/connection.js';
+import { workspaceConversationsDir } from '../workspace-paths.js';
+import { registerProvider } from './provider-registry.js';
+import type { AgentProvider, AgentQuery, McpServerConfig, ProviderEvent, ProviderOptions, QueryInput } from './types.js';
+
+function log(msg: string): void {
+  console.error(`[claude-provider] ${msg}`);
+}
+
 const requireFromHere = createRequire(import.meta.url);
 
 /**
@@ -42,10 +51,13 @@ function resolveClaudeBinary(): string | undefined {
     variants.push(`win32-${arch}`);
   }
 
+  // Win32 binaries ship with `.exe`; *nix uses unsuffixed `claude`.
+  const binaryName = platform === 'win32' ? 'claude.exe' : 'claude';
+
   for (const variant of variants) {
     try {
       const pkgJsonPath = requireFromHere.resolve(`@anthropic-ai/claude-agent-sdk-${variant}/package.json`);
-      const candidate = path.join(path.dirname(pkgJsonPath), 'claude');
+      const candidate = path.join(path.dirname(pkgJsonPath), binaryName);
       if (fs.existsSync(candidate)) return candidate;
     } catch {
       // Variant package not installed for this platform — try next.
@@ -60,15 +72,6 @@ log(
     ? `Resolved Claude Code binary: ${RESOLVED_CLAUDE_BINARY}`
     : `Could not resolve Claude Code binary for ${process.platform}-${process.arch} — falling back to SDK default`,
 );
-
-import { clearContainerToolInFlight, setContainerToolInFlight } from '../db/connection.js';
-import { workspaceConversationsDir } from '../workspace-paths.js';
-import { registerProvider } from './provider-registry.js';
-import type { AgentProvider, AgentQuery, McpServerConfig, ProviderEvent, ProviderOptions, QueryInput } from './types.js';
-
-function log(msg: string): void {
-  console.error(`[claude-provider] ${msg}`);
-}
 
 // Deferred SDK builtins that either sidestep nanoclaw's own scheduling or
 // don't fit our async message-passing model (they're designed for Claude
