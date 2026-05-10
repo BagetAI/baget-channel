@@ -251,15 +251,22 @@ The Railway service reads these at startup. Set them on the
 
 ### Persistence requirements (Railway)
 
-The host writes its central SQLite DB to `/app/data/v2.db`. Railway containers have ephemeral filesystems, so a **persistent volume mounted at `/app/data` is required** — without it, every redeploy wipes the bot pool and active pairings, and the next founder bind returns `503 pool_exhausted`.
+The host writes its central SQLite DB to `/app/data/v2.db`. Railway containers have ephemeral filesystems, so a **persistent volume mounted at `/app/data` is required** — without it, every redeploy wipes the bot pool, the channel-tokens table (founder bearer tokens), and active pairings. Symptoms: the next founder bind returns `503 pool_exhausted`, AND every existing founder's Telegram bot stops responding because `getChannelToken(agentGroupId)` returns null on every spawn.
 
 ```bash
 railway volume add --mount-path /app/data
 ```
 
+**Verifying the mount.** Startup logs the filesystem type at `DATA_DIR persistence confirmed { fstype: "ext4" | … }`. If you instead see the WARN `DATA_DIR is on an ephemeral filesystem`, the volume is not attached (or attached at the wrong mount path) — fix before any founder pairs. Self-check is in `src/index.ts` (`detectEphemeralDataDir`); reads `/proc/mounts` and matches the longest mountpoint that is a prefix of `DATA_DIR`. The check is best-effort and Linux-only — local dev (macOS) reports nothing, which is intentional.
+
+**File permissions.** `initDb` sets `0o600` on `v2.db` and the WAL/SHM sidecars after open, so a leaked snapshot or root-readable Railway volume doesn't expose the plaintext bearer column to other processes. The chmod is best-effort (silently ignores `ENOENT` for not-yet-created sidecars and logs a WARN on other failures so you find out before deploy day).
+
 After attaching the volume, seed the pool once via `POST /baget/bot-pool/seed`. The seeded rows survive every subsequent redeploy.
 
 **Recovery flow if the volume is ever lost or replaced:**
+
+> **Read first.** **Channel-token rows are NOT recoverable.** baget.ai retains only the sha256 hash — the plaintext lives only in the lost SQLite. The bot-pool seeder below rebuilds the bot pool but NOT founder pairings. Every paired founder has to re-pair from the dashboard, which mints a fresh bearer and re-POSTs to this fork. Plan for founder DMs explaining what happened.
+
 1. Set `BAGET_BOT_POOL_SEED_JSON` env var on the Railway service with the JSON exported from `GET /baget/bot-pool/export` (you stash this in 1Password after each seed).
 2. Redeploy. The boot-time seeder rebuilds the pool from the env var.
 3. Existing per-company assignments do NOT survive — `assigned_agent_group_id` was on the lost volume. Founders re-pair to fresh pool slots; the OLD bot username is now unassigned and goes back into rotation.

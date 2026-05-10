@@ -4,9 +4,16 @@
  * Thin orchestrator: init DB, run migrations, start channel adapters,
  * start delivery polls, start sweep, handle shutdown.
  */
-// MUST be the first import: installs Sentry's global error handlers
-// before any subsequent module has a chance to throw at load time. No-op
-// when SENTRY_DSN is unset (local dev). See src/sentry-init.ts.
+// MUST be the first import: tightens umask BEFORE any other module
+// evaluates, so a future import that writes a file at load time (logger,
+// self-seeding cache, etc.) inherits 0600 perms. ES modules hoist all
+// imports before any top-level statements, so this can't be a `process.
+// umask(...)` call at module top level — it'd run too late.
+import './umask-init.js';
+
+// MUST be early: installs Sentry's global error handlers before any
+// subsequent module has a chance to throw at load time. No-op when
+// SENTRY_DSN is unset (local dev). See src/sentry-init.ts.
 import './sentry-init.js';
 
 import path from 'path';
@@ -16,6 +23,7 @@ import { randomUUID } from 'crypto';
 import { createBagetAdminServer, type BagetAdminServer } from './baget-admin-server.js';
 import { maybeSeedBotPoolFromEnv } from './baget-bot-pool-env-seeder.js';
 import { DATA_DIR } from './config.js';
+import { detectEphemeralDataDir } from './data-dir-classify.js';
 import { enforceStartupBackoff, resetCircuitBreaker } from './circuit-breaker.js';
 import { migrateGroupsToClaudeLocal } from './claude-md-compose.js';
 import { initDb } from './db/connection.js';
@@ -78,6 +86,26 @@ async function main(): Promise<void> {
   const db = initDb(dbPath);
   runMigrations(db);
   log.info('Central DB ready', { path: dbPath });
+
+  // 1.x. Volume self-check. The DB, bot pool, and channel-token
+  //      bearers all live under DATA_DIR; without a Railway volume
+  //      mounted there they're wiped every redeploy. A live deploy
+  //      with a real volume reports e.g. fstype=ext4 — we only warn
+  //      on the tmpfs/overlay case so a fresh checkout in a new env
+  //      doesn't fail silently.
+  const fsInfo = detectEphemeralDataDir(DATA_DIR);
+  if (fsInfo.ephemeral) {
+    log.warn(
+      'DATA_DIR is on an ephemeral filesystem — SQLite, bot pool, and channel tokens will be lost on every redeploy. Attach a persistent volume at this path.',
+      { dataDir: DATA_DIR, mountPoint: fsInfo.mountPoint, fstype: fsInfo.fstype },
+    );
+  } else if (fsInfo.fstype) {
+    log.info('DATA_DIR persistence confirmed', {
+      dataDir: DATA_DIR,
+      mountPoint: fsInfo.mountPoint,
+      fstype: fsInfo.fstype,
+    });
+  }
 
   // 1a. Bot-pool env-var self-seeder. Recovery safety-net for the
   //     scenario where the Railway persistent volume on /app/data is
