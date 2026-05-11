@@ -832,7 +832,18 @@ function buildAdapter(cfg: BagetTelegramConfig): ChannelAdapter {
     // caller sends an attachment with no commentary. Don't fire a
     // sendMessage with an empty body (Telegram rejects it AND it would
     // count as a bogus founder-facing event).
-    const text = rawText !== null && rawText.length > 0 ? rawText : null;
+    //
+    // Sam 2026-05-11 prod: model wraps URLs in `` `...` `` (markdown
+    // code-span). Telegram has no parse_mode set so the backticks render
+    // literally AND the URL inside doesn't get auto-linked. Strip ALL
+    // backticks from outbound text — the prompt rule "no backticks"
+    // doesn't reliably stop it, so the channel adapter is the choke
+    // point. Same pattern as PR #61 (empty bubble) / PR #74 (post-card
+    // text). Safe: founders don't see code-formatted text on Telegram
+    // either way — backticks always render literally without parse_mode.
+    const text = rawText !== null && rawText.length > 0
+      ? rawText.replace(/`/g, '')
+      : null;
     const attachments = message.attachments ?? [];
     // Phase 4 v0.1: pull an inline_keyboard reply_markup off the
     // outbound content if the channel-side dispatchApproval emitted
