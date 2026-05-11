@@ -218,6 +218,32 @@ function buildAdapter(cfg: BagetTelegramConfig): ChannelAdapter {
   const recentUpdates = new Set<number>();
   const MAX_RECENT = 1024;
 
+  /**
+   * Sam 2026-05-11 prod: even after PR #61 (drop empty `🧭 cos:` bubble
+   * after approval card) and PR #72 (drop leaky tool-response `note`
+   * field), the model STILL emits a non-empty text bubble after the
+   * card — rephrasing `summary` + `cost.amount` into prose like
+   * "Raphaël: Redeploy the customer site (latest main)." That ships
+   * AS A SECOND BUBBLE behind the real card.
+   *
+   * Structural fix at the channel layer: when we deliver a message
+   * WITH `reply_markup` (the approval card itself), stamp the chat
+   * with the current timestamp. Before delivering any subsequent
+   * TEXT-ONLY message to the same chat within a short window (10s
+   * — long enough to catch the next model turn, short enough that
+   * a legitimate next founder turn isn't suppressed), drop it.
+   *
+   * Why at this layer not at the agent: model behavior is brittle —
+   * even tight prompt rules + scrubbed tool responses don't stop
+   * Gemini from emitting the rephrase. The channel adapter is the
+   * choke point; one drop here closes the whole class.
+   *
+   * Attachments are exempt — they're independent artifacts (founder
+   * may genuinely want a file delivered alongside the approval card).
+   */
+  const recentApprovalCards = new Map<number, number>();
+  const APPROVAL_CARD_TEXT_SUPPRESS_MS = 10_000;
+
   // Periodic janitor: drop seen-updates rows older than 24h. Cheap, runs
   // every 10 minutes — Telegram retries are over by then.
   let sweepHandle: NodeJS.Timeout | null = null;
@@ -864,6 +890,28 @@ function buildAdapter(cfg: BagetTelegramConfig): ChannelAdapter {
     // value independent of the text turn.
     if (prefixed === null && attachments.length === 0) return undefined;
 
+    // Post-approval-card text suppression (Sam 2026-05-11 prod). If we
+    // recently shipped an approval card to this chat AND the current
+    // outbound is text-only (no reply_markup of its own, no attachments),
+    // drop. Catches the model's non-empty rephrase bubble that PR #61
+    // (empty-body null check) doesn't catch. See `recentApprovalCards`
+    // comment for full rationale.
+    if (
+      prefixed !== null &&
+      !replyMarkup &&
+      attachments.length === 0
+    ) {
+      const cardSentAt = recentApprovalCards.get(chatId);
+      if (cardSentAt && Date.now() - cardSentAt < APPROVAL_CARD_TEXT_SUPPRESS_MS) {
+        log.info('Baget telegram: suppressing post-approval-card text bubble', {
+          chatId,
+          msSinceCard: Date.now() - cardSentAt,
+          textLen: prefixed.length,
+        });
+        return undefined;
+      }
+    }
+
     // Send attachments first, then the (persona-prefixed) text. Founders
     // see the artifact, then the team's commentary. Attachments are NOT
     // persona-prefixed — they're artifacts, not utterances. Caption
@@ -923,6 +971,13 @@ function buildAdapter(cfg: BagetTelegramConfig): ChannelAdapter {
     if (prefixed !== null) {
       const messageId = await sendBotMessage(chatId, prefixed, agentGroupId, resolvedBotToken, replyMarkup);
       if (messageId !== undefined) lastMessageId = messageId;
+      // Stamp the chat for post-approval-card text suppression (see
+      // `recentApprovalCards` comment near module top). Only stamp if
+      // we ACTUALLY sent an approval card (replyMarkup is the discriminator
+      // for inline-keyboard cards in this adapter).
+      if (replyMarkup && messageId !== undefined) {
+        recentApprovalCards.set(typeof chatId === 'number' ? chatId : Number(chatId), Date.now());
+      }
     }
 
     return lastMessageId;
