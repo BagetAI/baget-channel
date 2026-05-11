@@ -1181,6 +1181,16 @@ function buildAdapter(cfg: BagetTelegramConfig): ChannelAdapter {
       log.warn('Baget telegram: callback_query before setup() — dropping', { id: cb.id });
       return;
     }
+    // Clear the approval-card text-suppression window for this chat.
+    // PR #74 added a 10s suppression to drop the model's same-turn
+    // rephrase of the card content. But when the founder TAPS the
+    // card, the agent's response to that tap is a NEW turn — the
+    // success / failure message after the action runs (which can
+    // arrive in 2-8s, well within the 10s window). That reply must
+    // always reach the founder. Clearing here, before we synthesize
+    // the "yes" / "cancel" inbound, ensures the next outbound is not
+    // suppressed regardless of the 10s timer.
+    recentApprovalCards.delete(chatId);
     const synthText = decision === 'yes' ? 'yes' : 'cancel';
     const senderId = cb.from ? `telegram:${cb.from.id}` : 'telegram:unknown';
     const sender = cb.from
