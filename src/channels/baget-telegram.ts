@@ -241,7 +241,7 @@ function buildAdapter(cfg: BagetTelegramConfig): ChannelAdapter {
    * Attachments are exempt — they're independent artifacts (founder
    * may genuinely want a file delivered alongside the approval card).
    */
-  const recentApprovalCards = new Map<number, number>();
+  const recentApprovalCards = new Map<number | string, number>();
   const APPROVAL_CARD_TEXT_SUPPRESS_MS = 10_000;
 
   // Periodic janitor: drop seen-updates rows older than 24h. Cheap, runs
@@ -976,7 +976,7 @@ function buildAdapter(cfg: BagetTelegramConfig): ChannelAdapter {
       // we ACTUALLY sent an approval card (replyMarkup is the discriminator
       // for inline-keyboard cards in this adapter).
       if (replyMarkup && messageId !== undefined) {
-        recentApprovalCards.set(typeof chatId === 'number' ? chatId : Number(chatId), Date.now());
+        recentApprovalCards.set(chatId, Date.now());
       }
     }
 
