@@ -22,7 +22,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { createBagetAdminServer } from './baget-admin-server.js';
 import { closeDb, getDb, initTestDb } from './db/connection.js';
 import { runMigrations } from './db/migrations/index.js';
-import { countAvailableBots, getBotPoolEntryByUsername } from './db/baget-bot-pool.js';
+import { countActiveBots, getBotPoolEntryByUsername } from './db/baget-bot-pool.js';
 
 const ADMIN_TOKEN = 'test-admin-token-1234567890abcdef';
 
@@ -51,10 +51,10 @@ describe('POST /baget/bot-pool/seed', () => {
 
   function defaultGetMeFor(token: string): Response {
     const username = `mock_for_${token.replace(/[^a-z0-9]/gi, '').slice(0, 8)}_bot`;
-    return new Response(
-      JSON.stringify({ ok: true, result: { id: 1, is_bot: true, username, first_name: 'Mock' } }),
-      { status: 200, headers: { 'Content-Type': 'application/json' } },
-    );
+    return new Response(JSON.stringify({ ok: true, result: { id: 1, is_bot: true, username, first_name: 'Mock' } }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    });
   }
 
   beforeEach(async () => {
@@ -145,14 +145,15 @@ describe('POST /baget/bot-pool/seed', () => {
     expect(row).toBeDefined();
     expect(row?.bot_token_value).toBe('token-fresh-001');
     expect(row?.webhook_secret.length).toBeGreaterThan(20); // auto-minted
-    expect(row?.status).toBe('available');
+    // Post-020: fresh rows land active (retired_at IS NULL). The
+    // 1:1 `status` field is gone.
+    expect(row?.retired_at).toBeNull();
   });
 
   it('rotates token on re-seed of the same username', async () => {
     getMeOverrides.set(
       'token-v1',
-      () =>
-        new Response(JSON.stringify({ ok: true, result: { username: 'rotate_bot' } }), { status: 200 }),
+      () => new Response(JSON.stringify({ ok: true, result: { username: 'rotate_bot' } }), { status: 200 }),
     );
     const r1 = await postSeed({
       bots: [{ botUsername: 'rotate_bot', botToken: 'token-v1' }],
@@ -161,8 +162,7 @@ describe('POST /baget/bot-pool/seed', () => {
 
     getMeOverrides.set(
       'token-v2',
-      () =>
-        new Response(JSON.stringify({ ok: true, result: { username: 'rotate_bot' } }), { status: 200 }),
+      () => new Response(JSON.stringify({ ok: true, result: { username: 'rotate_bot' } }), { status: 200 }),
     );
     const r2 = await postSeed({
       bots: [{ botUsername: 'rotate_bot', botToken: 'token-v2' }],
@@ -170,7 +170,7 @@ describe('POST /baget/bot-pool/seed', () => {
     expect(r2.json.rotated).toBe(1);
     expect(r2.json.inserted).toBe(0);
     expect(getBotPoolEntryByUsername('rotate_bot')?.bot_token_value).toBe('token-v2');
-    expect(countAvailableBots()).toBe(1); // still 1, not 2
+    expect(countActiveBots()).toBe(1); // still 1, not 2
   });
 
   it('skips rows missing botUsername or botToken', async () => {
@@ -195,10 +195,7 @@ describe('POST /baget/bot-pool/seed', () => {
   });
 
   it('skips when Telegram getMe response is malformed', async () => {
-    getMeOverrides.set(
-      'malformed-token',
-      () => new Response(JSON.stringify({ ok: false }), { status: 200 }),
-    );
+    getMeOverrides.set('malformed-token', () => new Response(JSON.stringify({ ok: false }), { status: 200 }));
     const { json } = await postSeed({
       bots: [{ botUsername: 'whatever_bot', botToken: 'malformed-token' }],
     });
@@ -253,8 +250,7 @@ describe('POST /baget/bot-pool/seed', () => {
   it('partial failure does NOT bail: successful rows still land', async () => {
     getMeOverrides.set(
       'ok-tok',
-      () =>
-        new Response(JSON.stringify({ ok: true, result: { username: 'good_bot' } }), { status: 200 }),
+      () => new Response(JSON.stringify({ ok: true, result: { username: 'good_bot' } }), { status: 200 }),
     );
     getMeOverrides.set('bad-tok', () => new Response('forbidden', { status: 403 }));
     const { json } = await postSeed({

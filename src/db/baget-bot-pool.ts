@@ -1,50 +1,57 @@
 /**
- * Baget Telegram bot-pool helpers — see migration 016 for the schema
- * + design context.
+ * Baget Telegram bot-pool helpers — see migration 016 (initial pool) +
+ * migration 020 (N:1 switch) for the schema + design context.
+ *
+ * Pool model: **N companies per bot.** A single Telegram bot can sit in
+ * unlimited group chats, with `messaging_group_agents` routing each
+ * `chat_id` to its owning `agent_group`. The legacy 1:1 model treated
+ * the pool as a capacity-capped resource; the N:1 model treats it as a
+ * load-distribution + branding resource where every active bot is
+ * eligible to take new assignments.
  *
  * Lifecycle (per bot row):
  *
- *   seedBotPoolEntry()    — operator inserts via /baget/bot-pool/seed.
- *                           status='available', no FK, no assigned_at.
- *   assignNextAvailableBot(agentGroupId)
- *                          — bind handler picks the oldest available
- *                            row, atomically flips status→'assigned',
- *                            stamps FK + assigned_at. Returns the row
- *                            so the bind handler can register the
- *                            webhook + setMyName.
+ *   seedBotPoolEntry()    — operator inserts via /baget/bot-pool/seed,
+ *                           or the boot-time env-var seeder reads
+ *                           BAGET_BOT_POOL_SEED_JSON. Row lands with
+ *                           retired_at=NULL (active in rotation).
+ *   assignNextAvailableBot(agentGroupId, ownerUserId?)
+ *                          — bind handler creates a junction row
+ *                            linking agent_group → bot. Picks the
+ *                            least-loaded active bot, preferring one
+ *                            that doesn't already serve any of the
+ *                            same founder's other companies (best-
+ *                            effort same-founder split). Returns the
+ *                            bot row.
  *   markWebhookRegistered(username, ts)
  *                          — first-bind-only: records that Telegram
- *                            accepted setWebhook for this URL. Skipped
- *                            on subsequent re-binds of the same group.
+ *                            accepted setWebhook for this URL.
  *   getBotPoolEntryByAgentGroup(agentGroupId)
- *                          — adapter outbound path: looks up the
- *                            assigned bot to source the right token +
- *                            URL. Returns undefined for legacy
- *                            (non-pool) groups; adapter falls back to
- *                            cfg.botToken.
+ *                          — adapter outbound path: JOIN through the
+ *                            junction to source the right token + URL.
+ *                            Returns undefined for legacy (non-pool)
+ *                            groups; adapter falls back to cfg.botToken.
  *   getBotPoolEntryByUsername(username)
- *                          — webhook handler: secret-token check vs
- *                            the per-bot stored secret + agent_group
- *                            routing.
+ *                          — webhook handler: secret-token check vs the
+ *                            per-bot stored secret. Routing to a
+ *                            specific agent_group happens downstream
+ *                            via `chat_id` → `messaging_group_agents`.
  *   releaseBot(agentGroupId)
- *                          — disconnect handler: flips status back to
- *                            'available' + clears the FK so the next
- *                            bind reuses this bot. Webhook stays
- *                            registered (Telegram accepts re-set
- *                            without restart, and the URL contains
- *                            the username — immutable per pool row).
- *   countAvailableBots()    — observability + 503 gate.
+ *                          — disconnect handler: DELETEs the junction
+ *                            row. Bot stays in pool with no status
+ *                            change — it's still serving its other
+ *                            assignments. Returns the username for log
+ *                            lines.
+ *   countActiveBots()    — "how many bots are eligible for new
+ *                             assignments" (retired_at IS NULL). Used
+ *                             by observability + the 503 gate.
  *
- * Concurrency: every state transition is a single CAS UPDATE wrapped
- * in `getDb().transaction(...)` so two parallel binds against an
- * empty pool can never both grab the same row. The non-trivial case
- * is `assignNextAvailableBot`: SELECT-then-UPDATE under WAL would
- * race, so we wrap them in one transaction and the UPDATE's WHERE
- * clause re-asserts `status = 'available'` to defeat any reader that
- * snuck in between. better-sqlite3 transactions are synchronous, so
- * the race window is bounded to actual concurrent host calls — which
- * the bind endpoint receives one-at-a-time anyway, but we don't rely
- * on that.
+ * Concurrency: assignment is wrapped in `getDb().transaction(...)`. The
+ * junction's PK on `agent_group_id` makes a SECOND parallel assign for
+ * the same group race-safe — the loser hits SQLITE_CONSTRAINT_PRIMARYKEY
+ * and falls through to re-read the winner. Two parallel assigns for
+ * DIFFERENT agent_groups can land on the same or different bots; both
+ * are valid in N:1.
  *
  * Logging discipline:
  *   `bot_token_value` and `webhook_secret` are SECRETS. Helper
@@ -59,11 +66,12 @@ export interface BotPoolRow {
   bot_username: string;
   bot_token_value: string;
   webhook_secret: string;
-  status: 'available' | 'assigned';
-  assigned_agent_group_id: string | null;
-  assigned_at: string | null;
   webhook_registered_at: string | null;
   created_at: string;
+  /** Non-NULL when the operator retired the bot. Retired bots keep
+   *  serving their existing assignments but are skipped by
+   *  `assignNextAvailableBot` for new ones. */
+  retired_at: string | null;
   /** Provenance — `'admin'` for rows inserted via `POST /baget/bot-pool/seed`,
    *  `'env'` for rows inserted by the boot-time `BAGET_BOT_POOL_SEED_JSON`
    *  self-seeder. Default `'admin'` per migration #019, so legacy rows
@@ -73,19 +81,30 @@ export interface BotPoolRow {
 }
 
 /**
+ * Column list for SELECTs that return a `BotPoolRow`. Prefixed with
+ * `b.` so the same string works in both bare SELECTs from
+ * `baget_bot_pool b` and JOINs against `baget_bot_pool_assignments`
+ * (which also has a `bot_username` column — bare names would be
+ * ambiguous under JOIN).
+ */
+const BOT_ROW_COLS =
+  'b.bot_username, b.bot_token_value, b.webhook_secret, b.webhook_registered_at, b.created_at, b.retired_at, b.source';
+
+/**
  * Outcome of `seedBotPoolEntry`. `inserted` means a brand-new pool
  * row landed; `rotated` means the username was already known and we
  * UPDATEd `bot_token_value` + `webhook_secret` (the @BotFather
  * token-rotation flow). The seed admin endpoint surfaces these as
  * counts so the operator can tell which bots needed rotation.
  *
- * IMPORTANT: rotation does NOT touch `status`,
- * `assigned_agent_group_id`, `assigned_at`, `webhook_registered_at`,
- * or `created_at`. An assigned bot whose token rotates stays
- * assigned to its company; the founder's chat seamlessly continues
- * once the new token propagates.
+ * IMPORTANT: rotation does NOT touch `retired_at`,
+ * `webhook_registered_at`, or `created_at`. A retired bot whose token
+ * rotates stays retired; an active bot stays active and its existing
+ * assignments seamlessly continue once the new token propagates.
  */
 export type SeedOutcome = 'inserted' | 'rotated';
+
+export type SeedSource = 'admin' | 'env';
 
 /**
  * Upsert a bot into the pool. Caller validates the token via
@@ -94,24 +113,13 @@ export type SeedOutcome = 'inserted' | 'rotated';
  *
  * Idempotent on the username PK with sane rotation semantics:
  *
- *   - First seed of a username → INSERT a fresh `'available'` row.
- *     Returns `'inserted'`.
+ *   - First seed of a username → INSERT a fresh active row
+ *     (retired_at=NULL). Returns `'inserted'`.
  *
  *   - Re-seed of an existing username → UPDATE the credentials
- *     (`bot_token_value`, `webhook_secret`) only. `status`,
- *     `assigned_agent_group_id`, `assigned_at`, and
- *     `webhook_registered_at` are preserved so an in-use bot whose
- *     @BotFather token was rotated keeps serving its founder. Returns
- *     `'rotated'`.
- *
- * The original design used `INSERT OR IGNORE` and treated re-seeds
- * as "skipped" no-ops — that broke the operator's documented
- * rotation flow (token changes in BotFather, re-seed left stale
- * credentials in the DB, bot 401'd silently on every webhook /
- * outbound until manual intervention). Codex P1 catch.
+ *     (`bot_token_value`, `webhook_secret`) only. `retired_at` and
+ *     `webhook_registered_at` are preserved. Returns `'rotated'`.
  */
-export type SeedSource = 'admin' | 'env';
-
 export function seedBotPoolEntry(args: {
   botUsername: string;
   botTokenValue: string;
@@ -125,12 +133,6 @@ export function seedBotPoolEntry(args: {
 }): SeedOutcome {
   const db = getDb();
   const source: SeedSource = args.source ?? 'admin';
-  // Wrap the existence check + upsert in one transaction so the
-  // outcome flag matches the actual write (no TOCTOU window where a
-  // racing seed lands between the SELECT and the INSERT). Since
-  // better-sqlite3 transactions serialize on the same handle and
-  // /baget/bot-pool/seed is operator-only / low-frequency, the
-  // transaction overhead is negligible.
   return db.transaction((): SeedOutcome => {
     const existed = db.prepare('SELECT 1 AS one FROM baget_bot_pool WHERE bot_username = ?').get(args.botUsername) as
       | { one: number }
@@ -143,9 +145,8 @@ export function seedBotPoolEntry(args: {
     // debugging signal noisy.
     db.prepare(
       `INSERT INTO baget_bot_pool
-         (bot_username, bot_token_value, webhook_secret, status,
-          assigned_agent_group_id, assigned_at, webhook_registered_at, created_at, source)
-       VALUES (?, ?, ?, 'available', NULL, NULL, NULL, ?, ?)
+         (bot_username, bot_token_value, webhook_secret, webhook_registered_at, created_at, source, retired_at)
+       VALUES (?, ?, ?, NULL, ?, ?, NULL)
        ON CONFLICT(bot_username) DO UPDATE SET
          bot_token_value = excluded.bot_token_value,
          webhook_secret  = excluded.webhook_secret`,
@@ -155,118 +156,123 @@ export function seedBotPoolEntry(args: {
 }
 
 /**
- * Atomic assignment. Returns the bot row that was just assigned, or
- * null if the pool has no available bots.
+ * Assign a pool bot to an agent_group. Returns the bot row, or null
+ * if the pool has zero active bots (retired_at IS NULL) — which is
+ * the only path that surfaces 'pool_exhausted' upstream in N:1.
  *
- * Re-entrancy: if `agentGroupId` already has a bot assigned, this is
- * a no-op that returns the existing row. The bind handler relies on
- * that for idempotency — second bind for the same group returns the
- * same bot, never a fresh one.
+ * Re-entrancy: if `agentGroupId` already has a junction row, returns
+ * the existing bot (idempotent). Same posture as the 1:1 era.
  *
- * Concurrency model:
- *   The host runs as a single Node process (Railway service), and
- *   better-sqlite3 transactions serialize synchronously on the
- *   single DB handle, so two parallel calls into THIS function from
- *   the same process can never overlap. The SELECT + UPDATE pair
- *   inside the transaction is therefore race-free against in-process
- *   concurrency.
+ * Assignment policy:
+ *   - **Step A — same-founder preference.** If `ownerUserId` is
+ *     supplied, prefer a bot that doesn't already serve any of this
+ *     founder's other companies. Mitigates the "Telegram (bot, user)
+ *     → one DM" collapse for founders who run multiple companies on
+ *     the platform.
+ *   - **Step B — least-loaded.** Among the candidates after step A,
+ *     pick the bot with the fewest current assignments.
+ *   - **Step C — FIFO tiebreak.** Same load → oldest `created_at`
+ *     first. Preserves operator's seeding order as a stable signal.
  *
- *   The FK partial UNIQUE index `idx_bot_pool_assigned_agent_group`
- *   is the second-line guarantee for two cases that fall outside the
- *   in-process serialization:
- *     1. A future horizontally-scaled deployment with multiple
- *        Node processes hitting the same SQLite file (not the
- *        current shape, but defense in depth).
- *     2. A re-entrant call from the same process where the previous
- *        bind's row insertion happened OUTSIDE this function (e.g.
- *        operator manual UPDATE) — the unique-constraint violation
- *        still makes "two bots assigned to one agent_group"
- *        impossible.
- *   On `SQLITE_CONSTRAINT_UNIQUE` from the UPDATE we catch and
- *   re-read the existing assignment (the conflict is itself the
- *   evidence that another caller already won).
+ * All three are baked into a single ORDER BY so SQLite returns the
+ * winner in one query.
+ *
+ * Concurrency:
+ *   The host runs as a single Node process; better-sqlite3
+ *   transactions serialize synchronously, so two parallel calls into
+ *   this function from the same process can never overlap the
+ *   SELECT-then-INSERT pair. The PK on `agent_group_id` is the
+ *   second-line guarantee for any cross-process race (or operator
+ *   manual INSERT): the loser catches `SQLITE_CONSTRAINT_PRIMARYKEY`
+ *   and re-reads the winner's assignment.
  */
-export function assignNextAvailableBot(agentGroupId: string): BotPoolRow | null {
+export function assignNextAvailableBot(agentGroupId: string, ownerUserId?: string): BotPoolRow | null {
   const db = getDb();
-  const SELECT_BY_AGENT = db.prepare(
-    `SELECT bot_username, bot_token_value, webhook_secret, status,
-            assigned_agent_group_id, assigned_at, webhook_registered_at, created_at, source
-       FROM baget_bot_pool
-      WHERE assigned_agent_group_id = ?`,
-  );
   return db.transaction((): BotPoolRow | null => {
-    // 0. If this group already has a bot, return it (idempotent).
-    const existing = SELECT_BY_AGENT.get(agentGroupId) as BotPoolRow | undefined;
+    // 0. Idempotency: if a junction row already exists, return that bot.
+    const existing = db
+      .prepare(
+        `SELECT ${BOT_ROW_COLS}
+           FROM baget_bot_pool b
+           INNER JOIN baget_bot_pool_assignments a ON a.bot_username = b.bot_username
+          WHERE a.agent_group_id = ?`,
+      )
+      .get(agentGroupId) as BotPoolRow | undefined;
     if (existing) return existing;
 
-    // 1. Pick the oldest available bot. The partial filtered index
-    //    `idx_bot_pool_available` makes this O(1) past the first row.
+    // 1. Pick the winner per the policy in the doc-comment. The
+    //    `ag.user_id = ?` predicate inside the SUM short-circuits to 0
+    //    for any row that doesn't match — passing NULL for ownerUserId
+    //    (legacy callers that don't supply it) makes the entire SUM
+    //    zero for every bot, which collapses step A into a no-op and
+    //    falls through to pure least-loaded behavior.
+    //
+    //    The `ag.archived_at IS NULL` clause in the JOIN-ON ensures
+    //    archived agent_groups don't poison the same-founder count.
+    //    Today, `releaseBot` runs atomically with archive, so phantom
+    //    junction-rows-for-archived-groups don't happen on the happy
+    //    path. The filter is defense-in-depth for any future code
+    //    path that archives without releasing (cleanup jobs, manual
+    //    operator queries).
     const candidate = db
       .prepare(
-        `SELECT bot_username
-           FROM baget_bot_pool
-          WHERE status = 'available'
-          ORDER BY created_at ASC
+        `SELECT b.bot_username
+           FROM baget_bot_pool b
+           LEFT JOIN baget_bot_pool_assignments a ON a.bot_username = b.bot_username
+           LEFT JOIN agent_groups ag
+             ON ag.id = a.agent_group_id AND ag.archived_at IS NULL
+          WHERE b.retired_at IS NULL
+          GROUP BY b.bot_username
+          ORDER BY (SUM(CASE WHEN ag.user_id = ? THEN 1 ELSE 0 END) > 0) ASC,
+                   COUNT(a.agent_group_id) ASC,
+                   b.created_at ASC
           LIMIT 1`,
       )
-      .get() as { bot_username: string } | undefined;
+      .get(ownerUserId ?? null) as { bot_username: string } | undefined;
     if (!candidate) return null;
 
-    // 2. Flip the row to 'assigned' and stamp the FK. The WHERE
-    //    clause re-asserts `status='available'` so any prior change
-    //    on this row (concurrent process winning the race) fails
-    //    this UPDATE with changes=0. The FK partial UNIQUE index
-    //    fires only if a DIFFERENT bot was already assigned to this
-    //    same agent_group — see the catch below.
+    // 2. Insert the junction row. On a SQLITE_CONSTRAINT_PRIMARYKEY
+    //    race (another caller wrote the same agent_group_id between
+    //    step 0 and step 2), re-read and return the winner.
     const assignedAt = new Date().toISOString();
-    let result: { changes: number };
     try {
-      result = db
-        .prepare(
-          `UPDATE baget_bot_pool
-              SET status                  = 'assigned',
-                  assigned_agent_group_id = ?,
-                  assigned_at             = ?
-            WHERE bot_username = ? AND status = 'available'`,
-        )
-        .run(agentGroupId, assignedAt, candidate.bot_username);
+      db.prepare(
+        `INSERT INTO baget_bot_pool_assignments (agent_group_id, bot_username, assigned_at)
+         VALUES (?, ?, ?)`,
+      ).run(agentGroupId, candidate.bot_username, assignedAt);
     } catch (err) {
-      // SQLITE_CONSTRAINT_UNIQUE: another caller raced and assigned
-      // a (different) bot to this same agent_group between our
-      // step-0 lookup and step-2 write. Re-read and return their
-      // assignment — preserves the function's idempotency contract
-      // from the caller's perspective. (Single-process callers
-      // can't hit this; cross-process or operator-manual writes
-      // can.)
       const code = (err as { code?: string }).code ?? '';
-      if (code === 'SQLITE_CONSTRAINT_UNIQUE') {
-        const racedExisting = SELECT_BY_AGENT.get(agentGroupId) as BotPoolRow | undefined;
-        if (racedExisting) return racedExisting;
+      if (code === 'SQLITE_CONSTRAINT_PRIMARYKEY' || code === 'SQLITE_CONSTRAINT_UNIQUE') {
+        const raced = db
+          .prepare(
+            `SELECT ${BOT_ROW_COLS}
+               FROM baget_bot_pool b
+               INNER JOIN baget_bot_pool_assignments a ON a.bot_username = b.bot_username
+              WHERE a.agent_group_id = ?`,
+          )
+          .get(agentGroupId) as BotPoolRow | undefined;
+        if (raced) return raced;
       }
       throw err;
     }
-    if (result.changes !== 1) return null;
 
-    // 3. Read back the freshly-assigned row.
+    // 3. Read back the assigned bot row.
     return db
-      .prepare(
-        `SELECT bot_username, bot_token_value, webhook_secret, status,
-                assigned_agent_group_id, assigned_at, webhook_registered_at, created_at, source
-           FROM baget_bot_pool
-          WHERE bot_username = ?`,
-      )
+      .prepare(`SELECT ${BOT_ROW_COLS} FROM baget_bot_pool b WHERE b.bot_username = ?`)
       .get(candidate.bot_username) as BotPoolRow;
   })();
 }
 
 /**
- * Release the bot back to the pool. Called by the disconnect handlers
- * after the agent_group is archived + chats are unbound.
+ * Release the agent_group's assignment back to the pool. Called by the
+ * disconnect handlers after the agent_group is archived + chats are
+ * unbound.
  *
- * Returns the username that was released (for logging) or null if
- * the agent_group had no bot assigned. The latter is the legacy /
- * Vela case — agent_group never went through pool assignment, so
- * there's nothing to release.
+ * In N:1 this is a junction-row DELETE. The bot row stays in the pool
+ * (it may still have other assignments). Returns the username that
+ * was released (for logging) or null if the agent_group had no
+ * assignment (legacy / Vela pairings never went through pool
+ * assignment).
  *
  * Webhook stays registered. Telegram's setWebhook semantics allow
  * idempotent re-set; the cost of "leaving" the registration is one
@@ -277,25 +283,18 @@ export function assignNextAvailableBot(agentGroupId: string): BotPoolRow | null 
  */
 export function releaseBot(agentGroupId: string): string | null {
   const db = getDb();
-  const row = db
-    .prepare(
-      `SELECT bot_username
-         FROM baget_bot_pool
-        WHERE assigned_agent_group_id = ?`,
-    )
-    .get(agentGroupId) as { bot_username: string } | undefined;
-  if (!row) return null;
-  const result = db
-    .prepare(
-      `UPDATE baget_bot_pool
-          SET status                  = 'available',
-              assigned_agent_group_id = NULL,
-              assigned_at             = NULL
-        WHERE bot_username = ? AND assigned_agent_group_id = ?`,
-    )
-    .run(row.bot_username, agentGroupId);
-  if (result.changes !== 1) return null;
-  return row.bot_username;
+  return db.transaction((): string | null => {
+    const row = db
+      .prepare(`SELECT bot_username FROM baget_bot_pool_assignments WHERE agent_group_id = ?`)
+      .get(agentGroupId) as { bot_username: string } | undefined;
+    if (!row) return null;
+    // The SELECT above and this DELETE run inside the same
+    // transaction on the single-process better-sqlite3 handle, so
+    // the DELETE cannot return changes !== 1 after a successful read
+    // (no concurrent writer can drop the row in between).
+    db.prepare(`DELETE FROM baget_bot_pool_assignments WHERE agent_group_id = ?`).run(agentGroupId);
+    return row.bot_username;
+  })();
 }
 
 /**
@@ -306,10 +305,10 @@ export function releaseBot(agentGroupId: string): string | null {
 export function getBotPoolEntryByAgentGroup(agentGroupId: string): BotPoolRow | undefined {
   return getDb()
     .prepare(
-      `SELECT bot_username, bot_token_value, webhook_secret, status,
-              assigned_agent_group_id, assigned_at, webhook_registered_at, created_at, source
-         FROM baget_bot_pool
-        WHERE assigned_agent_group_id = ?`,
+      `SELECT ${BOT_ROW_COLS}
+         FROM baget_bot_pool b
+         INNER JOIN baget_bot_pool_assignments a ON a.bot_username = b.bot_username
+        WHERE a.agent_group_id = ?`,
     )
     .get(agentGroupId) as BotPoolRow | undefined;
 }
@@ -318,18 +317,14 @@ export function getBotPoolEntryByAgentGroup(agentGroupId: string): BotPoolRow | 
  * Lookup by username. The per-bot webhook route (`/api/channels/
  * telegram/bot/:botUsername/webhook`) uses this to verify the
  * incoming `X-Telegram-Bot-Api-Secret-Token` against the stored
- * `webhook_secret` and to resolve which `agent_group_id` should
- * route the update.
+ * `webhook_secret`. In N:1 the bot may be serving multiple
+ * agent_groups — chat routing happens downstream via the `chat_id`
+ * → `messaging_group_agents` mapping.
  */
 export function getBotPoolEntryByUsername(botUsername: string): BotPoolRow | undefined {
-  return getDb()
-    .prepare(
-      `SELECT bot_username, bot_token_value, webhook_secret, status,
-              assigned_agent_group_id, assigned_at, webhook_registered_at, created_at, source
-         FROM baget_bot_pool
-        WHERE bot_username = ?`,
-    )
-    .get(botUsername) as BotPoolRow | undefined;
+  return getDb().prepare(`SELECT ${BOT_ROW_COLS} FROM baget_bot_pool b WHERE b.bot_username = ?`).get(botUsername) as
+    | BotPoolRow
+    | undefined;
 }
 
 /**
@@ -340,38 +335,46 @@ export function getBotPoolEntryByUsername(botUsername: string): BotPoolRow | und
  */
 export function markWebhookRegistered(botUsername: string, registeredAt: string): void {
   getDb()
-    .prepare(
-      `UPDATE baget_bot_pool
-          SET webhook_registered_at = ?
-        WHERE bot_username = ?`,
-    )
+    .prepare(`UPDATE baget_bot_pool SET webhook_registered_at = ? WHERE bot_username = ?`)
     .run(registeredAt, botUsername);
 }
 
 /**
- * Pool depth gauge — used by the bind handler to return
- * `503 pool_exhausted` cleanly + by the seed endpoint's response so
- * the operator sees the new total.
+ * Count bots eligible for new assignments. In N:1 this is just "how
+ * many active bots are in the pool" — not "how many free slots."
+ * Used by the bind handler to surface `503 pool_exhausted` cleanly
+ * when zero active bots exist (the pool was never seeded, or every
+ * bot was retired).
  */
-export function countAvailableBots(): number {
-  const row = getDb().prepare(`SELECT COUNT(*) AS n FROM baget_bot_pool WHERE status = 'available'`).get() as {
+export function countActiveBots(): number {
+  const row = getDb().prepare(`SELECT COUNT(*) AS n FROM baget_bot_pool WHERE retired_at IS NULL`).get() as {
     n: number;
   };
   return row.n;
 }
 
 /**
- * Total pool size (any status). Distinct from `countAvailableBots`
- * because the env-var self-seeder gate keys on "is the table EMPTY?",
- * not "are there any AVAILABLE bots?". A pool with N assigned-but-no-
- * available rows is not empty — adding env-seeded rows on top would
- * silently double-seed any usernames that overlap (the rotation
- * semantics in `seedBotPoolEntry` would handle this safely, but the
- * spammed log lines on every boot would be noise). The empty-table
- * gate avoids that.
+ * Total pool size including retired rows. Distinct from
+ * `countActiveBots` because the env-var self-seeder gate keys on
+ * "is the table EMPTY?", not "are there any ACTIVE bots?". An
+ * operator who retired every bot still has rows in the table; the
+ * self-seeder must not silently insert duplicates on top of them.
  */
 export function countBotPoolEntries(): number {
   const row = getDb().prepare(`SELECT COUNT(*) AS n FROM baget_bot_pool`).get() as { n: number };
+  return row.n;
+}
+
+/**
+ * Per-bot assignment count. Surfaced in the admin export so operators
+ * can see at a glance which pool bots are heavily loaded vs idle.
+ * Replaces the old export's `_meta.assignedAgentGroupId` field (which
+ * could only carry one value and is meaningless in N:1).
+ */
+export function countAssignmentsForBot(botUsername: string): number {
+  const row = getDb()
+    .prepare(`SELECT COUNT(*) AS n FROM baget_bot_pool_assignments WHERE bot_username = ?`)
+    .get(botUsername) as { n: number };
   return row.n;
 }
 
@@ -388,11 +391,6 @@ export function countBotPoolEntries(): number {
  */
 export function listAllBotPoolEntries(): BotPoolRow[] {
   return getDb()
-    .prepare(
-      `SELECT bot_username, bot_token_value, webhook_secret, status,
-              assigned_agent_group_id, assigned_at, webhook_registered_at, created_at, source
-         FROM baget_bot_pool
-        ORDER BY created_at ASC`,
-    )
+    .prepare(`SELECT ${BOT_ROW_COLS} FROM baget_bot_pool b ORDER BY b.created_at ASC`)
     .all() as BotPoolRow[];
 }

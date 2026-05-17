@@ -1,10 +1,24 @@
 /**
  * Pre-minted Telegram bot pool — supports the multi-company pairing
- * model. Telegram has a hard constraint: one (bot, user) pair maps to
- * exactly one DM. So if a founder runs N companies, they need N bots
- * to get N separate chats. We pre-mint a small pool via @BotFather
- * (operator does this once), then assign one bot to each company at
- * bind time.
+ * model. We pre-mint a small pool via @BotFather (operator does this
+ * once), then assign bots to companies at bind time.
+ *
+ * **SUPERSEDED BY MIGRATION 020 (N:1 SWITCH).** This migration creates
+ * the 1:1 model where each pool bot serves exactly one company. The
+ * 1:1 enforcement (UNIQUE index on `assigned_agent_group_id`, status
+ * 'available' ↔ 'assigned') was driven by the worst-case "one founder
+ * runs N companies" — that founder's DM with the same bot would
+ * collapse across companies per Telegram's (bot, user) → one-DM rule.
+ * Migration 020 replaces this with a junction table allowing N
+ * companies per bot, since the common case (different founders, or
+ * group chats) routes cleanly via chat_id; the same-founder edge case
+ * is handled best-effort by `assignNextAvailableBot`'s same-founder-
+ * preference query. Read 020's doc-comment for the full rationale.
+ *
+ * The schema described below reflects the AS-CREATED state in
+ * migration 016. After migration 020 lands, the dropped columns and
+ * indexes no longer exist; consult `db/baget-bot-pool.ts` for the
+ * live shape.
  *
  * Schema:
  *   - `bot_username` (PK) — `@BotFather` issued, lowercase, e.g.

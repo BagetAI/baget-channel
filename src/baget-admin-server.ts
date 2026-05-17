@@ -62,7 +62,8 @@ import {
 } from './db/baget-agent-groups.js';
 import {
   assignNextAvailableBot,
-  countAvailableBots,
+  countAssignmentsForBot,
+  countActiveBots,
   getBotPoolEntryByAgentGroup,
   listAllBotPoolEntries,
   markWebhookRegistered,
@@ -982,13 +983,13 @@ export function createBagetAdminServer(config: BagetAdminServerConfig): BagetAdm
     //    PR #37: read the actual bind count instead of hardcoding
     //    false.
     const preBindChatCount = countMessagingGroupBindings(agentGroupId);
-    const poolResult = resolvePoolAssignment(agentGroupId, preBindChatCount > 0);
+    const poolResult = resolvePoolAssignment(agentGroupId, userId, preBindChatCount > 0);
     if (poolResult === 'pool_exhausted') {
       sendJson(res, 503, {
         ok: false,
         error: 'pool_exhausted',
         message:
-          'No pool bot available and no global fallback configured. Seed more bots into the pool or set a global telegramBotToken.',
+          'No active bots in the pool. Operator must seed at least one bot via POST /baget/bot-pool/seed (or restore BAGET_BOT_POOL_SEED_JSON) or set a global telegramBotToken fallback.',
       });
       return;
     }
@@ -1191,9 +1192,9 @@ export function createBagetAdminServer(config: BagetAdminServerConfig): BagetAdm
     //     refuse fresh pool assignment (no setWebhook URL → one-way
     //     broken chat); resolvePoolAssignment handles that case by
     //     falling back to global or returning pool_exhausted.
-    const poolResult = resolvePoolAssignment(agentGroupId, preBindChatCount > 0);
+    const poolResult = resolvePoolAssignment(agentGroupId, userId, preBindChatCount > 0);
     if (poolResult === 'pool_exhausted') {
-      log.error('Baget bind-telegram: pool exhausted and no global token configured', {
+      log.error('Baget bind-telegram: no active bots in pool and no global token configured', {
         userId,
         companyId,
         agentGroupId,
@@ -1201,7 +1202,7 @@ export function createBagetAdminServer(config: BagetAdminServerConfig): BagetAdm
       sendJson(res, 503, {
         ok: false,
         error: 'pool_exhausted',
-        message: 'Bot pool is empty — operator must seed more bots via POST /baget/bot-pool/seed.',
+        message: 'Bot pool has no active bots — operator must seed at least one via POST /baget/bot-pool/seed.',
       });
       return;
     }
@@ -1397,33 +1398,32 @@ export function createBagetAdminServer(config: BagetAdminServerConfig): BagetAdm
    *     than "the agent_groups row already existed": a partial-
    *     failure retry has the row but no chat-binds, so it
    *     correctly gets a pool bot rather than being starved on
-   *     global. Codex P2 catch.
+   *     global.
    *
-   *   - Fresh agent_group (or partial-failure retry) + pool has
-   *     availability → assigns a fresh row, returns
+   *   - Fresh agent_group (or partial-failure retry) + ≥ 1 active
+   *     pool bot → assigns via the junction table, returns
    *     `wasFreshlyAssigned: true`.
-   *   - Pool empty + global token configured → returns null
-   *     (caller falls back to global).
-   *   - Pool empty + no global token → `'pool_exhausted'` so the
-   *     caller can 503.
+   *   - Pool has zero active bots + global token configured →
+   *     returns null (caller falls back to global).
+   *   - Pool has zero active bots + no global token →
+   *     `'pool_exhausted'` so the caller can 503. **In the N:1
+   *     model (migration 020) this is an operator misconfiguration,
+   *     not a capacity issue** — every active bot can serve N
+   *     companies, so the only way to reach this branch is "no
+   *     bots seeded" or "all bots retired."
    *
-   * The `wasFreshlyAssigned` flag in the success return is the
-   * caller's signal for "did THIS call just stamp the
-   * `assigned_agent_group_id` FK?" (true), vs reusing an existing
-   * assignment (false). It used to gate a per-assignment setMyName
-   * call; that was removed (see the bind-handler comment block
-   * "Bot display-name: NOT touched at bind time") because the
-   * generic operator-set names are intentional. The flag is kept
-   * as part of the resolver's contract for future per-fresh-assign
-   * side-effects (e.g. logging, telemetry) and is read by the
-   * bind handler's setWebhook gate.
+   * `ownerUserId` is forwarded into `assignNextAvailableBot` for
+   * same-founder preference: a founder who runs multiple companies
+   * gets each company assigned to a different bot when possible,
+   * dodging the Telegram (bot, user) → one-DM collapse.
    *
-   * Wraps `getBotPoolEntryByAgentGroup` + `assignNextAvailableBot`
-   * with the precedence logic so the bind handler isn't littered
-   * with branches; future channel adapters reuse the same helper.
+   * The `wasFreshlyAssigned` flag stays in the contract for future
+   * per-fresh-assign side-effects (logging, telemetry) and is read
+   * by the bind handler's setWebhook gate.
    */
   function resolvePoolAssignment(
     agentGroupId: string,
+    ownerUserId: string,
     hadExistingChatBind: boolean,
   ): { row: BotPoolRow; wasFreshlyAssigned: boolean } | null | 'pool_exhausted' {
     const existing = getBotPoolEntryByAgentGroup(agentGroupId);
@@ -1433,35 +1433,23 @@ export function createBagetAdminServer(config: BagetAdminServerConfig): BagetAdm
     // is a Vela-style legacy pairing. Don't auto-assign; keep it on
     // the global bot.
     if (hadExistingChatBind && config.telegramBotToken) return null;
-    // Codex P1 (re-review of ec1c742): never assign a fresh pool
-    // bot when `publicBaseUrl` is unset. Without a webhook URL we
-    // cannot register the per-bot inbound route, which means the
-    // founder's chat would be one-way broken — outbound works
-    // (we'd return the pool token), but Telegram updates land
-    // nowhere because nothing is bound on the per-bot route. The
-    // bind would *appear* successful while the chat is silently
-    // half-dead. Fall back to the global bot if available, else
-    // surface `pool_exhausted` so the operator sees the
-    // misconfiguration immediately.
+    // Never assign a pool bot when `publicBaseUrl` is unset. Without
+    // a webhook URL we cannot register the per-bot inbound route, so
+    // the founder's chat would be one-way broken. Fall back to the
+    // global bot if available, else surface `pool_exhausted` so the
+    // operator sees the misconfiguration immediately.
     if (!config.publicBaseUrl) {
       return config.telegramBotToken ? null : 'pool_exhausted';
     }
-    // Fresh agent_group (no chat-binds yet) + publicBaseUrl set →
-    // safe to assign a pool bot. Covers both the genuine first-pair
-    // and the partial-failure-retry case.
-    const assigned = assignNextAvailableBot(agentGroupId);
-    // Idempotency note: assignNextAvailableBot's step-0 returns an
-    // existing assignment if it sees one, but we already gated on
-    // `getBotPoolEntryByAgentGroup` above. In the single-process
-    // host this means `assigned` (when non-null) is always the
-    // fresh assignment — the intermediate transaction commits the
-    // FK stamp. Under hypothetical multi-process concurrency the
-    // step-0 path could return an assignment another process just
-    // wrote; that case is rare and benign for setMyName (the other
-    // process either set the name or will).
+    // ≥ 1 active bot in the pool → assignNextAvailableBot picks the
+    // best candidate via same-founder-preference + least-loaded. The
+    // junction-table PK on agent_group_id keeps this idempotent in
+    // the cross-process race case.
+    const assigned = assignNextAvailableBot(agentGroupId, ownerUserId);
     if (assigned) return { row: assigned, wasFreshlyAssigned: true };
-    // Pool empty. If the global token is configured, fall through to
-    // the legacy single-bot path; else exhaustion is fatal.
+    // Pool has zero active bots. If the global token is configured,
+    // fall through to the legacy single-bot path; else surface the
+    // operator-misconfig error.
     return config.telegramBotToken ? null : 'pool_exhausted';
   }
 
@@ -1693,11 +1681,14 @@ export function createBagetAdminServer(config: BagetAdminServerConfig): BagetAdm
       webhookSecret: row.webhook_secret,
       // Diagnostic-only fields — ignored on POST seed, but useful when
       // the operator inspects the export in 1Password to spot a row
-      // that was env-seeded vs admin-seeded.
+      // that was env-seeded vs admin-seeded, or to see per-bot load.
+      // `assignmentCount` replaces the migration-020-removed
+      // `assignedAgentGroupId` field — a single FK was meaningless
+      // once each bot could serve N companies.
       _meta: {
         source: row.source,
-        status: row.status,
-        assignedAgentGroupId: row.assigned_agent_group_id,
+        retiredAt: row.retired_at,
+        assignmentCount: countAssignmentsForBot(row.bot_username),
         createdAt: row.created_at,
       },
     }));
@@ -1857,7 +1848,7 @@ export function createBagetAdminServer(config: BagetAdminServerConfig): BagetAdm
       inserted,
       rotated,
       skipped,
-      poolDepth: countAvailableBots(),
+      poolDepth: countActiveBots(),
     });
     sendJson(res, 200, {
       ok: true,
@@ -1865,7 +1856,7 @@ export function createBagetAdminServer(config: BagetAdminServerConfig): BagetAdm
       inserted,
       rotated,
       skipped,
-      poolDepth: countAvailableBots(),
+      poolDepth: countActiveBots(),
       results,
     });
   }
