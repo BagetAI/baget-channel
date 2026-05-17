@@ -59,11 +59,19 @@ WORKDIR /app
 # here and redeploy. 1.2.20 is the known-bad floor and shouldn't be a
 # rollback target.
 ARG BUN_VERSION=1.2.23
+# `unzip` is needed twice: once by Bun's installer here (transient),
+# and again at the next layer's `bun add … md-to-pdf` step — md-to-pdf
+# transitively depends on Puppeteer, whose postinstall downloads
+# `chrome-headless-shell` as a .zip and extracts it via `unzip`. Without
+# unzip on PATH the postinstall fails with: "Required native binary
+# ('tar.exe' or 'unzip') was not found in the system PATH." Keeping
+# unzip installed costs ~600 KB of image size and avoids that crash.
+# `curl` is still purged because nothing downstream needs it.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends curl ca-certificates unzip \
     && curl -fsSL https://bun.sh/install | bash -s -- "bun-v${BUN_VERSION}" \
     && mv /root/.bun/bin/bun /usr/local/bin/bun \
-    && apt-get purge -y curl unzip \
+    && apt-get purge -y curl \
     && rm -rf /var/lib/apt/lists/* /root/.bun
 
 # Copy production node_modules + built host code + agent-runner source
