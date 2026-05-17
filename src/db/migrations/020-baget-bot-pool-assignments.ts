@@ -69,10 +69,27 @@ export const migration020: Migration = {
       --    where assigned_at was somehow NULL (defensive — the helper
       --    always stamped it, but a manual UPDATE could have left it
       --    blank). Falling back to created_at preserves ordering.
+      --
+      --    The EXISTS subquery against agent_groups is a defensive guard
+      --    against production state that violated the migration-017
+      --    invariant: that trigger was supposed to null
+      --    assigned_agent_group_id whenever the referenced agent_group
+      --    was hard-deleted, but our first prod migration attempt
+      --    crashed with FOREIGN KEY constraint failed here — at least
+      --    one bot row in prod has an assigned_agent_group_id pointing
+      --    at a no-longer-existing agent_group. The junction's FK to
+      --    agent_groups(id) rejects the orphan, the whole tx rolls
+      --    back, and migration 020 never lands. Filtering orphans out
+      --    on insert lets the rest of the backfill succeed; the orphan
+      --    bot ends the migration with no junction row, which is the
+      --    correct N:1 representation of "this bot is now available"
+      --    (and incidentally recovers a bot that was stuck-assigned in
+      --    the 1:1 era).
       INSERT INTO baget_bot_pool_assignments (agent_group_id, bot_username, assigned_at)
-        SELECT assigned_agent_group_id, bot_username, COALESCE(assigned_at, created_at)
-          FROM baget_bot_pool
-         WHERE assigned_agent_group_id IS NOT NULL;
+        SELECT bp.assigned_agent_group_id, bp.bot_username, COALESCE(bp.assigned_at, bp.created_at)
+          FROM baget_bot_pool bp
+         WHERE bp.assigned_agent_group_id IS NOT NULL
+           AND EXISTS (SELECT 1 FROM agent_groups WHERE id = bp.assigned_agent_group_id);
 
       -- 3. The orphan-release trigger from migration 017 referenced
       --    assigned_agent_group_id — we're about to drop that column,
