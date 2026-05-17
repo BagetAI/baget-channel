@@ -63,8 +63,10 @@ describe('maybeSeedBotPoolFromEnv', () => {
     expect(rows).toHaveLength(2);
     for (const row of rows) {
       expect(row.source).toBe('env');
-      expect(row.status).toBe('available');
-      expect(row.assigned_agent_group_id).toBeNull();
+      // Post-020: bot rows are active by default (retired_at IS NULL).
+      // The 1:1 `status` and `assigned_agent_group_id` fields were
+      // dropped; assignment lives in the junction table.
+      expect(row.retired_at).toBeNull();
       expect(row.webhook_secret).toMatch(/^.+$/); // either supplied or minted
     }
     const alpha = rows.find((r) => r.bot_username === 'alpha_bot');

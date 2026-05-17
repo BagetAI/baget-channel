@@ -28,7 +28,8 @@ import { createBagetAdminServer } from './baget-admin-server.js';
 import { buildPerBotWebhookUrl, registerTelegramWebhook, setBotDisplayName } from './channels/baget-telegram-bind.js';
 import { _testBuildBagetTelegramAdapter } from './channels/baget-telegram.js';
 import {
-  countAvailableBots,
+  countAssignmentsForBot,
+  countActiveBots,
   getBotPoolEntryByAgentGroup,
   getBotPoolEntryByUsername,
   seedBotPoolEntry,
@@ -398,12 +399,15 @@ describe('handleBindTelegram — pool path', () => {
     expect((calls[0]!.body as Record<string, unknown>).secret_token).toBe('sec-acme-001');
     expect(calls[1]!.url).toContain('/sendMessage');
 
-    // DB state: assignment landed, webhook_registered_at stamped.
+    // DB state: assignment landed (junction row exists for this
+    // agent_group → bot), webhook_registered_at stamped.
     const entry = getBotPoolEntryByAgentGroup('ag-pool-bind');
     expect(entry).toBeDefined();
     expect(entry?.bot_username).toBe('acme_bot');
-    expect(entry?.assigned_agent_group_id).toBe('ag-pool-bind');
     expect(entry?.webhook_registered_at).toBeTruthy();
+    // Exactly one company is now bound to this bot (the post-020
+    // N:1 model replaces the `assigned_agent_group_id` column check).
+    expect(countAssignmentsForBot('acme_bot')).toBe(1);
   });
 
   it('returns 503 pool_exhausted when the pool is empty AND no global token configured', async () => {
@@ -491,8 +495,12 @@ describe('handleBindTelegram — pool path', () => {
 
     // The same bot still serves the same agent_group.
     expect(getBotPoolEntryByAgentGroup('ag-re-bind')?.bot_username).toBe('acme_bot_re');
-    // No new bots were assigned.
-    expect(countAvailableBots()).toBe(0);
+    // No DUPLICATE assignment was created on the re-bind (junction PK
+    // makes the second INSERT a no-op via the idempotent step-0 path).
+    expect(countAssignmentsForBot('acme_bot_re')).toBe(1);
+    // Bot is still active in the pool (post-020: assignment does NOT
+    // mark the bot as "claimed" — it just adds a junction row).
+    expect(countActiveBots()).toBe(1);
   });
 
   it('does NOT roll back the bind on setWebhook failure — leaves webhook_registered_at NULL for retry', async () => {
@@ -637,7 +645,7 @@ describe('handleBindTelegram — legacy global-bot path', () => {
     expect(json.telegramOpenUrl).toBe('https://t.me/baget_global_bot');
 
     // Pool depth unchanged — fresh_pool_bot is still available.
-    expect(countAvailableBots()).toBe(1);
+    expect(countActiveBots()).toBe(1);
     expect(getBotPoolEntryByAgentGroup('ag-vela-legacy')).toBeUndefined();
 
     // Welcome went out on the GLOBAL token, not the pool token.
@@ -690,7 +698,7 @@ describe('handleBindTelegram — legacy global-bot path', () => {
     expect(calls).toHaveLength(1);
     expect(calls[0]!.url).toContain('/bottok-global-fallback/sendMessage');
     expect(getBotPoolEntryByAgentGroup('ag-no-url')).toBeUndefined();
-    expect(countAvailableBots()).toBe(1);
+    expect(countActiveBots()).toBe(1);
   });
 
   it('publicBaseUrl unset + NO global token + pool seeded → 503 pool_exhausted (no silent half-broken bind, Codex re-review P1)', async () => {
@@ -717,7 +725,7 @@ describe('handleBindTelegram — legacy global-bot path', () => {
     // Pool stays untouched — operator didn't lose a bot to a
     // malformed deployment.
     expect(getBotPoolEntryByAgentGroup('ag-half-broken')).toBeUndefined();
-    expect(countAvailableBots()).toBe(1);
+    expect(countActiveBots()).toBe(1);
   });
 
   it('publicBaseUrl unset + EXISTING pool assignment → still works (no side-effects, but token still resolves)', async () => {
@@ -868,8 +876,9 @@ describe('disconnect releases the assigned bot back to the pool', () => {
 
     await postBind(server.baseUrl);
     const before = getBotPoolEntryByAgentGroup('ag-dc-bind');
-    expect(before?.status).toBe('assigned');
+    expect(before?.bot_username).toBe('acme_bot_dc');
     expect(before?.webhook_registered_at).toBeTruthy();
+    expect(countAssignmentsForBot('acme_bot_dc')).toBe(1);
 
     // Disconnect via tuple-style DELETE.
     const dc = await fetch(`${server.baseUrl}/baget/agent-groups`, {
@@ -881,14 +890,15 @@ describe('disconnect releases the assigned bot back to the pool', () => {
     const dcJson = (await dc.json()) as { releasedBot?: string };
     expect(dcJson.releasedBot).toBe('acme_bot_dc');
 
-    // Bot is back to 'available'; webhook_registered_at PERSISTS so
-    // the next assignment of this row doesn't burn another setWebhook
-    // round-trip.
+    // Post-020: junction row gone, but the bot row stays active in
+    // the pool. webhook_registered_at PERSISTS so the next assignment
+    // of this row doesn't burn another setWebhook round-trip.
     const after = getBotPoolEntryByUsername('acme_bot_dc');
-    expect(after?.status).toBe('available');
-    expect(after?.assigned_agent_group_id).toBeNull();
+    expect(after).toBeDefined();
+    expect(after?.retired_at).toBeNull();
     expect(after?.webhook_registered_at).toBe(before?.webhook_registered_at);
     expect(getBotPoolEntryByAgentGroup('ag-dc-bind')).toBeUndefined();
+    expect(countAssignmentsForBot('acme_bot_dc')).toBe(0);
   });
 
   it('disconnect on a legacy global-bot pairing returns releasedBot:null without erroring', async () => {
@@ -1000,7 +1010,8 @@ describe('disconnect releases the assigned bot back to the pool', () => {
       body: JSON.stringify({ userId: 'u-acme', companyId: 'c-acme' }),
     });
     const recycled = getBotPoolEntryByUsername('recycle_bot');
-    expect(recycled?.status).toBe('available');
+    expect(recycled).toBeDefined();
+    expect(recycled?.retired_at).toBeNull();
     expect(recycled?.webhook_registered_at).toBeTruthy();
 
     // Founder B pairs Bolt Co — gets the SAME (recycled) bot row.
@@ -1367,5 +1378,127 @@ describe('deliver() — outbound bot token resolution', () => {
 
     expect(messageId).toBe('1');
     expect(outboundUrls[0]).toContain('/botglobal-fallback-token/sendMessage');
+  });
+});
+
+// Post-020 (N:1) — verifies the headline behavior: more companies than
+// bots is no longer a pool_exhausted condition. Three distinct founders
+// each pair one company against a 2-bot pool; all three succeed, the
+// assignments distribute across both bots (no overflow / no error).
+describe('handleBindTelegram — N:1 multi-tenant scenarios', () => {
+  let server: BindServer | null = null;
+
+  beforeEach(() => {
+    initTestDb();
+    runMigrations(getDb());
+  });
+
+  afterEach(async () => {
+    await server?.close();
+    closeDb();
+    server = null;
+  });
+
+  it('3 distinct founders all pair successfully against a 2-bot pool (was pool_exhausted under 1:1)', async () => {
+    seedBotPoolEntry({
+      botUsername: 'pool_a_bot',
+      botTokenValue: 'tok-a',
+      webhookSecret: 'sec-a',
+      createdAt: new Date(Date.parse('2026-05-04T00:00:00Z')).toISOString(),
+    });
+    seedBotPoolEntry({
+      botUsername: 'pool_b_bot',
+      botTokenValue: 'tok-b',
+      webhookSecret: 'sec-b',
+      createdAt: new Date(Date.parse('2026-05-04T00:01:00Z')).toISOString(),
+    });
+
+    let agCounter = 0;
+    server = await startBindServer({
+      publicBaseUrl: PUBLIC_BASE_URL,
+      telegramRoutes: [
+        { match: (u) => u.endsWith('/setWebhook'), handler: () => okResponse({ ok: true, result: true }) },
+        { match: (u) => u.endsWith('/setMyName'), handler: () => okResponse({ ok: true, result: true }) },
+        {
+          match: (u) => u.endsWith('/sendMessage'),
+          handler: () => okResponse({ ok: true, result: { message_id: 1 } }),
+        },
+      ],
+      generateAgentGroupId: () => `ag-n1-${++agCounter}`,
+    });
+
+    // Bind 3 distinct founder/company pairs back-to-back.
+    for (let i = 1; i <= 3; i++) {
+      const { status, json } = await postBind(server.baseUrl, {
+        ...VALID_BIND_BODY,
+        userId: `founder-${i}`,
+        companyId: `company-${i}`,
+        companyName: `Company ${i}`,
+        telegramUserId: 1000 + i,
+      });
+      expect(status).toBe(200);
+      expect(json.botUsername === 'pool_a_bot' || json.botUsername === 'pool_b_bot').toBe(true);
+    }
+
+    // Both bots are still active (assignment doesn't consume them).
+    expect(countActiveBots()).toBe(2);
+    // Combined assignments: 3 (one per founder).
+    const total = countAssignmentsForBot('pool_a_bot') + countAssignmentsForBot('pool_b_bot');
+    expect(total).toBe(3);
+    // Distribution: least-loaded picks the second bot for #2, the
+    // tied-load tiebreak (FIFO oldest first) puts #3 on pool_a_bot.
+    expect(countAssignmentsForBot('pool_a_bot')).toBe(2);
+    expect(countAssignmentsForBot('pool_b_bot')).toBe(1);
+  });
+
+  it('same founder pairing two companies lands on different bots when alternatives exist', async () => {
+    seedBotPoolEntry({
+      botUsername: 'pool_a_bot',
+      botTokenValue: 'tok-a',
+      webhookSecret: 'sec-a',
+      createdAt: new Date(Date.parse('2026-05-04T00:00:00Z')).toISOString(),
+    });
+    seedBotPoolEntry({
+      botUsername: 'pool_b_bot',
+      botTokenValue: 'tok-b',
+      webhookSecret: 'sec-b',
+      createdAt: new Date(Date.parse('2026-05-04T00:01:00Z')).toISOString(),
+    });
+
+    let agCounter = 0;
+    server = await startBindServer({
+      publicBaseUrl: PUBLIC_BASE_URL,
+      telegramRoutes: [
+        { match: (u) => u.endsWith('/setWebhook'), handler: () => okResponse({ ok: true, result: true }) },
+        { match: (u) => u.endsWith('/setMyName'), handler: () => okResponse({ ok: true, result: true }) },
+        {
+          match: (u) => u.endsWith('/sendMessage'),
+          handler: () => okResponse({ ok: true, result: { message_id: 1 } }),
+        },
+      ],
+      generateAgentGroupId: () => `ag-sf-${++agCounter}`,
+    });
+
+    // Same founder, two distinct companies.
+    const r1 = await postBind(server.baseUrl, {
+      ...VALID_BIND_BODY,
+      userId: 'solo-founder',
+      companyId: 'company-A',
+      companyName: 'Company A',
+      telegramUserId: 2001,
+    });
+    expect(r1.status).toBe(200);
+    const r2 = await postBind(server.baseUrl, {
+      ...VALID_BIND_BODY,
+      userId: 'solo-founder',
+      companyId: 'company-B',
+      companyName: 'Company B',
+      telegramUserId: 2001, // same Telegram user
+    });
+    expect(r2.status).toBe(200);
+
+    // Same-founder preference puts company-B on the OTHER bot to
+    // avoid the (bot, user) → one-DM collapse.
+    expect(r1.json.botUsername).not.toBe(r2.json.botUsername);
   });
 });
