@@ -301,6 +301,60 @@ describe('migration 020 — backfill from 1:1 to N:1', () => {
     expect(junctionCount.n).toBe(0);
     expect(countActiveBots()).toBe(1);
   });
+
+  it('skips orphan rows where assigned_agent_group_id references a no-longer-existing agent_group (prod hotfix)', () => {
+    // Production crash on first migration-020 attempt: at least one
+    // bot row had `assigned_agent_group_id` pointing at an
+    // agent_groups row that had been hard-deleted, despite migration
+    // 017's orphan-release trigger. The unfiltered backfill INSERT
+    // hit the junction's FK to agent_groups and rolled back the
+    // entire transaction, leaving production crash-looping.
+    //
+    // This test plants the exact production shape: a bot whose
+    // `assigned_agent_group_id` doesn't match any agent_groups row,
+    // alongside a healthy bot whose assignment is valid. The fixed
+    // migration must skip the orphan and successfully backfill the
+    // healthy one. The orphan bot ends with no junction row, which
+    // is the correct N:1 representation of "now available."
+    applyPre020Schema();
+    const db = getDb();
+
+    // Healthy: agent_group exists, bot points at it.
+    db.prepare(
+      `INSERT INTO agent_groups (id, name, folder, user_id, company_id, baget_team_members, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    ).run('ag-healthy', 'CoH', 'coh', 'user-h', 'co-h', '{}', NOW);
+    db.prepare(
+      `INSERT INTO baget_bot_pool
+         (bot_username, bot_token_value, webhook_secret, status, assigned_agent_group_id, assigned_at, webhook_registered_at, created_at, source)
+       VALUES (?, ?, ?, 'assigned', ?, ?, ?, ?, ?)`,
+    ).run('healthy_bot', 'tok-h', 'sec-h', 'ag-healthy', nowIso(100), nowIso(150), NOW, 'admin');
+
+    // Orphan: bot points at an agent_group_id that doesn't exist in
+    // agent_groups. Inserted with foreign_keys temporarily off to
+    // simulate the prod state that survived the trigger gap.
+    db.exec('PRAGMA foreign_keys = OFF');
+    db.prepare(
+      `INSERT INTO baget_bot_pool
+         (bot_username, bot_token_value, webhook_secret, status, assigned_agent_group_id, assigned_at, webhook_registered_at, created_at, source)
+       VALUES (?, ?, ?, 'assigned', ?, ?, ?, ?, ?)`,
+    ).run('orphan_bot', 'tok-o', 'sec-o', 'ag-deleted-long-ago', nowIso(200), nowIso(250), NOW, 'admin');
+    db.exec('PRAGMA foreign_keys = ON');
+
+    // Fixed migration must NOT throw on the orphan.
+    expect(() => db.transaction(() => migration020.up(db))()).not.toThrow();
+
+    // Healthy assignment was preserved.
+    const junctionRows = db
+      .prepare(`SELECT agent_group_id, bot_username FROM baget_bot_pool_assignments`)
+      .all() as Array<{ agent_group_id: string; bot_username: string }>;
+    expect(junctionRows).toHaveLength(1);
+    expect(junctionRows[0]).toMatchObject({ agent_group_id: 'ag-healthy', bot_username: 'healthy_bot' });
+
+    // Orphan bot ended the migration with no junction row → effectively
+    // available in N:1, recovering it from the stuck-assigned state.
+    expect(countActiveBots()).toBe(2);
+  });
 });
 
 describe('seedBotPoolEntry rotation semantics', () => {
