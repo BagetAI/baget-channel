@@ -252,6 +252,7 @@ The Railway service reads these at startup. Set them on the
 | `DATABASE_URL` | no | `data/v2.db` | Currently the host writes a per-volume SQLite file under `data/`. Future: switch to a managed Postgres if multi-replica becomes a thing. |
 | `BAGET_BOT_POOL_SEED_JSON` | no | — | Boot-time self-seeder for the Telegram bot pool. JSON array of `{ botUsername, botToken, webhookSecret? }`. Only seeds when the `baget_bot_pool` table is empty (recovery path for a lost-volume scenario) — otherwise it's a no-op. Set this once after creating the Railway service, never touch it again. The `webhookSecret` field is optional; a fresh 16-byte hex value is minted per row when omitted. **NOT** a substitute for the Railway volume on `/app/data` — see *Persistence requirements* below. |
 | `WEBHOOK_PORT` | no | `3000` | Used by the upstream Chat-SDK webhook server (legacy). Distinct from `TELEGRAM_WEBHOOK_PORT` above. |
+| `COMMUNITY_TELEGRAM_URL` | no | — | Telegram invite link to the Baget founders community. When set, the bot posts a one-time "join the community" message into a founder's channel right after the welcome on connect (both bind paths). Unset → feature is dark (no send). Set per environment to control where it's live. |
 
 ### Persistence requirements (Railway)
 

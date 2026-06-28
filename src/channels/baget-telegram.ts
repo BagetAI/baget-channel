@@ -64,6 +64,7 @@ import {
   sendBagetBotMessage,
   sendBagetBotPhoto,
   sendBagetTelegramWelcome,
+  sendBagetCommunityInvite,
   type TelegramReplyMarkup,
 } from './baget-telegram-bind.js';
 import {
@@ -766,6 +767,26 @@ function buildAdapter(cfg: BagetTelegramConfig): ChannelAdapter {
         startWelcomeBotToken,
       );
     }
+    // Community invite — best-effort, after the welcome (covers both the
+    // team-named greeting and the generic fallback above). Skips silently when
+    // COMMUNITY_TELEGRAM_URL is unset; never affects the bind. Guarded on the
+    // token (same resolution the welcome uses) — no token, no send.
+    if (startWelcomeBotToken) {
+      try {
+        await sendBagetCommunityInvite({
+          botToken: startWelcomeBotToken,
+          apiBaseUrl: cfg.apiBaseUrl,
+          fetchImpl: cfg.fetchImpl,
+          chatId,
+          agentGroupId: row.agent_group_id,
+        });
+      } catch (err) {
+        log.warn('Baget telegram: community invite send threw (ignored)', {
+          chatId,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
     log.info('Baget telegram: paired chat to agent_group', {
       chatId,
       agentGroupId: row.agent_group_id,
@@ -841,9 +862,7 @@ function buildAdapter(cfg: BagetTelegramConfig): ChannelAdapter {
     // point. Same pattern as PR #61 (empty bubble) / PR #74 (post-card
     // text). Safe: founders don't see code-formatted text on Telegram
     // either way — backticks always render literally without parse_mode.
-    const text = rawText !== null && rawText.length > 0
-      ? rawText.replace(/`/g, '')
-      : null;
+    const text = rawText !== null && rawText.length > 0 ? rawText.replace(/`/g, '') : null;
     const attachments = message.attachments ?? [];
     // Phase 4 v0.1: pull an inline_keyboard reply_markup off the
     // outbound content if the channel-side dispatchApproval emitted
@@ -907,11 +926,7 @@ function buildAdapter(cfg: BagetTelegramConfig): ChannelAdapter {
     // drop. Catches the model's non-empty rephrase bubble that PR #61
     // (empty-body null check) doesn't catch. See `recentApprovalCards`
     // comment for full rationale.
-    if (
-      prefixed !== null &&
-      !replyMarkup &&
-      attachments.length === 0
-    ) {
+    if (prefixed !== null && !replyMarkup && attachments.length === 0) {
       const cardSentAt = recentApprovalCards.get(chatId);
       if (cardSentAt && Date.now() - cardSentAt < APPROVAL_CARD_TEXT_SUPPRESS_MS) {
         log.info('Baget telegram: suppressing post-approval-card text bubble', {
