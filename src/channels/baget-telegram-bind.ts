@@ -357,6 +357,41 @@ export async function sendBagetTelegramWelcome(args: {
 }
 
 /**
+ * One-time community invite, sent right after the welcome on a fresh bind so
+ * the founder is nudged to join the Baget founders community in the channel
+ * they just landed in.
+ *
+ * Gated on COMMUNITY_TELEGRAM_URL — returns `{ ok: false, skipped: true }`
+ * without sending when the env var is unset, so the feature ships dark until
+ * the operator sets it on this service. Best-effort, exactly like the welcome:
+ * sendBagetBotMessage already catches transport failures, so a failed invite
+ * never affects the bind. Plain text (no parse_mode) — Telegram auto-links the
+ * bare URL and renders the group preview card.
+ */
+export async function sendBagetCommunityInvite(args: {
+  botToken: string;
+  apiBaseUrl?: string;
+  fetchImpl?: typeof fetch;
+  chatId: number | string;
+  agentGroupId: string;
+}): Promise<BagetTelegramSendResult | { ok: false; skipped: true }> {
+  const url = (process.env.COMMUNITY_TELEGRAM_URL || '').trim();
+  if (!url) return { ok: false, skipped: true };
+  const text =
+    `👋 One more thing — you're not building alone.\n\n` +
+    `Join the Baget founders community to swap notes, get unstuck, and show off ` +
+    `what your team ships:\n${url}`;
+  return sendBagetBotMessage({
+    botToken: args.botToken,
+    apiBaseUrl: args.apiBaseUrl,
+    fetchImpl: args.fetchImpl,
+    chatId: args.chatId,
+    text,
+    agentGroupId: args.agentGroupId,
+  });
+}
+
+/**
  * "Channel disconnected" farewell, sent on the founder's bound chat
  * right after the admin DELETE handler runs the cleanup.
  *

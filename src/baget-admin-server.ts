@@ -85,6 +85,7 @@ import {
   registerTelegramWebhook,
   sendBagetTelegramFarewell,
   sendBagetTelegramWelcome,
+  sendBagetCommunityInvite,
 } from './channels/baget-telegram-bind.js';
 import { log } from './log.js';
 import { getMessagingGroupsByAgentGroup } from './db/messaging-groups.js';
@@ -1348,6 +1349,24 @@ export function createBagetAdminServer(config: BagetAdminServerConfig): BagetAdm
       teamMembers,
       agentGroupId,
     });
+
+    // Community invite — best-effort, right after the welcome. Skips silently
+    // when COMMUNITY_TELEGRAM_URL is unset; never affects the bind (rows are
+    // already committed above).
+    try {
+      await sendBagetCommunityInvite({
+        botToken: resolvedBotToken,
+        apiBaseUrl: config.telegramApiBaseUrl,
+        fetchImpl: config.telegramFetchImpl,
+        chatId: telegramUserId,
+        agentGroupId,
+      });
+    } catch (err) {
+      log.warn('Baget bind-telegram: community invite send threw (ignored)', {
+        agentGroupId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
 
     log.info('Baget bind-telegram: paired chat to agent_group via direct bind', {
       userId,
