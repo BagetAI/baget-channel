@@ -2771,5 +2771,5 @@ registerTools([
 ]);
 
 log(
-  'baget MCP tools registered: 18 read + 1 file-transfer + 1 generate + 21 direct write + 8 approval-gated = 51 total (Tier 4: +1 approval-gated)',
+  'baget MCP tools registered: 18 read + 2 file-transfer + 1 generate + 20 direct write + 9 approval-gated = 50 total (Tier 4: +1 approval-gated)',
 );
