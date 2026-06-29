@@ -36,6 +36,7 @@ interface FetchCall {
   url: string;
   method?: string;
   authHeader?: string | null;
+  body?: string;
 }
 
 /**
@@ -71,6 +72,7 @@ function installFetchSpy(): void {
       url,
       method: init?.method,
       authHeader: headers['Authorization'] ?? headers['authorization'] ?? null,
+      body: typeof init?.body === 'string' ? init.body : undefined,
     });
     for (const route of routedResponses) {
       if (route.matches(url)) return route.respond();
@@ -1693,4 +1695,70 @@ describe('tool description hygiene — no literal env-var or template-placeholde
       expect(offenders).toEqual([]);
     });
   }
+});
+
+describe('baget_set_ai_budget tool', () => {
+  it('is registered approval-gated with a tier enum + budgetUsd + confirmed schema', () => {
+    const tool = getRegisteredToolByName('baget_set_ai_budget');
+    expect(tool).toBeDefined();
+    const schema = tool!.tool.inputSchema as {
+      properties: Record<string, { type?: string; enum?: string[] }>;
+      required?: string[];
+    };
+    expect(schema.properties.tier?.enum).toEqual(['flash_lite', 'flash', 'pro']);
+    expect(schema.properties.budgetUsd?.type).toBe('number');
+    expect(schema.properties.confirmed?.type).toBe('boolean');
+    expect(schema.required).toEqual(['tier', 'budgetUsd']);
+  });
+
+  it('description steers to Lite / Standard / Pro and Chef, never the model name', () => {
+    const desc = getRegisteredToolByName('baget_set_ai_budget')!.tool.description ?? '';
+    expect(desc).toContain('Chef');
+    expect(desc).toMatch(/Lite \/ Standard \/ Pro/);
+    expect(desc).not.toMatch(/gemini/i);
+  });
+
+  it('confirmed:false POSTs /approval/preview with {action, payload} + bearer; summary uses the level label', async () => {
+    // dispatchApproval(confirmed:true) reuses these same args.action +
+    // args.payload, so proving the preview leg proves the execute leg too.
+    seedSingleDestination(); // inits the session DB dispatchApproval routes through
+    routeResponse(
+      (url) => url.includes('/approval/preview'),
+      () =>
+        new Response(
+          JSON.stringify({
+            ok: true,
+            cost: { amount: 500, remaining: 10000, tasksRemaining: 0 },
+            approval: { requestId: 'req-1', expiresAt: new Date(Date.now() + 600000).toISOString() },
+          }),
+          { status: 200 },
+        ),
+    );
+    const tool = getRegisteredToolByName('baget_set_ai_budget');
+    const result = await tool!.handler({ tier: 'flash', budgetUsd: 5, confirmed: false });
+
+    expect(result.isError).toBeUndefined();
+    const previewCall = fetchCalls.find((c) => c.url.includes('/approval/preview'));
+    expect(previewCall).toBeDefined();
+    expect(previewCall!.url).toBe(
+      'https://stg-app.baget.ai/api/companies/company-uuid-123/approval/preview',
+    );
+    expect(previewCall!.method).toBe('POST');
+    expect(previewCall!.authHeader).toBe('Bearer test-bearer-token');
+    expect(JSON.parse(previewCall!.body ?? '{}')).toEqual({
+      action: 'set-ai-budget',
+      payload: { tier: 'flash', budgetUsd: 5 },
+    });
+    const text = (result.content[0] as { text: string }).text;
+    expect(text).toContain('Standard'); // founder-facing level label
+    expect(text).toContain('$5.00');
+    expect(text).not.toMatch(/gemini/i);
+  });
+
+  it('rejects an out-of-range budget locally, without calling baget.ai', async () => {
+    const tool = getRegisteredToolByName('baget_set_ai_budget');
+    const result = await tool!.handler({ tier: 'flash', budgetUsd: 5000, confirmed: false });
+    expect(result.isError).toBe(true);
+    expect(fetchCalls).toHaveLength(0);
+  });
 });

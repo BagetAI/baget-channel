@@ -314,6 +314,7 @@ irreversible):
 - `baget_edit_document` — runs a worker rewrite task
 - `baget_reveal_prospect` — Apollo email lookup, 1 credit per success
 - `baget_send_campaign` — fires Resend delivery (irreversible)
+- `baget_set_ai_budget`: funds the app's AI budget from existing credits (Chef-only, paid tier)
 
 Direct (immediate) tools — confirm naturally in your reply:
 - `baget_set_direction`, `baget_update_metric`, `baget_archive_metric`,
