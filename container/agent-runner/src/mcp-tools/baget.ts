@@ -1,3 +1,6 @@
+// build: cache-bust 2026-06-29 to ship baget_set_ai_budget on Railway
+// (forces a fresh COPY of container/ so the single-process agent-runner
+// picks up the new tool; safe to remove on the next change to this file).
 /**
  * Baget MCP tools — exposes founder actions on a Baget company to the
  * agent running in this container.
