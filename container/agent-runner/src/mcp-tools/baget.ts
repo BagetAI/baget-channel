@@ -2269,6 +2269,57 @@ const topupCredits: McpToolDefinition = {
   },
 };
 
+const setAiBudget: McpToolDefinition = {
+  tool: {
+    name: 'baget_set_ai_budget',
+    description:
+      "Fund the app's AI budget from the founder's EXISTING baget credits, so the product the team is building can call AI at runtime. Use when the founder says \"set up my app's AI budget\", \"fund my app's AI\", \"give my app an AI budget\", \"set my app's AI to Standard with $5\", \"add $10 to my app's AI budget\". CHEF-ONLY: this is a paid (Chef) tier feature. An apprenti founder's preview comes back cannot-proceed with an upgrade note; relay that plainly. APPROVAL-GATED: it SPENDS the founder's existing credits (it does NOT take a card payment). To ADD credits to the wallet, use baget_topup_credits instead. The cost preview shows the credits and dollar amount before the founder confirms.\n\nCollect TWO things from the founder: (1) the level, one of Lite / Standard / Pro (map to tier: Lite=flash_lite, Standard=flash, Pro=pro), and (2) the dollar amount in USD (budgetUsd, $1 to $1000). The budget is ADDITIVE: each call adds on top of the existing budget.\n\nCOPY RULES: speak to the founder ONLY in terms of Lite / Standard / Pro and dollars. NEVER name the underlying model or provider, and NEVER mention any fee or percentage. Those stay behind the scenes.\n\nFlow:\n1. First call: confirmed:false with tier + budgetUsd. Surfaces the approval preview.\n2. Founder confirms (replies a word like yes / go). Call again with confirmed:true and the IDENTICAL payload.\n3. baget.ai debits the credits and raises the app's AI budget. Relay the returned message verbatim.",
+    inputSchema: {
+      type: 'object',
+      properties: {
+        tier: {
+          type: 'string',
+          enum: ['flash_lite', 'flash', 'pro'],
+          description:
+            'The level the founder chose: flash_lite = Lite, flash = Standard, pro = Pro. Never say the raw value or any model name to the founder.',
+        },
+        budgetUsd: {
+          type: 'number',
+          minimum: 1,
+          maximum: 1000,
+          description: 'Dollar amount to ADD to the app AI budget. Range [1, 1000]. e.g. 5 = $5.',
+        },
+        confirmed: {
+          type: 'boolean',
+          description:
+            'Set to false on the first call (surfaces the preview card). Set to true with the IDENTICAL payload after the founder confirms.',
+        },
+      },
+      required: ['tier', 'budgetUsd'],
+      additionalProperties: false,
+    },
+  },
+  async handler(args) {
+    const tier = String(args.tier);
+    if (tier !== 'flash_lite' && tier !== 'flash' && tier !== 'pro') {
+      return fail('tier must be one of: flash_lite, flash, pro');
+    }
+    const budgetUsd = Number(args.budgetUsd);
+    if (!Number.isFinite(budgetUsd) || budgetUsd < 1 || budgetUsd > 1000) {
+      return fail('budgetUsd must be a number in [1, 1000]');
+    }
+    const label = tier === 'flash_lite' ? 'Lite' : tier === 'pro' ? 'Pro' : 'Standard';
+    const credits = Math.round(budgetUsd * 100);
+    const dollars = budgetUsd.toFixed(2);
+    return dispatchApproval({
+      action: 'set-ai-budget',
+      payload: { tier, budgetUsd },
+      confirmed: args.confirmed === true,
+      summary: `Add ${credits} credits ($${dollars}) to your app's AI at the ${label} level.`,
+    });
+  },
+};
+
 const getBillingHistory: McpToolDefinition = {
   tool: {
     name: 'baget_get_billing_history',
@@ -2712,6 +2763,7 @@ registerTools([
   sendCampaign,
   // Write — approval-gated (Tier 3)
   topupCredits,
+  setAiBudget,
   // Write — approval-gated (Tier 3.5)
   redeploySite,
   // Write — approval-gated (Tier 4)
@@ -2719,5 +2771,5 @@ registerTools([
 ]);
 
 log(
-  'baget MCP tools registered: 18 read + 1 file-transfer + 1 generate + 21 direct write + 7 approval-gated = 50 total (Tier 4: +1 approval-gated)',
+  'baget MCP tools registered: 18 read + 2 file-transfer + 1 generate + 20 direct write + 9 approval-gated = 50 total (Tier 4: +1 approval-gated)',
 );
