@@ -1848,6 +1848,32 @@ describe('baget_invite_member tool', () => {
     });
   });
 
+  it('normalizes co-founder role variations to cofounder (case/hyphen/underscore)', async () => {
+    for (const variant of ['Co-founder', 'co-founder', 'CO_FOUNDER', 'co founder', 'cofounder']) {
+      fetchCalls.length = 0;
+      seedSingleDestination();
+      routeResponse(
+        (url) => url.includes('/approval/preview'),
+        () =>
+          new Response(
+            JSON.stringify({
+              ok: true,
+              cost: { amount: 0, remaining: 10000, tasksRemaining: 0 },
+              approval: {
+                requestId: 'req-inv-norm',
+                expiresAt: new Date(Date.now() + 600000).toISOString(),
+              },
+            }),
+            { status: 200 },
+          ),
+      );
+      const tool = getRegisteredToolByName('baget_invite_member');
+      await tool!.handler({ email: 'dana@example.com', role: variant, confirmed: false });
+      const previewCall = fetchCalls.find((c) => c.url.includes('/approval/preview'));
+      expect(JSON.parse(previewCall!.body ?? '{}').payload.role).toBe('cofounder');
+    }
+  });
+
   it('rejects an empty email locally, without calling baget.ai', async () => {
     const tool = getRegisteredToolByName('baget_invite_member');
     const result = await tool!.handler({ email: '   ', confirmed: false });

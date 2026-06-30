@@ -2739,9 +2739,16 @@ const inviteMember: McpToolDefinition = {
     const email = String(args.email ?? '').trim();
     if (!email) return fail('email is required');
     // Normalize role to a valid enum before dispatch so a missing or garbled
-    // role can't 400 at the route — default to `advisor` (least privilege),
-    // matching baget.ai's own default.
-    const role = args.role === 'cofounder' ? 'cofounder' : 'advisor';
+    // role can't 400 at the route. Strip case + non-letters so the common
+    // co-founder variations the LLM might emit ('co-founder', 'Co-Founder',
+    // 'co_founder', 'co founder') all resolve to 'cofounder' instead of
+    // silently downgrading a co-founder to read-only 'advisor' (Gemini HIGH).
+    // Anything that isn't recognizably co-founder defaults to 'advisor'
+    // (least privilege), matching baget.ai's own default.
+    const normalizedRole = String(args.role ?? '')
+      .toLowerCase()
+      .replace(/[^a-z]/g, '');
+    const role = normalizedRole === 'cofounder' ? 'cofounder' : 'advisor';
     const roleLabel = role === 'cofounder' ? 'co-founder' : 'advisor';
     return dispatchApproval({
       action: 'invite-member',
