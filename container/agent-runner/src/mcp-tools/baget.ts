@@ -2705,6 +2705,60 @@ const buyDomain: McpToolDefinition = {
   },
 };
 
+const inviteMember: McpToolDefinition = {
+  tool: {
+    name: 'baget_invite_member',
+    description:
+      "Invite a co-founder or advisor to the company workspace by email. Use when the founder says \"add my co-founder\", \"invite my advisor\", \"bring on a teammate\", \"add <name> to the team\". Collect BOTH the email AND the role before calling. role: 'cofounder' = full access including managing the team; 'advisor' = read-only. If the founder doesn't say which, ASK — don't guess (when truly unspecified the server defaults to 'advisor', least privilege). APPROVAL-GATED — surfaces a confirmation card, then sends a real invite email (irreversible external send). CHEF-ONLY: an apprenti founder's call comes back `cannot-proceed` with a Chef-upgrade note — relay it verbatim.\n\nFlow:\n1. First call: `confirmed: false` with `email` + `role`. baget.ai surfaces the approval card.\n2. Founder taps Approve → call again with `confirmed: true` and the IDENTICAL payload.\n3. baget.ai creates the pending invite + emails them a join link. Echo the returned `messageForFounder` verbatim — never claim the invite went out before this returns.",
+    inputSchema: {
+      type: 'object',
+      properties: {
+        email: {
+          type: 'string',
+          minLength: 3,
+          maxLength: 254,
+          description: "The teammate's email address. Lowercased + validated by baget.ai.",
+        },
+        role: {
+          type: 'string',
+          enum: ['cofounder', 'advisor'],
+          description:
+            "'cofounder' = full access including managing the team; 'advisor' = read-only. Ask the founder which one; omit only if truly unspecified (server defaults to 'advisor').",
+        },
+        confirmed: {
+          type: 'boolean',
+          description:
+            'Set to false on the first call (surfaces the approval card). Set to true with the IDENTICAL payload after the founder confirms.',
+        },
+      },
+      required: ['email'],
+      additionalProperties: false,
+    },
+  },
+  async handler(args) {
+    const email = String(args.email ?? '').trim();
+    if (!email) return fail('email is required');
+    // Normalize role to a valid enum before dispatch so a missing or garbled
+    // role can't 400 at the route. Strip case + non-letters so the common
+    // co-founder variations the LLM might emit ('co-founder', 'Co-Founder',
+    // 'co_founder', 'co founder') all resolve to 'cofounder' instead of
+    // silently downgrading a co-founder to read-only 'advisor' (Gemini HIGH).
+    // Anything that isn't recognizably co-founder defaults to 'advisor'
+    // (least privilege), matching baget.ai's own default.
+    const normalizedRole = String(args.role ?? '')
+      .toLowerCase()
+      .replace(/[^a-z]/g, '');
+    const role = normalizedRole === 'cofounder' ? 'cofounder' : 'advisor';
+    const roleLabel = role === 'cofounder' ? 'co-founder' : 'advisor';
+    return dispatchApproval({
+      action: 'invite-member',
+      payload: { email, role },
+      confirmed: args.confirmed === true,
+      summary: `Invite **${email}** as ${roleLabel} to the workspace. Sends them an email to join.`,
+    });
+  },
+};
+
 // ── Register ─────────────────────────────────────────────────────────────────
 
 registerTools([
@@ -2771,8 +2825,9 @@ registerTools([
   redeploySite,
   // Write — approval-gated (Tier 4)
   buyDomain,
+  inviteMember,
 ]);
 
 log(
-  'baget MCP tools registered: 18 read + 2 file-transfer + 1 generate + 20 direct write + 9 approval-gated = 50 total (Tier 4: +1 approval-gated)',
+  'baget MCP tools registered: 18 read + 2 file-transfer + 1 generate + 20 direct write + 10 approval-gated = 51 total (Tier 4: +1 buy-domain, +1 invite-member)',
 );
