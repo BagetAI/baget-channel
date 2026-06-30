@@ -1762,3 +1762,96 @@ describe('baget_set_ai_budget tool', () => {
     expect(fetchCalls).toHaveLength(0);
   });
 });
+
+describe('baget_invite_member tool', () => {
+  it('is registered approval-gated with email + role enum + confirmed schema', () => {
+    const tool = getRegisteredToolByName('baget_invite_member');
+    expect(tool).toBeDefined();
+    const schema = tool!.tool.inputSchema as {
+      properties: Record<string, { type?: string; enum?: string[] }>;
+      required?: string[];
+    };
+    expect(schema.properties.email?.type).toBe('string');
+    expect(schema.properties.role?.enum).toEqual(['cofounder', 'advisor']);
+    expect(schema.properties.confirmed?.type).toBe('boolean');
+    expect(schema.required).toEqual(['email']);
+  });
+
+  it('description names both roles, the approval gate, and Chef-only', () => {
+    const desc = getRegisteredToolByName('baget_invite_member')!.tool.description ?? '';
+    expect(desc).toContain('Chef');
+    expect(desc).toMatch(/cofounder/);
+    expect(desc).toMatch(/advisor/);
+    expect(desc).toMatch(/APPROVAL-GATED/);
+  });
+
+  it('confirmed:false POSTs /approval/preview with {action:invite-member, payload:{email,role}} + bearer', async () => {
+    // dispatchApproval(confirmed:true) reuses these same args.action +
+    // args.payload, so proving the preview leg proves the execute leg too.
+    seedSingleDestination();
+    routeResponse(
+      (url) => url.includes('/approval/preview'),
+      () =>
+        new Response(
+          JSON.stringify({
+            ok: true,
+            cost: { amount: 0, remaining: 10000, tasksRemaining: 0 },
+            approval: {
+              requestId: 'req-inv-1',
+              expiresAt: new Date(Date.now() + 600000).toISOString(),
+            },
+          }),
+          { status: 200 },
+        ),
+    );
+    const tool = getRegisteredToolByName('baget_invite_member');
+    const result = await tool!.handler({
+      email: 'alice@example.com',
+      role: 'cofounder',
+      confirmed: false,
+    });
+
+    expect(result.isError).toBeUndefined();
+    const previewCall = fetchCalls.find((c) => c.url.includes('/approval/preview'));
+    expect(previewCall).toBeDefined();
+    expect(previewCall!.method).toBe('POST');
+    expect(previewCall!.authHeader).toBe('Bearer test-bearer-token');
+    expect(JSON.parse(previewCall!.body ?? '{}')).toEqual({
+      action: 'invite-member',
+      payload: { email: 'alice@example.com', role: 'cofounder' },
+    });
+  });
+
+  it('defaults a missing role to advisor before dispatch', async () => {
+    seedSingleDestination();
+    routeResponse(
+      (url) => url.includes('/approval/preview'),
+      () =>
+        new Response(
+          JSON.stringify({
+            ok: true,
+            cost: { amount: 0, remaining: 10000, tasksRemaining: 0 },
+            approval: {
+              requestId: 'req-inv-2',
+              expiresAt: new Date(Date.now() + 600000).toISOString(),
+            },
+          }),
+          { status: 200 },
+        ),
+    );
+    const tool = getRegisteredToolByName('baget_invite_member');
+    await tool!.handler({ email: 'bob@example.com', confirmed: false });
+    const previewCall = fetchCalls.find((c) => c.url.includes('/approval/preview'));
+    expect(JSON.parse(previewCall!.body ?? '{}').payload).toEqual({
+      email: 'bob@example.com',
+      role: 'advisor',
+    });
+  });
+
+  it('rejects an empty email locally, without calling baget.ai', async () => {
+    const tool = getRegisteredToolByName('baget_invite_member');
+    const result = await tool!.handler({ email: '   ', confirmed: false });
+    expect(result.isError).toBe(true);
+    expect(fetchCalls).toHaveLength(0);
+  });
+});
