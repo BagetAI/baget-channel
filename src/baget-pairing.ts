@@ -108,9 +108,26 @@ const REQUIRED_PLACEHOLDERS: ReadonlyArray<string> = ['company_name', 'cos_name'
 export interface RenderClaudeMdArgs {
   companyName: string;
   teamMembers: BagetTeamMembers;
+  /**
+   * Absolute deep link to the founder's Company Settings → Members tab
+   * (`<appBaseUrl>/dashboard/<companyId>?settings=members`). Substituted
+   * into the `{{members_settings_url}}` placeholder so the agent can hand
+   * the founder a tappable link when they ask to add a co-founder/teammate.
+   * Built upstream from a trusted origin + companyId; omitted only by tests,
+   * which fall back to a generic dashboard URL.
+   */
+  dashboardMembersUrl?: string;
   /** Optional override for the template path — used by tests. */
   templatePath?: string;
 }
+
+/**
+ * Fallback members-settings link used when `dashboardMembersUrl` is omitted
+ * (tests / defensive). Production always supplies the company-specific URL
+ * via `provisionBagetGroup`; this generic form still lands the founder on
+ * their dashboard, where they can open Company Settings → Members.
+ */
+const DEFAULT_MEMBERS_SETTINGS_URL = 'https://app.baget.ai/dashboard?settings=members';
 
 /**
  * Render the Baget CLAUDE.md template with founder-specific team names.
@@ -155,7 +172,17 @@ export function renderBagetClaudeMd(args: RenderClaudeMdArgs): string {
   // roles that are present. Done before placeholder substitution so a
   // missing `developer_name` placeholder inside a stripped block isn't
   // flagged as an unsubstituted-placeholder error below.
-  const template = stripRoleBlocks(rawTemplate, presentRoles);
+  let template = stripRoleBlocks(rawTemplate, presentRoles);
+
+  // Substitute the trusted members-settings deep link FIRST, verbatim.
+  // It must NOT pass through the {{placeholder}} loop below, which runs
+  // every value through sanitizeForPrompt() — that caps at 60 chars and
+  // strips URL punctuation, both of which would corrupt the link. The URL
+  // is built upstream from a trusted origin + companyId (no founder input),
+  // so we only strip control chars. Function-form replacement so any `$`
+  // in the value isn't treated as a special replacement token.
+  const membersUrl = (args.dashboardMembersUrl?.trim() || DEFAULT_MEMBERS_SETTINGS_URL).replace(/[\r\n\t]/g, '');
+  template = template.replace(/\{\{members_settings_url\}\}/g, () => membersUrl);
 
   // Sanity check: after processing, no `<!--role:` or `<!--/role:`
   // markers should remain. A leftover marker means the template has
@@ -316,6 +343,7 @@ export function provisionBagetGroup(args: ProvisionBagetGroupArgs): ProvisionedB
   const rendered = renderBagetClaudeMd({
     companyName: args.companyName,
     teamMembers: args.teamMembers,
+    dashboardMembersUrl: `${args.bagetApiBaseUrl.replace(/\/+$/, '')}/dashboard/${args.companyId}?settings=members`,
   });
   const claudeLocalPath = path.join(groupDir, 'CLAUDE.local.md');
   const tmpClaude = `${claudeLocalPath}.tmp.${process.pid}.${Date.now()}`;

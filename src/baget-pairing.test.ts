@@ -58,6 +58,25 @@ describe('renderBagetClaudeMd', () => {
     expect(out).not.toContain('{{company_name}}');
   });
 
+  it('substitutes the company-specific members-settings deep link verbatim', () => {
+    const url = 'https://app.baget.ai/dashboard/abc12345-6789?settings=members';
+    const out = renderBagetClaudeMd({
+      companyName: 'Acme',
+      teamMembers: TEAM,
+      dashboardMembersUrl: url,
+    });
+    // Full URL survives intact — it must NOT be truncated by the 60-char
+    // sanitizeForPrompt cap nor have its `?`/`=`/`/` punctuation stripped.
+    expect(out).toContain(url);
+    expect(out).not.toContain('{{members_settings_url}}');
+  });
+
+  it('falls back to a generic members URL when none provided', () => {
+    const out = renderBagetClaudeMd({ companyName: 'Acme', teamMembers: TEAM });
+    expect(out).toContain('?settings=members');
+    expect(out).not.toContain('{{members_settings_url}}');
+  });
+
   it('throws on missing required placeholder value (empty string)', () => {
     expect(() =>
       renderBagetClaudeMd({
